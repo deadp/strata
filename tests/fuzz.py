@@ -154,6 +154,7 @@ def run_ewf(data, _dir=[]):
 
 
 def _seeds_fs():
+    import imagebuild_apfs
     import imagebuild_ext4
     import imagebuild_fat
     out = {
@@ -164,6 +165,7 @@ def _seeds_fs():
         "exfat": imagebuild_fat.build_exfat,
         "ext4": imagebuild_ext4.build_ext4,
         "ext2": imagebuild_ext4.build_ext2_legacy,
+        "apfs": imagebuild_apfs.build_apfs,
     }
     try:
         import imagebuild_ntfs
