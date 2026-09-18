@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS tagged_items (
     modified TEXT,
     accessed TEXT,
     file_created TEXT,
+    contiguous INTEGER,
     UNIQUE (evidence_id, part, node, tag));
 
 CREATE TABLE IF NOT EXISTS audit (
@@ -412,6 +413,7 @@ class Case:
         self._migrate_file_hashes()
         self._migrate_bookmark_frame()
         self._migrate_evidence_kind()
+        self._migrate_tagged_items()
         self.index_reset = False
         self.index_db = None
         self.index_pending = 0
@@ -470,6 +472,14 @@ class Case:
         if "read_bytes" not in cols:
             self.db.execute("ALTER TABLE file_hashes ADD COLUMN "
                             "read_bytes INTEGER")
+        self.db.commit()
+
+    def _migrate_tagged_items(self):
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(tagged_items)")}
+        if "contiguous" in cols:
+            return
+        self.db.execute("ALTER TABLE tagged_items ADD COLUMN "
+                        "contiguous INTEGER")
         self.db.commit()
 
     def _migrate_bookmark_frame(self):
@@ -893,13 +903,16 @@ class Case:
                    else item.get("start_cluster"))
         cur = self.db.execute(
             "INSERT INTO tagged_items (evidence_id,part,node,path,name,size,"
-            "is_dir,deleted,tag,note,created_at,examiner,modified,accessed,"
-            "file_created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "is_dir,deleted,contiguous,tag,note,created_at,examiner,"
+            "modified,accessed,file_created) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(evidence_id,part,node,tag) DO UPDATE SET note=excluded.note",
             (evidence_id, part, node, item.get("path"), item.get("name"),
              item.get("size"), int(bool(item.get("is_dir"))),
-             int(bool(item.get("deleted"))), tag, note, utcnow(), self.examiner,
-             item.get("modified"), item.get("accessed"), item.get("created")))
+             int(bool(item.get("deleted"))),
+             int(bool(item.get("contiguous"))), tag, note, utcnow(),
+             self.examiner, item.get("modified"), item.get("accessed"),
+             item.get("created")))
         self.db.commit()
         self.log("item.tag", {"path": item.get("path"), "name": item.get("name"),
                               "tag": tag, "node": node})

@@ -3604,12 +3604,15 @@ def _entry_from_body(fs, body):
     fields below that the caller does have are used, so a deleted file
     exported this way is still read the way engine.fs.* expects a deleted
     entry to be read, rather than as if it were live, and the export
-    manifest records what the caller actually knew about it."""
+    manifest records what the caller actually knew about it. "contiguous"
+    (exFAT NoFatChain) matters the same way: a contiguous deleted file must
+    be read as one extent from its start cluster, not by walking the FAT."""
     node = body.get("node")
     n = None if node in (None, "", "null") else int(node)
     entry = {"name": body.get("name"), "path": body.get("path"),
              "size": body.get("size"), "is_dir": False,
              "deleted": bool(body.get("deleted")),
+             "contiguous": bool(body.get("contiguous")),
              "modified": body.get("modified"),
              "accessed": body.get("accessed"),
              "created": body.get("created")}

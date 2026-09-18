@@ -4557,7 +4557,8 @@ async function openTagged(t) {
   const part = partIn(t.evidence_id, t.part);
   if (!part) return toast(txt('messages.toast.partition_evidence'));
   const entry = { name: t.name, path: t.path, size: t.size,
-                  is_dir: !!t.is_dir, deleted: !!t.deleted };
+                  is_dir: !!t.is_dir, deleted: !!t.deleted,
+                  contiguous: !!t.contiguous };
   const n = t.node === 'null' ? null : Number(t.node);
   const fsName = (part.detected || '').toUpperCase();
   Object.assign(entry, nodeEntry(fsName, n));
@@ -9084,6 +9085,7 @@ $('#btn-tag-export').addEventListener('click', async () => {
       const r = await api.post('export/file', { part: t.part, node: t.node,
                                                 name: t.name, path: t.path,
                                                 size: t.size, deleted: !!t.deleted,
+                                                contiguous: !!t.contiguous,
                                                 modified: t.modified,
                                                 accessed: t.accessed,
                                                 created: t.file_created });
