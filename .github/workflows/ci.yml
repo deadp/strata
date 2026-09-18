@@ -96,7 +96,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          # Native arm64 runner: rustc 1.98 always passes
+          # -Wl,--fix-cortex-a53-843419 when cross-linking from x86_64
+          # (pre-link-arg in the target spec), and the x86_64-hosted
+          # rust-lld that `cc -fuse-ld=lld` picks up rejects it.  Building
+          # on the target arch avoids the flag entirely.
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -109,15 +114,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # x86_64 host cross-linking aarch64: rustc passes
-      # -Wl,--fix-cortex-a53-843419, which the x86_64-hosted lld invoked
-      # through `cc -fuse-ld=lld` rejects.  Building for generic armv8
-      # disables the erratum workaround and drops the flag.
       - name: Build release cdylib
         run: cargo build --release --target ${{ matrix.target }}
         working-directory: native
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-feature=-fix-cortex-a53-843419"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
