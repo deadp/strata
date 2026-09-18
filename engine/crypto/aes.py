@@ -77,6 +77,7 @@ class AES:
         if len(key) not in (16, 24, 32):
             raise ValueError("AES key must be 16, 24 or 32 bytes, got %d"
                              % len(key))
+        self._raw = key
         self.key_size = len(key)
         nk = len(key) // 4
         self.rounds = nk + 6
@@ -256,13 +257,14 @@ def _key_bytes(key):
     return key._raw_key()
 
 
-def xts_decrypt(key1, key2, sector, data):
+def xts_decrypt(key1, key2, sector, data, sector_size=None):
     if native.available() and len(data) >= 16:
         k1 = _key_bytes(key1) if isinstance(key1, AES) else bytes(key1)
         k2 = _key_bytes(key2) if isinstance(key2, AES) else bytes(key2)
         if len(k1) == len(k2) and len(k1) in (16, 24, 32):
             try:
-                return native.aes_xts_decrypt(k1, k2, sector, data)
+                return native.aes_xts_decrypt(k1, k2, sector, data,
+                                              sector_size=sector_size)
             except native.NativeError:
                 pass
     return _xts_decrypt_py(key1, key2, sector, data)

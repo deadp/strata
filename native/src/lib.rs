@@ -15,9 +15,10 @@
 //! plan's contingency); the differential test in tests/test_native_crypto.py
 //! is the referee.  CBC and Argon2 use the crates directly.
 
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::consts::U16;
+use aes::cipher::{BlockDecrypt, BlockEncrypt, BlockSizeUser, KeyInit};
 use aes::Block;
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, AssociatedData, ParamsBuilder, Version};
 
 // Mirror of engine/native.py.  Keep both tables identical.
 pub const STRATA_OK: i32 = 0;
@@ -58,7 +59,7 @@ pub extern "C" fn strata_argon2_derive(
         || salt_len > i32::MAX as usize
         || secret_len > i32::MAX as usize
         || associated_len > i32::MAX as usize
-        || out_len > i32::MAX as usize
+        || out_len > i32::MAX as u64
         || out_len < 4
         || salt_len < 8
         || t == 0
@@ -84,36 +85,55 @@ pub extern "C" fn strata_argon2_derive(
 
     let password = unsafe { std::slice::from_raw_parts(password, password_len) };
     let salt = unsafe { std::slice::from_raw_parts(salt, salt_len) };
-    let secret = if secret_len > 0 {
+    // The crate carries the secret (key) on the context and associated
+    // data on Params.  Associated data is capped at 32 bytes by the
+    // crate; the engine never sends more (refuse rather than drop).
+    if associated_len > 32 {
+        return STRATA_ERR_PARAMS;
+    }
+    let secret: &[u8] = if secret_len > 0 {
         if secret.is_null() {
             return STRATA_ERR_PARAMS;
         }
         unsafe { std::slice::from_raw_parts(secret, secret_len) }
     } else {
-        &[][..]
+        &[]
     };
-    let associated = if associated_len > 0 {
+    let associated: &[u8] = if associated_len > 0 {
         if associated.is_null() {
             return STRATA_ERR_PARAMS;
         }
         unsafe { std::slice::from_raw_parts(associated, associated_len) }
     } else {
-        &[][..]
+        &[]
     };
 
-    let params = match Params::new(
-        m_kib as u32,
-        t as u32,
-        p as u32,
-        Some(out_len as usize),
-    ) {
+    let mut builder = ParamsBuilder::new();
+    builder.m_cost(m_kib as u32);
+    builder.t_cost(t as u32);
+    builder.p_cost(p as u32);
+    builder.output_len(out_len as usize);
+    if !associated.is_empty() {
+        let ad = match AssociatedData::new(associated) {
+            Ok(x) => x,
+            Err(_) => return STRATA_ERR_PARAMS,
+        };
+        builder.data(ad);
+    }
+    let params = match builder.build() {
         Ok(x) => x,
         Err(_) => return STRATA_ERR_PARAMS,
     };
-    let ctx = Argon2::new(algorithm, ver, params);
+    let ctx = if secret.is_empty() {
+        Argon2::new(algorithm, ver, params)
+    } else {
+        match Argon2::new_with_secret(secret, algorithm, ver, params) {
+            Ok(x) => x,
+            Err(_) => return STRATA_ERR_PARAMS,
+        }
+    };
     let mut tag = vec![0u8; out_len as usize];
-    let rc = ctx.hash_password_into(password, salt, &mut tag);
-    if rc.is_err() {
+    if ctx.hash_password_into(password, salt, &mut tag).is_err() {
         return STRATA_ERR_OOM;
     }
     unsafe {
@@ -161,7 +181,7 @@ pub extern "C" fn strata_xts_decrypt(
     }
 }
 
-fn xts_decrypt_inner<A: BlockDecrypt + KeyInit>(
+fn xts_decrypt_inner<A: BlockDecrypt + BlockEncrypt + KeyInit + BlockSizeUser<BlockSize = U16>>(
     k1: &[u8],
     k2: &[u8],
     sector: u64,
@@ -180,7 +200,7 @@ fn xts_decrypt_inner<A: BlockDecrypt + KeyInit>(
     // Tweak = E_k2(sector as LE u64 padded to 16 zero bytes).
     let mut tweak = [0u8; 16];
     tweak[..8].copy_from_slice(&sector.to_le_bytes());
-    let mut tblock: Block = tweak.into();
+    let mut tblock = Block::clone_from_slice(&tweak);
     tweak_cipher.encrypt_block(&mut tblock);
 
     let mut block = Block::default();
@@ -195,8 +215,8 @@ fn xts_decrypt_inner<A: BlockDecrypt + KeyInit>(
         }
         unsafe {
             std::ptr::copy_nonoverlapping(block.as_ptr(), out, 16);
+            out = out.add(16);
         }
-        out = out.add(16);
         tblock = gf_mul_alpha(&tblock);
     }
     STRATA_OK
@@ -244,7 +264,7 @@ pub extern "C" fn strata_cbc_decrypt(
     }
 }
 
-fn cbc_decrypt_inner<A: BlockDecrypt + KeyInit>(
+fn cbc_decrypt_inner<A: BlockDecrypt + KeyInit + BlockSizeUser<BlockSize = U16>>(
     key: &[u8],
     iv: &[u8],
     data: &[u8],
@@ -265,8 +285,8 @@ fn cbc_decrypt_inner<A: BlockDecrypt + KeyInit>(
         }
         unsafe {
             std::ptr::copy_nonoverlapping(block.as_ptr(), out, 16);
+            out = out.add(16);
         }
-        out = out.add(16);
         prev.copy_from_slice(chunk);
     }
     STRATA_OK

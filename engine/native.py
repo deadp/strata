@@ -200,11 +200,13 @@ def argon2_derive(password, salt, *, t, m_kib, p, out_len, kind, version,
     return out.raw
 
 
-def aes_xts_decrypt(key1, key2, start_sector, data, sector_size=512):
+def aes_xts_decrypt(key1, key2, start_sector, data, sector_size=None):
     """XTS-decrypt full sectors via the sidecar; raises NativeError."""
     lib = _require()
     if len(key1) != len(key2):
         raise NativeError("XTS key halves must match")
+    if sector_size is None:
+        sector_size = len(data)
     out = ctypes.create_string_buffer(len(data))
     rc = lib.strata_xts_decrypt(
         key1, key2, len(key1), start_sector, sector_size, data, len(data),

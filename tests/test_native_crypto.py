@@ -64,10 +64,11 @@ class Differential(unittest.TestCase):
                 k2 = bytes(rng.randrange(256) for _ in range(key_len))
                 sector = rng.randrange(1 << 40)
                 data = bytes(rng.randrange(256) for _ in range(sector_size))
-                cases.append((k1, k2, sector, data))
-        for k1, k2, sector, data in cases:
+                cases.append((k1, k2, sector, (sector_size, data)))
+        for k1, k2, sector, (sector_size, data) in cases:
             with self.subTest(k=len(k1), sector=sector):
-                got = native.aes_xts_decrypt(k1, k2, sector, data)
+                got = native.aes_xts_decrypt(k1, k2, sector, data,
+                                             sector_size=sector_size)
                 want = aes._xts_decrypt_py(k1, k2, sector, data)
                 self.assertEqual(got, want)
 
