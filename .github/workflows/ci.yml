@@ -109,13 +109,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # x86_64 host linking for aarch64: rust-lld enables the Cortex-A53
-      # erratum fix by default, which the cross linker rejects.
+      # x86_64 host cross-linking aarch64: rustc passes
+      # -Wl,--fix-cortex-a53-843419, which the x86_64-hosted lld invoked
+      # through `cc -fuse-ld=lld` rejects.  Building for generic armv8
+      # disables the erratum workaround and drops the flag.
       - name: Build release cdylib
         run: cargo build --release --target ${{ matrix.target }}
         working-directory: native
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=--no-fix-cortex-a53-843419"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-feature=-fix-cortex-a53-843419"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
