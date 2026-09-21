@@ -45,10 +45,10 @@ recognised and refused by name today; these entries are about *reading* it.
 
 ### Shadow copies
 
-- [ ] **Read a Volume Shadow Copy.** Snapshots are found and listed today, but
-      none can be opened. Reading one means a block-redirect overlay over the
-      volume, then browsing its tree as a filesystem in its own right, plus
-      the differential-area store types.
+- [~] **Read a Volume Shadow Copy.** Snapshots are found and listed, and a
+      snapshot can now be opened: a block-redirect overlay over the volume plus
+      the differential-area store types let Strata browse a snapshot's tree as a
+      filesystem in its own right. Tested on synthetic images only so far.
 
 ### Filesystems
 

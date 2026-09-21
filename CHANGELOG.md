@@ -13,6 +13,16 @@ records, not how the code changed.
 
 ### Added
 
+- **Volume Shadow Copies can now be opened, not just listed.** Where an
+  exhibit holds shadow copies, Strata shows each snapshot in the Shadow
+  Copies pane with an Open button; opening one browses that snapshot's
+  files and folders as a filesystem in its own right, reading through the
+  block-redirect overlay to the differential store where a changed block
+  was copied and falling through to the base volume where it was not.
+  Hex, preview, export and folder export all read snapshot content, and
+  the snapshot context is labelled throughout so results are never
+  confused with the live volume
+  ([#49](https://github.com/switch-nz/strata/issues/49)).
 - **Re-running an artefact collector now asks first if it already has a
   result for that evidence item.** `save_artefact` replaces the earlier
   row silently, which is fine on a first pass and wrong once an examiner

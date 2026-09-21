@@ -210,6 +210,7 @@ class Evidence:
         self.volumes = volume_mod.scan(self.image)
         self.label = os.path.basename(path)
         self.fs_cache = {}
+        self.snapshot_cache = {}
         self._structures = None
         self.index_tasks = {}
         self.hive_cache = {}
@@ -237,7 +238,8 @@ REGISTRY = None
 class Session:
 
     _PER_EVIDENCE = (
-        "image", "path", "volumes", "fs_cache", "index_tasks", "hive_cache",
+        "image", "path", "volumes", "fs_cache", "snapshot_cache",
+        "index_tasks", "hive_cache",
         "unlocked", "vault_cache", "reader_cache", "tz_candidates",
         "tz_scanned", "evidence_id", "_structures", "usn", "file_bytes",
     )
@@ -260,7 +262,7 @@ class Session:
             cur = self.__dict__.get("items", {}).get(
                 self.__dict__.get("active_id"))
             if cur is None:
-                return None if name != "fs_cache" else {}
+                return {} if name in ("fs_cache", "snapshot_cache") else None
             return getattr(cur, name)
         raise AttributeError(name)
 
@@ -557,6 +559,43 @@ class Session:
             self._attach_tree_cache(fs, ev, offset)
             ev.fs_cache[offset] = fs
             return fs
+
+    def snapshot_fs(self, offset, snap_index, ev=None):
+        """Filesystem over a shadow copy: an NtfsFS reading a VssOverlay
+        wrapped around the base region. Cached per (offset, snap_index)."""
+        ev = ev or self.current
+        if ev is None:
+            raise ValueError(_t("server.evidence_open"))
+        key = (offset, snap_index)
+        hit = ev.snapshot_cache.get(key)
+        if hit is not None:
+            return hit
+        with self.fs_lock:
+            hit = ev.snapshot_cache.get(key)
+            if hit is not None:
+                return hit
+            region = self.region(offset, ev=ev)
+            report = vss_mod.snapshots(region)
+            if not report.get("present"):
+                raise ValueError("No shadow copies on this volume.")
+            snaps = report.get("snapshots") or []
+            if snap_index < 0 or snap_index >= len(snaps):
+                raise ValueError("No such shadow copy (index %d)." % snap_index)
+            snap = snaps[snap_index]
+            if snap.get("unsupported"):
+                raise ValueError(snap["unsupported"])
+            overlay = vss_mod.VssOverlay(region, snap,
+                                         findings=list(report.get("findings")
+                                                       or []))
+            fs = ntfs_mod.open_fs(overlay)
+            # Snapshot trees must not reuse the base volume's persisted tree
+            # cache: key it with a pseudo-offset far above any real offset
+            # (real offsets are 0x200-aligned; offset*1024 + snap_index keeps
+            # one distinct slot per snapshot). path_for/stamp need an int.
+            self._attach_tree_cache(fs, ev, offset * 1024 + snap_index)
+            ev.snapshot_cache[key] = fs
+            return fs
+
 
     def _attach_tree_cache(self, fs, ev, offset):
         if not hasattr(fs, "tree_store"):
@@ -1017,7 +1056,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/hex":
             off = self._q("offset", 0, int)
             length = min(self._q("length", 4096, int), 1 << 20)
-            src = self._region_from_query()
+            try:
+                src = self._region_from_query()
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             data = src.read_at(off, length)
             return self._send(200, {"offset": off, "length": len(data),
                                     "data": base64.b64encode(data).decode(),
@@ -1026,12 +1068,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dir":
             off = self._q("part", 0, int)
             ev = s.evidence(self._q("ev", None)) or s.current
+            snap = self._q("snap", None, int)
             try:
-                fs = s.fs(off, ev=ev)
+                fs = s.fs(off, ev=ev) if snap is None \
+                    else s.snapshot_fs(off, snap, ev=ev)
             except ntfs_mod.EncryptedVolume as exc:
                 return self._send(200, {"entries": [], "encrypted": True,
                                         "kind": exc.kind, "part": off,
                                         "error": str(exc)})
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             node = self._q("node", None)
             root = getattr(fs, "root_node", None)
             if root is None:
@@ -1039,8 +1085,12 @@ class Handler(BaseHTTPRequestHandler):
                         "APFS": 2}.get(fs.name, 0)
             handle = int(node) if node not in (None, "") else root
             if getattr(fs, "index_pending", None) and fs.index_pending():
+                # Snapshot trees key their index like their tree cache:
+                # off*1024+snap keeps one slot per snapshot, never clashing
+                # with the base volume's index at the same offset.
+                ikey = off if snap is None else off * 1024 + snap
                 return self._send(200, {"building": True,
-                                        "task": s.ensure_index(off, fs,
+                                        "task": s.ensure_index(ikey, fs,
                                                                ev=ev)})
             entries = fs.listdir(handle, self._q("path", "/"))
             typed = capped = 0
@@ -1068,7 +1118,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/stat":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", None, int)
+            try:
+                fs = s.fs(off) if snap is None else s.snapshot_fs(off, snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             stream = self._q("stream", "")
             try:
@@ -1121,7 +1175,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/preview":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", None, int)
+            try:
+                fs = s.fs(off) if snap is None else s.snapshot_fs(off, snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             n = min(self._q("length", 65536, int), 1 << 20)
             stream = self._q("stream", "")
@@ -1258,7 +1316,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/file":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", None, int)
+            try:
+                fs = s.fs(off) if snap is None else s.snapshot_fs(off, snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             try:
                 info = fs.stat(entry)
@@ -1774,9 +1836,11 @@ class Handler(BaseHTTPRequestHandler):
     def _region_from_query(self):
         sess = self._session()
         part = self._q("part", None, int)
+        snap = self._q("snap", None, int)
         raw = self._q("entry", "")
         if raw:
-            fs = sess.fs(part or 0)
+            fs = sess.fs(part or 0) if snap is None \
+                else sess.snapshot_fs(part or 0, snap)
             entry = json.loads(raw)
             stream = self._q("stream", "")
             try:
@@ -1791,6 +1855,17 @@ class Handler(BaseHTTPRequestHandler):
                               cur.file_bytes if cur is not None else None)
         if part is None:
             return sess.image
+        if snap is not None:
+            region = sess.region(part)
+            report = vss_mod.snapshots(region)
+            if not report.get("present"):
+                raise ValueError("No shadow copies on this volume.")
+            snaps = report.get("snapshots") or []
+            if snap < 0 or snap >= len(snaps):
+                raise ValueError("No such shadow copy (index %d)." % snap)
+            return vss_mod.VssOverlay(region, snaps[snap],
+                                      findings=list(report.get("findings")
+                                                    or []))
         return sess.region(part)
 
     def _api_post(self, path, body):
@@ -3488,7 +3563,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/export/file":
             part = int(body.get("part") or 0)
-            fs = s.fs(part)
+            snap = body.get("snap")
+            snap = int(snap) if snap is not None else None
+            fs = s.fs(part) if snap is None else s.snapshot_fs(part, snap)
             entry = body.get("entry") or _entry_from_body(fs, body)
             out_dir = body.get("dir") or os.path.join(
                 os.path.dirname(s.path), "strata-export")
@@ -3514,7 +3591,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/export/folder":
             part = int(body.get("part") or 0)
-            fs = s.fs(part)
+            snap = body.get("snap")
+            snap = int(snap) if snap is not None else None
+            fs = s.fs(part) if snap is None else s.snapshot_fs(part, snap)
             entry = body.get("entry")
             if not entry or not entry.get("is_dir"):
                 return self._send(400, {"error": _t("server.export_folder.folder")})
