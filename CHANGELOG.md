@@ -13,6 +13,17 @@ records, not how the code changed.
 
 ### Added
 
+- **Split raw sets written by FTK Imager, Guymager and `dd` with `split`
+  now open as one exhibit.** Only three-digit `.001`/`.002` naming was
+  joined before, so a set numbered any other way opened as its first piece
+  alone — a whole disk presented as a few gigabytes of it, with nothing on
+  screen to say so. Guymager's `.0000` numbering (which widens for a disk
+  needing more than 999 pieces), `split`'s default `.aa`/`.ab` suffixes and
+  its `-d` numeric ones are now recognised alongside FTK Imager's `.001`,
+  and a missing, wrongly sized or mixed-width piece raises a finding that
+  names the piece the way that set numbers it. An image summary or info
+  file sitting beside the pieces is not mistaken for one
+  ([#45](https://github.com/switch-nz/strata/issues/45)).
 - **Re-running an artefact collector now asks first if it already has a
   result for that evidence item.** `save_artefact` replaces the earlier
   row silently, which is fine on a first pass and wrong once an examiner

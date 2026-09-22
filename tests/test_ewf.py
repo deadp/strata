@@ -445,13 +445,14 @@ class Raw(TempDir):
         self.assertEqual(img.size, 0)
         self.assertEqual(img.read_at(0, 10), b"")
 
-    def write_split(self, piece, first=1, skip=(), prefix="split"):
-        names = []
-        for i, data in enumerate(build.split_raw(MEDIA, piece)):
-            name = "%s.%03d" % (prefix, first + i)
+    def write_split(self, piece, first=1, skip=(), prefix="split",
+                    style="ftk"):
+        pieces = build.split_raw(MEDIA, piece)
+        names = build.split_names(prefix, len(pieces), style=style,
+                                  first=first)
+        for i, data in enumerate(pieces):
             if first + i not in skip:
-                self.write(name, data)
-            names.append(name)
+                self.write(names[i], data)
         return names
 
     def test_split_raw_set(self):
@@ -509,6 +510,78 @@ class Raw(TempDir):
         img = self.open(os.path.join(self.dir, "split.001"))
         self.assertEqual(len(img.findings), 1)
         self.assertIn("split.002 is 2000 bytes", img.findings[0])
+
+    def test_guymager_four_digit_set(self):
+        names = self.write_split(3000, first=0, prefix="gm",
+                                 style="guymager")
+        self.write("gm.info", b"guymager info\n")
+        img = self.open(os.path.join(self.dir, "gm.0000"))
+        self.assertEqual(img.info()["segments"], names)
+        self.assertEqual(img.size, len(MEDIA))
+        self.assertEqual(img.read_at(0, len(MEDIA)), MEDIA)
+        self.assertEqual(img.findings, [])
+
+    def test_split_alphabetic_set(self):
+        names = self.write_split(3000, first=0, prefix="disk.dd",
+                                 style="split")
+        img = self.open(os.path.join(self.dir, "disk.dd.aa"))
+        self.assertEqual(img.info()["segments"], names)
+        self.assertEqual(img.size, len(MEDIA))
+        self.assertEqual(img.read_at(0, len(MEDIA)), MEDIA)
+        self.assertEqual(img.findings, [])
+
+    def test_split_numeric_two_digit_set(self):
+        names = self.write_split(3000, first=0, prefix="disk.dd",
+                                 style="splitd")
+        img = self.open(os.path.join(self.dir, "disk.dd.00"))
+        self.assertEqual(img.info()["segments"], names)
+        self.assertEqual(img.size, len(MEDIA))
+        self.assertEqual(img.read_at(0, len(MEDIA)), MEDIA)
+        self.assertEqual(img.findings, [])
+
+    def test_ftk_summary_sidecar_is_not_a_piece(self):
+        names = self.write_split(3000, prefix="ev")
+        self.write("ev.001.txt", b"Image Summary\n")
+        img = self.open(os.path.join(self.dir, "ev.001"))
+        self.assertEqual(img.info()["segments"], names)
+        self.assertNotIn("ev.001.txt", img.info()["segments"])
+        self.assertEqual(img.read_at(0, len(MEDIA)), MEDIA)
+
+    def test_alphabetic_run_must_start_at_aa(self):
+        self.write("notes.ab", MEDIA[:100])
+        self.write("notes.ac", MEDIA[100:200])
+        img = self.open(os.path.join(self.dir, "notes.ab"))
+        self.assertEqual(img.info()["segments"], ["notes.ab"])
+        self.assertEqual(img.findings, [])
+
+    def test_ordinary_lettered_files_are_not_a_set(self):
+        self.write("report.txt", MEDIA[:100])
+        self.write("report.log", MEDIA[100:200])
+        img = self.open(os.path.join(self.dir, "report.txt"))
+        self.assertEqual(img.info()["segments"], ["report.txt"])
+        self.assertEqual(img.findings, [])
+
+    def test_mixed_width_set_is_joined_with_a_finding(self):
+        pieces = build.split_raw(MEDIA[:9000], 3000)
+        self.assertEqual(len(pieces), 3)
+        for name, data in zip(["ev.001", "ev.002", "ev.0003"], pieces):
+            self.write(name, data)
+        img = self.open(os.path.join(self.dir, "ev.001"))
+        self.assertEqual(img.info()["segments"],
+                         ["ev.001", "ev.002", "ev.0003"])
+        self.assertEqual(img.read_at(0, 9000), MEDIA[:9000])
+        self.assertEqual(len(img.findings), 1)
+        self.assertIn("mixes", img.findings[0])
+
+    def test_missing_piece_names_the_sets_own_width(self):
+        self.assertGreater(len(MEDIA), 3 * 2000)
+        self.write_split(2000, first=0, skip=(2,), prefix="gm",
+                         style="guymager")
+        img = self.open(os.path.join(self.dir, "gm.0000"))
+        self.assertEqual(img.size, 4000)
+        self.assertEqual(len(img.findings), 1)
+        self.assertIn("gm.0002", img.findings[0])
+        self.assertNotIn("gm.002;", img.findings[0])
 
     def test_many_pieces_keep_few_files_open(self):
         piece = len(MEDIA) // 40 + 1
