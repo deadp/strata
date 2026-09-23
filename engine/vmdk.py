@@ -4,7 +4,7 @@ import re
 import struct
 import threading
 
-from .inflate import inflate_capped
+from .inflate import DAMAGED, STOPPED, inflate_ended
 from .text import t as _t
 
 SECTOR = 512
@@ -23,6 +23,14 @@ GTE_ZEROED = 1
 NO_GD = 0xFFFFFFFFFFFFFFFF
 
 GRAIN_CACHE = 64
+
+# Bounds for header and grain-table fields that come straight from the
+# evidence, unvalidated: a genuine VMDK never comes close to these, but a
+# damaged or hostile one otherwise trades a byte count for one that seeks
+# to nowhere, allocates gigabytes, or divides by zero.
+MAX_GRAIN_BYTES = 64 << 20        # real grains run 64 KiB-2 MiB
+MAX_NUM_GTES = 1 << 16            # the default is 512
+MAX_GRAIN_TABLES = 1 << 20        # bounds the grain directory read
 
 class VmdkError(Exception):
 
@@ -146,8 +154,15 @@ class VmdkImage:
 
         self.descriptor = {}
         if hdr["descriptor_offset"] and hdr["descriptor_size"]:
-            self._fh.seek(hdr["descriptor_offset"] * SECTOR)
-            raw = self._fh.read(hdr["descriptor_size"] * SECTOR)
+            raw, clipped = self._bounded_read(
+                hdr["descriptor_offset"] * SECTOR,
+                hdr["descriptor_size"] * SECTOR)
+            if clipped:
+                self.findings.append(
+                    "The descriptor declares %d bytes at sector %d, past "
+                    "the end of the file; only %d bytes were read."
+                    % (hdr["descriptor_size"] * SECTOR,
+                       hdr["descriptor_offset"], len(raw)))
             self.descriptor = parse_descriptor(
                 raw.split(b"\x00", 1)[0].decode("ascii", "replace"))
         self._refuse_if_differencing(self.descriptor)
@@ -182,7 +197,8 @@ class VmdkImage:
         self.header = hdr
         self.size = hdr["capacity"] * SECTOR
         self.grain_bytes = hdr["grain_size"] * SECTOR
-        if not self.grain_bytes or hdr["grain_size"] % 8:
+        if (not self.grain_bytes or hdr["grain_size"] % 8
+                or self.grain_bytes > MAX_GRAIN_BYTES):
             raise VmdkError(_t("vmdk.implausible_vmdk_grain_size")
                             % hdr["grain_size"])
         self._read_tables(hdr)
@@ -253,16 +269,34 @@ class VmdkImage:
                 % (self.size - avail))
 
     def _read_tables(self, hdr):
-        n_gt = -(-hdr["capacity"] // (hdr["grain_size"] * hdr["num_gtes"]))
-        self._fh.seek(hdr["gd_offset"] * SECTOR)
-        raw = self._fh.read(4 * n_gt)
-        if len(raw) < 4 * n_gt:
+        num_gtes = hdr["num_gtes"]
+        if not (0 < num_gtes <= MAX_NUM_GTES):
+            raise VmdkError(_t("vmdk.implausible_vmdk_grain_table_entries")
+                            % num_gtes)
+        n_gt = -(-hdr["capacity"] // (hdr["grain_size"] * num_gtes))
+        if not (0 < n_gt <= MAX_GRAIN_TABLES):
+            raise VmdkError(_t("vmdk.implausible_vmdk_grain_table_count")
+                            % n_gt)
+        raw, clipped = self._bounded_read(hdr["gd_offset"] * SECTOR,
+                                          4 * n_gt)
+        if clipped or len(raw) < 4 * n_gt:
             raise VmdkError(_t("vmdk.grain_directory_runs_past"))
         self._gd = struct.unpack("<%dI" % n_gt, raw)
-        self._num_gtes = hdr["num_gtes"]
+        self._num_gtes = num_gtes
         self._gt = {}
         self.tables_present = sum(1 for g in self._gd if g)
         self.tables_total = n_gt
+
+    def _bounded_read(self, offset, size):
+        """Read `size` bytes at `offset`, never past the end of the file, so
+        a table entry or header field that names a huge or absurd position
+        seeks nowhere rather than raising OSError or allocating what it
+        claims. Returns (data, clipped)."""
+        if offset < 0 or offset >= self.file_size or size <= 0:
+            return b"", size > 0
+        want = min(size, self.file_size - offset)
+        self._fh.seek(offset)
+        return self._fh.read(want), want < size
 
     def _table(self, n):
         got = self._gt.get(n)
@@ -273,8 +307,7 @@ class VmdkImage:
             self._gt[n] = ()
             return ()
         with self._io_lock:
-            self._fh.seek(at * SECTOR)
-            raw = self._fh.read(4 * self._num_gtes)
+            raw, _ = self._bounded_read(at * SECTOR, 4 * self._num_gtes)
         got = struct.unpack("<%dI" % self._num_gtes, raw) \
             if len(raw) >= 4 * self._num_gtes else ()
         self._gt[n] = got
@@ -293,13 +326,18 @@ class VmdkImage:
         if gte in (GTE_UNALLOCATED, GTE_ZEROED):
             return None
 
+        offset = gte * SECTOR
         with self._io_lock:
-            self._fh.seek(gte * SECTOR)
             if not self.stream_optimized:
-                data = self._fh.read(self.grain_bytes)
+                data, clipped = self._bounded_read(offset, self.grain_bytes)
+                if clipped:
+                    self._note_once(
+                        "A grain table entry points past the end of the "
+                        "file; that grain reads as zeros past where the "
+                        "file ends.")
             else:
-                head = self._fh.read(12)
-                if len(head) < 12:
+                head, clipped = self._bounded_read(offset, 12)
+                if clipped or len(head) < 12:
                     return None
                 _lba, csize = struct.unpack("<QI", head)
                 if not csize:
@@ -307,17 +345,38 @@ class VmdkImage:
                                     "marker rather than a grain; that grain "
                                     "reads as zeros.")
                     return None
-                comp = self._fh.read(csize)
+                # A compressed grain can exceed its raw size only by zlib's
+                # small worst-case expansion; a far larger declared size is
+                # itself implausible, and reading it as given could mean
+                # reading gigabytes from a file that holds nothing like it.
+                cap = self.grain_bytes + self.grain_bytes // 64 + 1024
+                comp, _ = self._bounded_read(offset + 12, min(csize, cap))
+                if csize > cap:
+                    self._note_once(
+                        "A grain declares %d bytes of compressed data, more "
+                        "than is plausible for a %d-byte grain; only %d "
+                        "bytes were read." % (csize, self.grain_bytes,
+                                              len(comp)))
         if self.stream_optimized:
-            data, over = inflate_capped(comp, self.grain_bytes)
+            data, over, status = inflate_ended(comp, self.grain_bytes)
             if over:
                 self._note_once("A compressed grain inflates past the %d-byte "
                                 "grain size this descriptor declares; it was "
                                 "cut off there." % self.grain_bytes)
-            elif not data:
+            elif not data or status == DAMAGED:
                 self._note_once("A compressed grain would not inflate; "
                                 "it reads as zeros.")
                 return None
+            elif len(data) < self.grain_bytes:
+                self._note_once(
+                    "A grain is incomplete: its compressed data %s and gave "
+                    "%d of %d bytes; the rest reads as zeros."
+                    % ("ends early" if status == STOPPED
+                       else "decompressed short", len(data), self.grain_bytes))
+            elif status == STOPPED:
+                self._note_once(
+                    "A grain's compressed data ends before its checksum, "
+                    "so it could not be verified.")
 
         if len(data) < self.grain_bytes:
             data = data + bytes(self.grain_bytes - len(data))

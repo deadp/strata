@@ -16,17 +16,7 @@ Legend — `[ ]` not started · `[~]` partly there
 A forensic tool's worst failure is a confident wrong answer, so this comes
 before anything new.
 
-- [~] **Parsers that return wrong or missing results without a warning**
-      ([#19](https://github.com/switch-nz/strata/issues/19)). Still open:
-      a truncated compressed stream in a VMDK or AD1 may be returned short
-      without a finding, as an E01 chunk was; there are no test images yet.
-- [~] **Damaged input that exhausts memory**
-      ([#15](https://github.com/switch-nz/strata/issues/15)). The fuzzer's
-      findings are fixed; one residual remains — a contiguous exFAT run is
-      still built one list element per cluster, so a corrupt stream length on
-      a large genuine volume can ask for millions of entries. Representing
-      contiguous runs as `(start, count)` removes it.
-- [ ] Previewing a genuine case can still upgrade its schema or create its
+- [x] Previewing a genuine case can still upgrade its schema or create its
       `cache/` folder. It writes only to Strata's own record, never to
       evidence, but a preview should not write at all.
 
@@ -66,9 +56,6 @@ recognised and refused by name today; these entries are about *reading* it.
       and hard links through the private metadata directory.
 - [ ] **APFS snapshots** — the superblock's snapshot metadata is located but
       snapshots are not listed or read.
-- [ ] **ext4 extended attributes** — only the in-inode `system.data`
-      attribute that holds inline data is read; the rest (in-inode and
-      external xattr blocks) are not shown.
 
 ### Encryption
 
@@ -77,8 +64,10 @@ recognised and refused by name today; these entries are about *reading* it.
       recovery key, so neither can be used yet.
 - [ ] **BitLocker with the Elephant diffuser** — Vista and Windows 7 volumes
       are identified and refused rather than decrypted wrongly.
-- [ ] **LUKS2 with Argon2** — needs a standard-library-only Argon2, which is
-      the hard part; the rest of LUKS2 is the same shape as LUKS1.
+- [ ] **LUKS2 with Argon2 against real cryptsetup images** — implemented and
+      verified against synthetic images built to cryptsetup's layout; real
+      cryptsetup-written volumes still need to be confirmed before this can
+      be called done.
 - [ ] **FileVault 2** (APFS and Core Storage).
 
 ---
@@ -91,16 +80,11 @@ recognised and refused by name today; these entries are about *reading* it.
 - [ ] **Browser disk cache** — the on-disk cache format, separate from the
       history databases already read.
 - [ ] **Event ID descriptions**, and timelining across logs.
-- [ ] **Hash-set matches shown in the folder and search views**, not only in
-      the hash run.
-- [ ] **PST:** ANSI (32-bit) files are refused today; attachment *content*
-      (only names and sizes are read); OST-specific structures.
+- [ ] **PST:** ANSI (32-bit) files are refused today; OST-specific
+      structures are not handled.
 - [ ] **Legacy Office body text** — Word's piece table, Excel's BIFF stream,
       PowerPoint's records. Properties are read; the body is deliberately left
       unread rather than guessed at.
-- [ ] **ShimCache caveat on screen** — an entry proves a file was examined,
-      not that it ran. The distinction exists in the parser's reasoning but is
-      not shown to the examiner.
 
 ---
 
@@ -163,9 +147,15 @@ Agreeing with another tool is agreement, not verification.
 
 ## Analysis
 
-- [ ] Fuzzy hashing (ssdeep-style) and image similarity.
-- [ ] Carving across fragments, starting with bi-fragment gap carving.
-- [ ] Duplicate detection across evidence items.
+- [ ] Image similarity (perceptual hashing) -- needs pixel-level image
+      decoding this codebase does not otherwise have a reason to carry, so
+      it is scoped separately from fuzzy hashing (done).
+- [ ] Carving across fragments beyond the first slice: a gap that is not a
+      currently-allocated extent (both fragments sit in unallocated space,
+      with unrelated deleted data between them), sizer-only (no-footer)
+      signatures, and three or more fragments. The first slice --
+      footer-terminated types split around exactly one allocated gap -- is
+      done.
 - [ ] A map view for GPS coordinates.
 
 ---
@@ -175,11 +165,6 @@ Agreeing with another tool is agreement, not verification.
 - [ ] Configurable columns in the folder view, and the filter controls search
       already has (both can share `filesearch.matches_filters`).
 - [ ] Read-only mode that refuses export and report writing.
-- [ ] Ask before re-running an artefact replaces its earlier result — fine on a
-      first pass, wrong once someone has worked from the earlier output.
-- [ ] Cheap artefact *presence* checks that could honestly run on open — is
-      there a Recycle Bin with content, a browser profile, a prefetch folder —
-      as counts rather than parses.
 - [ ] Template editor, so an examiner can define a structure without Python.
       The templates in `engine/structure.py` are already declarative enough to
       make this mostly an interface problem.
@@ -193,13 +178,6 @@ Agreeing with another tool is agreement, not verification.
 
 ## Performance and debt
 
-- [ ] `/api/file` reads the whole file again on every Range request (up to the
-      stream cap). Wants a cached extent map before anyone scrubs a large video.
-- [ ] Registry values over 2 KB are not inlined and have no fetch path in the
-      interface.
-- [ ] Gallery thumbnails load the full-size image for every picture.
-- [ ] The content index is rebuilt in full each time; there is no incremental
-      update.
 - [ ] Tagged items are keyed on the filesystem handle (MFT record / inode):
       stable within an image, but a tag will not follow the same volume
       re-acquired into another image.
@@ -214,14 +192,3 @@ Agreeing with another tool is agreement, not verification.
 - **Fuzz corpus growth.** The saved corpus is small; a standing fuzz job with
   coverage feedback would find the next #15 before a user does.
 
----
-
-## Not yet re-checked
-
-Carried from the earlier internal roadmap but not yet confirmed against the
-current code, so neither ticked nor dropped:
-
-- Email message bodies rendered as text rather than raw source.
-- The export manifest leaving `modified` blank when an item is exported by
-  node alone.
-- Indexing time and peak memory on very large NTFS volumes.

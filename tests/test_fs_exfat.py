@@ -9,6 +9,7 @@ import os
 import random
 import struct
 import sys
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -357,6 +358,33 @@ class ExfatRobustness(unittest.TestCase):
         heap_end = fs.cluster_offset(fs.cluster_count + 2)
         for r in fs.runs(e):
             self.assertLessEqual(r["offset"] + r["length"], heap_end)
+
+    # A contiguous (NoFatChain) stream is one run end to end; chain() must
+    # not build a list of every cluster in it to discover that, or a large
+    # genuine volume with a huge claimed run costs memory proportional to
+    # its cluster count (residual of #15/#19, issue #43).
+    def test_huge_contiguous_run_stays_flat(self):
+        data = bytearray(self.good)
+        fs = exfat.ExfatFS(BytesImage(data))
+        e = dict(by_name(fs.listdir(0))["Contiguous.dat"])
+        # A large genuine volume: billions of clusters, all real (no
+        # boot-sector lie for the heap-end clamp to catch), and a file
+        # claiming to span most of it.
+        fs.cluster_count = 2_000_000_000
+        e["size"] = 1_000_000_000 * fs.cluster_size
+
+        chain = fs.chain(e["start_cluster"], True, e["size"])
+        self.assertIsInstance(chain, range)
+        self.assertEqual(len(chain), 1_000_000_000)
+
+        t0 = time.time()
+        runs = fs.runs(e)
+        self.assertLess(time.time() - t0, 1.0)
+        self.assertEqual(runs, [{
+            "offset": fs.cluster_offset(e["start_cluster"]),
+            "length": e["size"], "used": e["size"],
+            "cluster": e["start_cluster"], "clusters": 1_000_000_000,
+            "sparse": False}])
 
     def test_random_garbage_is_not_exfat(self):
         rng = random.Random(5)

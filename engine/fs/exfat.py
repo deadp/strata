@@ -114,7 +114,11 @@ class ExfatFS:
                 if msg not in self.findings:
                     self.findings.append(msg)
                 n = limit
-            return list(range(start, start + n))
+            # A range, not a list: a contiguous stream is exactly one run,
+            # known analytically from its length, so nothing here should
+            # cost memory proportional to the number of clusters. Slicing,
+            # indexing, len() and iteration all still work for callers.
+            return range(start, start + n)
         out, seen, c = [], set(), start
         while 2 <= c < self.cluster_count + 2 and c not in seen:
             seen.add(c)
@@ -276,16 +280,21 @@ class ExfatFS:
         clusters = self.chain(start, entry.get("contiguous"), entry["size"])
         if not clusters:
             return []
-        runs, rs, rl = [], clusters[0], 1
-        for prev, cur in zip(clusters, clusters[1:]):
-            if cur == prev + 1:
-                rl += 1
-            else:
-                runs.append((rs, rl))
-                rs, rl = cur, 1
-        runs.append((rs, rl))
+        if isinstance(clusters, range):
+            # Already one run end to end; nothing to walk cluster by
+            # cluster to discover that.
+            groups = [(clusters[0], len(clusters))]
+        else:
+            groups, rs, rl = [], clusters[0], 1
+            for prev, cur in zip(clusters, clusters[1:]):
+                if cur == prev + 1:
+                    rl += 1
+                else:
+                    groups.append((rs, rl))
+                    rs, rl = cur, 1
+            groups.append((rs, rl))
         out, remaining = [], entry["size"]
-        for c, n in runs:
+        for c, n in groups:
             length = n * self.cluster_size
             out.append({"offset": self.cluster_offset(c), "length": length,
                         "used": max(0, min(length, remaining)),

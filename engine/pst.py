@@ -126,7 +126,9 @@ PID_BODY = 0x1000
 PID_DISPLAY_NAME = 0x3001
 PID_CREATION_TIME = 0x3007
 PID_LAST_MODIFICATION_TIME = 0x3008
+PID_ATTACH_DATA_BIN = 0x3701
 PID_ATTACH_LONG_FILENAME = 0x3707
+PID_ATTACH_MIME_TAG = 0x370E
 PID_ATTACH_SIZE = 0x0E20
 PID_LTP_ROW_ID = 0x67F2
 
@@ -528,10 +530,25 @@ class Pst:
             if not props:
                 continue
             out.append({
+                "nid": nid,
                 "name": props.get(PID_ATTACH_LONG_FILENAME) or None,
                 "size": props.get(PID_ATTACH_SIZE),
+                "content_type": props.get(PID_ATTACH_MIME_TAG) or None,
             })
         return out
+
+    def attachment_bytes(self, node, att_nid):
+        """The one attachment property mail() never reads: the content
+        itself. Kept out of attachments()/mail() because that runs over
+        every message in the store, and decoding every attachment's binary
+        content there would hash-run-eagerly what should be fetched only
+        when an examiner opens one."""
+        ent = self.subnodes(node.get("sub") or 0).get(int(att_nid) & 0xFFFFFFFF)
+        if not ent or (int(att_nid) & 0x1F) != NID_TYPE_ATTACHMENT:
+            return None
+        bd, bs = ent
+        props = self.pc({"data": bd, "sub": bs})
+        return props.get(PID_ATTACH_DATA_BIN)
 
     def message(self, nid, folder=None):
         node = self.nbt().get(nid)

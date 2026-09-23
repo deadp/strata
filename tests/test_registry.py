@@ -138,6 +138,26 @@ class Values(HiveFixture):
         self.assertIsNone(v["value"])
         self.assertEqual(self.hive.value_bytes(v["offset"]), build.BIG_BLOB)
 
+    # /api/registry/value (issue #79) fetches a value too large to inline by
+    # re-reading it with inline=False, then decoding value_bytes() itself --
+    # this is that sequence, run directly against a value large enough that
+    # values() left it truncated.
+    def test_truncated_value_can_be_fetched_in_full(self):
+        v = self.values()["Big"]
+        self.assertTrue(v["truncated"])
+        full = self.hive.value(v["offset"], inline=False)
+        self.assertEqual(full["offset"], v["offset"])
+        self.assertEqual(full["type_id"], v["type_id"])
+        self.assertEqual(full["size"], v["size"])
+        raw = self.hive.value_bytes(full["offset"])
+        full["value"] = self.hive.decode(full["type_id"], raw)
+        self.assertEqual(
+            full["value"],
+            registry.Hive.decode(v["type_id"], build.BIG_BLOB))
+
+    def test_fetching_an_unknown_offset_gives_nothing(self):
+        self.assertIsNone(self.hive.value(0xFFFFFF, inline=False))
+
     def test_decode_other_types(self):
         self.assertEqual(registry.Hive.decode(5, b"\x00\x00\x01\x00"), 256)
         self.assertEqual(registry.Hive.decode(11, struct.pack("<Q", 2 ** 40)),

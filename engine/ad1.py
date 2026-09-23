@@ -4,7 +4,7 @@ import re
 import struct
 import threading
 
-from .inflate import inflate_capped
+from .inflate import DAMAGED, STOPPED, inflate_ended
 from .text import t as _t
 
 SEGMENT_MAGIC = b"ADSEGMENTEDFILE\x00"
@@ -93,6 +93,15 @@ class Ad1Segments:
     def __init__(self, path):
         self.paths = self._siblings(path)
         self._files = [open(p, "rb") for p in self.paths]
+        try:
+            self._init_from_files()
+        except BaseException:
+            # Otherwise a rejected segment leaves the evidence files held
+            # open, which on Windows keeps them locked.
+            self.close()
+            raise
+
+    def _init_from_files(self):
         self._io_lock = threading.Lock()
         self._sizes = [os.path.getsize(p) for p in self.paths]
         self.size = sum(self._sizes)
@@ -100,6 +109,8 @@ class Ad1Segments:
         head = self.read_at(0, 0x40)
         if not looks_like_ad1(head):
             raise Ad1Error(_t("ad1.ad1_segment_magic_missing"))
+        if len(head) < 0x2C:
+            raise Ad1Error(_t("ad1.segment_header_runs_past"))
         self.version = struct.unpack_from("<I", head, 0x10)[0]
         index = struct.unpack_from("<I", head, 0x18)[0]
         count = struct.unpack_from("<I", head, 0x1C)[0]
@@ -174,8 +185,19 @@ class Ad1:
         if h[:len(IMAGE_MAGIC)] != IMAGE_MAGIC:
             raise Ad1Error(
                 _t("ad1.segment_header_ad1_but") % base)
-        self.chunk_size = struct.unpack_from("<I", h, 0x18)[0]
+        if len(h) < 0x38:
+            raise Ad1Error(_t("ad1.logical_image_header_runs_past") % base)
+        declared_chunk_size = struct.unpack_from("<I", h, 0x18)[0]
+        # Bounded like _chunk_ceiling()'s decompression cap: real chunks run
+        # tens of KB, and this value also sizes every zero-fill for a chunk
+        # that fails to decompress, so an unbounded declaration is a
+        # multi-gigabyte allocation from one damaged or hostile chunk.
+        self.chunk_size = min(max(declared_chunk_size, 1), 1 << 26)
         self.findings = []
+        if self.chunk_size != declared_chunk_size:
+            self.findings.append(
+                "Chunk size declared as %d bytes is implausible; using %d."
+                % (declared_chunk_size, self.chunk_size))
         trailer = struct.unpack_from("<I", h, 0x24)[0]
         nlen = struct.unpack_from("<I", h, 0x2C)[0]
         noff = struct.unpack_from("<I", h, 0x34)[0]
@@ -304,22 +326,51 @@ class Ad1:
         offs = struct.unpack("<%dQ" % (count + 1), raw)
         return list(zip(offs[:-1], offs[1:]))
 
+    def _decompress_chunk(self, index, name, raw, nominal):
+        """Inflate one stored chunk to exactly `nominal` bytes -- the length
+        the AD1 chunking scheme expects at this index -- reporting and
+        zero-filling whatever could not be recovered. Every chunk keeps its
+        own place this way; nothing shifts because an earlier one came back
+        short."""
+        if not raw:
+            self.findings.append(
+                "Chunk %d of %r could not be read; zero-filled."
+                % (index, name))
+            return bytes(nominal)
+        part, over, status = inflate_ended(raw, self._chunk_ceiling())
+        if over:
+            self.findings.append(
+                "A chunk inflates past the %d-byte chunk size this "
+                "container declares; it was cut off there."
+                % self._chunk_ceiling())
+        if not part or status == DAMAGED:
+            self.findings.append(
+                "Chunk %d of %r failed to decompress; zero-filled."
+                % (index, name))
+            return bytes(nominal)
+        if len(part) < nominal:
+            self.findings.append(
+                "Chunk %d of %r is incomplete: its compressed data %s and "
+                "gave %d of %d bytes; the rest reads as zeros."
+                % (index, name, "ends early" if status == STOPPED
+                   else "decompressed short", len(part), nominal))
+            return part + bytes(nominal - len(part))
+        return part[:nominal]
+
     def read_object(self, o, max_bytes=None):
         out = bytearray()
         want = o["size"] if max_bytes is None else min(o["size"], max_bytes)
-        for start, end in self.chunk_table(o):
+        cs = max(1, self.chunk_size)
+        for n, (start, end) in enumerate(self.chunk_table(o)):
             if want and len(out) >= want:
                 break
-            raw = self._read(start, end - start)
-            if not raw:
+            nominal = min(cs, o["size"] - n * cs)
+            if nominal <= 0:
                 break
-            part, over = inflate_capped(raw, self._chunk_ceiling())
-            if over:
-                self.findings.append(
-                    "A chunk inflates past the %d-byte chunk size this "
-                    "container declares; it was cut off there."
-                    % self._chunk_ceiling())
-            out += part if part else raw
+            raw = self._read(start, end - start)
+            out += self._decompress_chunk(n, o["name"], raw, nominal)
+        if want and len(out) < want:
+            out += bytes(want - len(out))
         return bytes(out[:want]) if want else bytes(out)
 
     def read_range(self, o, off, length):
@@ -333,36 +384,29 @@ class Ad1:
         table = self.chunk_table(o)
         first = off // cs
         out = bytearray()
-        pos = first * cs
         for n in range(first, len(table)):
-            start, end = table[n]
-            raw = self._read(start, end - start)
-            if not raw:
-                break
-            part, _ = inflate_capped(raw, self._chunk_ceiling())
-            if not part:
-                part = raw
-            take = part[max(0, off - pos):]
-            out += take
-            pos += len(part)
             if len(out) >= length:
                 break
+            nominal = min(cs, size - n * cs)
+            if nominal <= 0:
+                break
+            start, end = table[n]
+            raw = self._read(start, end - start)
+            part = self._decompress_chunk(n, o["name"], raw, nominal)
+            pos = n * cs
+            out += part[max(0, off - pos):]
         return bytes(out[:length])
 
     def hash_object(self, o, algos=("md5", "sha1")):
         hs = {name: hashlib.new(name) for name in algos}
         total = 0
-        for start, end in self.chunk_table(o):
+        cs = max(1, self.chunk_size)
+        for n, (start, end) in enumerate(self.chunk_table(o)):
+            nominal = min(cs, o["size"] - total)
+            if nominal <= 0:
+                break
             raw = self._read(start, end - start)
-            if not raw:
-                break
-            part, _ = inflate_capped(raw, self._chunk_ceiling())
-            if not part:
-                part = raw
-            room = o["size"] - total
-            if room <= 0:
-                break
-            part = part[:room]
+            part = self._decompress_chunk(n, o["name"], raw, nominal)
             total += len(part)
             for h in hs.values():
                 h.update(part)
@@ -391,14 +435,20 @@ class Ad1Image:
     def __init__(self, path):
         self.path = path
         self.segments = Ad1Segments(path)
-        self.segment_paths = list(self.segments.paths)
-        self.size = self.segments.size
-        self.bytes_per_sector = 512
-        self.header = {}
-        self.stored_md5 = None
-        self.stored_sha1 = None
-        self._pos = 0
-        self.image = Ad1(self.segments)
+        try:
+            self.segment_paths = list(self.segments.paths)
+            self.size = self.segments.size
+            self.bytes_per_sector = 512
+            self.header = {}
+            self.stored_md5 = None
+            self.stored_sha1 = None
+            self._pos = 0
+            self.image = Ad1(self.segments)
+        except BaseException:
+            # Otherwise a logical image the segments reject leaves them
+            # held open, which on Windows keeps the evidence files locked.
+            self.segments.close()
+            raise
         self.findings = (list(self.image.attributes.get("findings", []) or [])
                          + list(self.image.findings))
         self.findings.append(

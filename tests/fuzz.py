@@ -3,8 +3,8 @@
 Seeds are the synthetic images from tests/imagebuild_*.py.  Each case takes
 one seed, applies a few random mutations (bit flips, interesting integers,
 truncation, duplicated spans) and drives the same entry points the app uses:
-open the filesystem and walk it, open a hive and walk it, open an E01 and
-read and verify it.
+open the filesystem and walk it, open a hive and walk it, open an E01 or a
+VMDK and read and verify it, open an AD1 and walk and read its files.
 
 What counts as a finding:
 
@@ -136,11 +136,11 @@ def run_reglog(data, _pair=[]):
     reglog.recover(_pair[0], [data])
 
 
-def run_ewf(data, _dir=[]):
+def run_ewf(data, _dir=[], name="case.E01"):
     from engine import ewf
     if not _dir:
         _dir.append(tempfile.mkdtemp(prefix="strata-fuzz-"))
-    path = os.path.join(_dir[0], "case.E01")
+    path = os.path.join(_dir[0], name)
     with open(path, "wb") as fh:
         fh.write(data)
     img = ewf.open_image(path)
@@ -151,6 +151,10 @@ def run_ewf(data, _dir=[]):
         img.verify()
     finally:
         img.close()
+
+
+def run_vmdk(data):
+    run_ewf(data, name="disk.vmdk")
 
 
 def _seeds_fs():
@@ -177,9 +181,11 @@ def _seeds_fs():
 
 def targets():
     """name -> (seed builder, runner)."""
+    import imagebuild_ad1
     import imagebuild_ewf
     import imagebuild_fat
     import imagebuild_registry
+    import imagebuild_vmdk
     out = {}
     for name, build in _seeds_fs().items():
         out[name] = (build, run_fs)
@@ -195,6 +201,11 @@ def targets():
     out["reglog"] = (lambda: imagebuild_registry.build_dirty_pair()[1],
                      run_reglog)
     out["ewf"] = (lambda: imagebuild_ewf.build_e01()[0], run_ewf)
+    out["vmdk-sparse"] = (imagebuild_vmdk.build_sparse, run_vmdk)
+    out["vmdk-stream"] = (lambda: imagebuild_vmdk.build_stream_optimized()[0],
+                          run_vmdk)
+    # An AD1 opens through the filesystem dispatcher, like a volume.
+    out["ad1"] = (lambda: imagebuild_ad1.build_ad1()[0], run_fs)
     return out
 
 

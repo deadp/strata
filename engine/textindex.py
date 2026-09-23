@@ -273,62 +273,69 @@ def build(fs, case, part, root_node, progress=None, want_live_names=False,
     if not getattr(case, "fts", False):
         return {"error": "This SQLite has no FTS5; indexed search is unavailable."}
 
-    walk = {}
-    entries = filesearch.collect(fs, root_node, state=walk)
-    live_names = {}
-    if want_live_names:
-        for e in entries:
-            n = e.get("mft")
-            if n is not None:
-                live_names.setdefault(n, set()).add(
-                    (e.get("name") or "").lower())
-    entries = [e for e in entries
-               if not e.get("is_dir") and filesearch.matches_filters(e, filters)]
-    total = max(1, len(entries))
-
     case.index.execute(
         "DELETE FROM content_index WHERE part = ? AND evidence = ?",
         (part, str(evidence if evidence is not None else "")))
     case.index.commit()
 
+    walk = {}
+    live_names = {} if want_live_names else None
     rows = []
-    indexed = 0
-    read_total = 0
-    with_exif = 0
-    structured = 0
+    counts = {"candidates": 0, "indexed": 0, "read_total": 0,
+             "with_exif": 0, "structured": 0}
     skip = {"empty": 0, "unreadable": 0, "no_text": 0}
-    for i, e in enumerate(entries):
-        if progress and i % 32 == 0:
-            progress(i / total)
+    evidence_key = str(evidence if evidence is not None else "")
+
+    # A streaming walk: each entry is read and indexed as the walk finds
+    # it, rather than the whole tree being collected into memory first
+    # (#81) -- at a large collection, walking alone was 40+ seconds and
+    # 2.5 GB before a single file was even read.
+    def on_entry(e):
+        if live_names is not None:
+            n = e.get("mft")
+            if n is not None:
+                live_names.setdefault(n, set()).add(
+                    (e.get("name") or "").lower())
+        if e.get("is_dir") or not filesearch.matches_filters(e, filters):
+            return
+        counts["candidates"] += 1
+        if progress and counts["candidates"] % 32 == 0:
+            # No total is known without walking the tree twice, so this
+            # approaches 1 as candidates grows without ever reaching it
+            # (progress(1.0) below marks the real end) -- a single float,
+            # since a caller indexing several partitions in one task
+            # (server's whole-disk build) wraps this into its own overall
+            # fraction and does not accept anything else.
+            progress(counts["candidates"] / (counts["candidates"] + 200))
         if not e.get("size"):
             skip["empty"] += 1
-            continue
+            return
         try:
             data = fs.read_file(e, read_bytes if read_bytes
                                 else (e.get("size") or None))
         except Exception:
             skip["unreadable"] += 1
-            continue
+            return
         if not data:
             skip["unreadable"] += 1
-            continue
-        read_total += len(data)
+            return
+        counts["read_total"] += len(data)
         body = structured_text(data, e.get("name") or "")
         if body:
-            structured += 1
+            counts["structured"] += 1
             if max_text:
                 body = body[:max_text]
         else:
             body = extract_text(data, max_text if max_text else len(data))
         meta = image_metadata_text(data)
         if meta:
-            with_exif += 1
+            counts["with_exif"] += 1
             body = (meta + " " + (body or "")).strip()
             if max_text:
                 body = body[:max_text]
         if not body:
             skip["no_text"] += 1
-            continue
+            return
         node = (e.get("mft") if e.get("mft") is not None
                 else e.get("inode") if e.get("inode") is not None
                 else e.get("oid") if e.get("oid") is not None
@@ -336,25 +343,28 @@ def build(fs, case, part, root_node, progress=None, want_live_names=False,
         rows.append((e.get("name") or "", e.get("path") or "", body,
                      str(node), part, e.get("size") or 0,
                      int(bool(e.get("deleted"))), e.get("modified") or "",
-                     "", "file", str(evidence if evidence is not None else "")))
-        indexed += 1
+                     "", "file", evidence_key))
+        counts["indexed"] += 1
         if len(rows) >= batch:
             _flush(case, rows)
-            rows = []
+            rows.clear()
+
+    filesearch.walk_stream(fs, root_node, on_entry, state=walk)
     if rows:
         _flush(case, rows)
 
+    indexed = counts["indexed"]
     case.set_index_meta("index_part_%d" % part, str(indexed))
     if progress:
         progress(1.0)
     with_content = indexed + skip["unreadable"] + skip["no_text"]
-    out = {"indexed": indexed, "candidates": len(entries),
+    out = {"indexed": indexed, "candidates": counts["candidates"],
            "with_content": with_content, "skip": skip,
            "skipped": sum(skip.values()),
            "coverage": round(indexed / with_content, 4) if with_content else 1.0,
-           "bytes_read": read_total,
-           "structured": structured,
-           "with_exif": with_exif,
+           "bytes_read": counts["read_total"],
+           "structured": counts["structured"],
+           "with_exif": counts["with_exif"],
            "walk_truncated": bool(walk.get("truncated"))}
     if want_live_names:
         out["live_names"] = live_names

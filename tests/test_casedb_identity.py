@@ -135,5 +135,90 @@ class RealCasesStillWork(unittest.TestCase):
         self.assertFalse(is_case(path))
 
 
+class PreviewWritesNothing(unittest.TestCase):
+    """A read-only preview serves the summary and writes nothing at all."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="strata-peekro-")
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+
+    def build_case(self, name):
+        path = os.path.join(self.dir, name)
+        case = Case(path, name=name, examiner="tester")
+        case.add_evidence("/images/laptop.E01",
+                          {"kind": "image", "format": "E01", "size": 123},
+                          label="laptop")
+        case.log("test.entry", {"n": 1})
+        case.close()
+        return path
+
+    def test_preview_changes_nothing(self):
+        path = self.build_case("peeked.strata")
+        # A case built today already has cache/ from its own rw open; strip
+        # it to the legacy shape the roadmap item is about — a case folder
+        # holding nothing but the record.
+        shutil.rmtree(os.path.join(path, casedb.CACHE_DIR))
+        before = snapshot(path)
+        peek = Case(path, read_only=True)
+        self.addCleanup(peek.close)
+        out = peek.summary()
+        self.assertEqual(out["name"], "peeked.strata")
+        self.assertEqual([r["path"] for r in out["evidence"]],
+                         ["/images/laptop.E01"])
+        self.assertTrue(peek.verify_audit()["intact"])
+        self.assertFalse(peek.fts)
+        self.assertIsNone(peek.index_db)
+        self.assertFalse(os.path.isdir(os.path.join(path, casedb.CACHE_DIR)))
+        self.assertEqual(snapshot(path), before)
+
+    def test_preview_does_not_upgrade_stale_schema(self):
+        path = self.build_case("stale.strata")
+        db = sqlite3.connect(os.path.join(path, casedb.DB_NAME))
+        db.execute("ALTER TABLE evidence DROP COLUMN kind")
+        db.commit()
+        db.close()
+
+        peek = Case(path, read_only=True)
+        self.addCleanup(peek.close)
+        self.assertEqual(len(peek.summary()["evidence"]), 1)
+        peek.close()
+
+        probe = sqlite3.connect(os.path.join(path, casedb.DB_NAME))
+        peek_cols = {r[1] for r in probe.execute(
+            "PRAGMA table_info(evidence)")}
+        probe.close()
+        self.assertNotIn("kind", peek_cols)
+
+    def test_plain_open_still_migrates(self):
+        path = self.build_case("regress.strata")
+        db = sqlite3.connect(os.path.join(path, casedb.DB_NAME))
+        db.execute("ALTER TABLE evidence DROP COLUMN kind")
+        db.commit()
+        db.close()
+
+        case = Case(path, examiner="tester")
+        self.addCleanup(case.close)
+        cols = {r[1] for r in case.db.execute(
+            "PRAGMA table_info(evidence)")}
+        self.assertIn("kind", cols)
+        self.assertEqual(case.summary()["evidence"][0]["kind"], "image")
+
+    def test_preview_works_on_a_read_only_folder(self):
+        path = self.build_case("locked.strata")
+        before = snapshot(path)
+
+        def restore():
+            os.chmod(path, 0o755)
+        self.addCleanup(restore)
+        os.chmod(path, 0o555)
+
+        peek = Case(path, read_only=True)
+        out = peek.summary()
+        self.assertTrue(peek.verify_audit()["intact"])
+        peek.close()
+        os.chmod(path, 0o755)
+        self.assertEqual(snapshot(path), before)
+
+
 if __name__ == "__main__":
     unittest.main()
