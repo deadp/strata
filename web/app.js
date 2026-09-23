@@ -1912,19 +1912,38 @@ async function showEntry(e, part, from = null, stream = null) {
       read it.</p>` : ''}`;
 
   const xattrList = st.xattrs || [];
+  const xattrDecoded = d => {
+    if (Array.isArray(d)) {
+      return `<ul class="xattr-urls">${d.map(u => `<li class="mono">${esc(u)}</li>`).join('')}</ul>`;
+    }
+    return kv([
+      d.flags != null && [txt('ui.xattr.flags'), esc(d.flags)],
+      d.agent != null && [txt('ui.xattr.agent'), esc(d.agent)],
+      d.downloaded_at != null && [txt('ui.xattr.downloaded_at'), esc(d.downloaded_at)],
+      d.event_id != null && [txt('ui.xattr.event_id'), esc(d.event_id)],
+    ]);
+  };
   const xattrs = !xattrList.length ? '' : `<h3>${txt('ui.extended_attributes')}</h3>
     ${xattrList.map(a => {
-      const bytes = Uint8Array.from(atob(a.value || ''), c => c.charCodeAt(0));
+      const header = `<div class="runbar">
+          <span>${esc(a.name)}${a.truncated ? ' · truncated' : ''}</span>
+          <span class="len">${fmt.bytes(a.size)}</span>
+        </div>`;
+      if (a.value == null) {
+        return `${header}<p class="hint">${txt('ui.xattr.value_not_captured')}</p>`;
+      }
+      const bytes = Uint8Array.from(atob(a.value), c => c.charCodeAt(0));
+      if (a.decoded != null) {
+        return `${header}${a.name === 'com.apple.metadata:kMDItemWhereFroms'
+          ? `<p class="hint">${txt('ui.xattr.origin_urls')}</p>${xattrDecoded(a.decoded)}`
+          : xattrDecoded(a.decoded)}`;
+      }
       const preview = looksTextual(bytes)
         ? esc(decodeText(bytes).slice(0, 200))
         : Array.from(bytes.slice(0, 32))
             .map(b => b.toString(16).padStart(2, '0')).join(' ')
           + (bytes.length > 32 ? '…' : '');
-      return `<div class="runbar">
-          <span>${esc(a.name)}${a.truncated ? ' · truncated' : ''}</span>
-          <span class="len">${fmt.bytes(a.size)}</span>
-        </div>
-        <div class="hint mono">${preview}</div>`;
+      return `${header}<div class="hint mono">${preview}</div>`;
     }).join('')}`;
 
   const ent = st.entropy && st.entropy.entropy !== null ? `<h3>${txt('ui.show_entry.entropy')}</h3>
@@ -4400,8 +4419,8 @@ async function loadAttack(suggestFor = null) {
   return r;
 }
 
-function fillAttackPicker(suggested) {
-  const sel = $('#tag-attack');
+function fillAttackPicker(suggested, selId = 'tag-attack', noteId = 'tag-attack-note') {
+  const sel = $('#' + selId);
   if (!sel || !attackState.catalogue) return;
   const cat = attackState.catalogue;
   const byTactic = new Map();
@@ -4424,7 +4443,7 @@ function fillAttackPicker(suggested) {
   }
   sel.innerHTML = html;
 
-  const note = $('#tag-attack-note');
+  const note = $('#' + noteId);
   if (note) {
     note.hidden = false;
     note.textContent = cat.complete
@@ -4574,6 +4593,41 @@ async function tagDialog(entry, part) {
   fillAttackPicker(r && r.suggestions);
   $('#dlg-tag').showModal();
 }
+
+async function attackArtefactDialog(kind, index, label, part) {
+  $('#attack-artefact-item').textContent = label || `${kind} #${index}`;
+  const dlg = $('#dlg-attack-artefact');
+  dlg.dataset.kind = kind;
+  dlg.dataset.index = index;
+  dlg.dataset.part = part ?? 0;
+  $('#attack-artefact-technique').value = '';
+  $('#attack-artefact-text').value = '';
+  const r = await loadAttack(kind);
+  fillAttackPicker(r && r.suggestions, 'attack-artefact-technique',
+                   'attack-artefact-note');
+  dlg.showModal();
+}
+
+$('#dlg-attack-artefact').addEventListener('close', async () => {
+  const dlg = $('#dlg-attack-artefact');
+  if (dlg.returnValue !== 'ok') return;
+  const tech = $('#attack-artefact-technique').value;
+  if (!tech) return toast(txt('messages.toast.pick_a_technique'));
+  const t = (attackState.catalogue?.techniques || []).find(x => x.id === tech);
+  const a = await api.post('attack/tag', {
+    part: +dlg.dataset.part,
+    target_kind: 'artefact',
+    target_ref: `${dlg.dataset.kind}:${dlg.dataset.index}`,
+    technique: tech, technique_name: t?.name, tactic: t?.tactic,
+    note: $('#attack-artefact-text').value.trim(), asserted: true,
+    catalogue: attackState.catalogue?.version,
+  });
+  if (a.error) return toast(a.error);
+  attackState.tags = a.tags || [];
+  attackState.summary = a.summary || [];
+  renderAttackTactics();
+  renderAttackList();
+});
 
 async function loadTags() {
   const r = await api.get('tags');
@@ -6341,7 +6395,8 @@ function renderAppcompat(r, part) {
   ].filter(Boolean).join(' · ');
 
   const rows = shim.map((e, i) => `
-    <div class="result" data-k="shim" data-i="${i}">
+    <div class="result" data-k="shim" data-i="${i}"
+         data-label="${esc((e.path || '').split('\\').pop())}">
       <div class="top"><span class="kind">shimcache #${e.order}</span>
         <span class="off">${esc(e.control_set || '')}</span></div>
       <div class="name">${esc((e.path || '').split('\\').pop())}</div>
@@ -6361,6 +6416,11 @@ function renderAppcompat(r, part) {
     </div>`)).join('');
 
   box.innerHTML = notes + `<div class="results-head">${esc(head)}</div>` + rows;
+  bindResults(box, () => {}, el => el.dataset.k === 'shim'
+    ? [{ label: txt('ui.attack_artefact.attribute_menu'),
+         action: () => attackArtefactDialog('appcompat', +el.dataset.i,
+                                            el.dataset.label, part) }]
+    : null);
   tabCount('triage', shim.length + files.length);
 }
 

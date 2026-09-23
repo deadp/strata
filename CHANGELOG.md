@@ -24,6 +24,29 @@ records, not how the code changed.
   names the piece the way that set numbers it. An image summary or info
   file sitting beside the pieces is not mistaken for one
   ([#45](https://github.com/switch-nz/strata/issues/45)).
+- **Extended attributes on APFS and HFS+ files are now decoded, not just
+  listed.** APFS already walked a file's extended attributes but discarded
+  their value, and HFS+ located the Attributes fork without ever opening
+  it, so neither surfaced anything beyond an attribute's name and size.
+  Both now read the value when it's stored inline, and decode the two most
+  examination-relevant ones: `com.apple.quarantine` (Gatekeeper's download
+  flag — agent, timestamp, event id) and
+  `com.apple.metadata:kMDItemWhereFroms` (the URL a file was downloaded
+  from, and often the page that linked to it). The file inspector's
+  Extended Attributes section shows the decoded fields alongside the raw
+  value, and notes plainly when a large, fork-based attribute's content
+  wasn't captured.
+- **A ShimCache entry (or any artefact row) can now be attributed to an
+  ATT&CK technique, and that attribution shows in the report.** ATT&CK
+  attribution existed only for tagged files; an artefact row like a
+  ShimCache entry has no filesystem handle to tag, so there was no way
+  to attribute one at all, and the report's ATT&CK section stayed
+  empty for it. Right-clicking a ShimCache entry now offers "Attribute
+  ATT&CK technique…", using the same picker and suggested-techniques
+  catalogue tagging a file already has; the attribution appears in the
+  ATT&CK tab and the report exactly as a file's would
+  ([#63](https://github.com/switch-nz/strata/issues/63), the report
+  half — the on-screen "examined, not run" caveat shipped earlier).
 - **Re-running an artefact collector now asks first if it already has a
   result for that evidence item.** `save_artefact` replaces the earlier
   row silently, which is fine on a first pass and wrong once an examiner
