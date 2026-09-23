@@ -3,12 +3,54 @@ import email
 import email.policy
 import email.utils
 import re
+from html.parser import HTMLParser
 
 FROM_LINE = re.compile(rb"^From (\S*) +(.*)$")
 ESCAPED = re.compile(rb"^(>+)From ", re.M)
 
+MAX_HTML_TEXT = 256 * 1024
+
 def _unescape(body):
     return ESCAPED.sub(lambda m: b">" * (len(m.group(1)) - 1) + b"From ", body)
+
+class _VisibleText(HTMLParser):
+    """The text a browser would show, not the markup: script/style content
+    is dropped, everything else is kept as plain text -- no tag is ever
+    interpreted, only its own textual content."""
+
+    def __init__(self):
+        super().__init__()
+        self._skip = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if not self._skip and data.strip():
+            self.parts.append(data.strip())
+
+def _html_to_text(markup, limit=MAX_HTML_TEXT):
+    """A message with no text/plain part is reduced to its visible text, so
+    there is something to show that is not markup -- never rendered as
+    HTML, and never returned at all if the parser cannot make sense of it."""
+    if not markup:
+        return None
+    try:
+        p = _VisibleText()
+        p.feed(markup)
+        p.close()
+    except Exception:
+        return None
+    text = re.sub(r"[ \t]+", " ", "\n".join(p.parts)).strip()
+    if not text:
+        return None
+    return text[:limit] if limit else text
 
 def split_messages(data):
     out = []
@@ -98,6 +140,7 @@ def parse_message(raw, offset=None):
     except Exception:
         pass
 
+    html_text = _html_to_text(html) if html and text is None else None
     status = (msg.get("Status") or "") + (msg.get("X-Status") or "")
     return {
         "offset": offset,
@@ -119,6 +162,7 @@ def parse_message(raw, offset=None):
         "attachment_count": len(attachments),
         "text": text,
         "html_bytes": len(html) if html else 0,
+        "html_text": html_text,
         "headers": {k: str(v) for k, v in msg.items()},
     }
 

@@ -13,6 +13,117 @@ records, not how the code changed.
 
 ### Added
 
+- **Extended attributes on APFS and HFS+ files are now decoded, not just
+  listed.** APFS already walked a file's extended attributes but discarded
+  their value, and HFS+ located the Attributes fork without ever opening
+  it, so neither surfaced anything beyond an attribute's name and size.
+  Both now read the value when it's stored inline, and decode the two most
+  examination-relevant ones: `com.apple.quarantine` (Gatekeeper's download
+  flag — agent, timestamp, event id) and
+  `com.apple.metadata:kMDItemWhereFroms` (the URL a file was downloaded
+  from, and often the page that linked to it). The file inspector's
+  Extended Attributes section shows the decoded fields alongside the raw
+  value, and notes plainly when a large, fork-based attribute's content
+  wasn't captured.
+- **A ShimCache entry (or any artefact row) can now be attributed to an
+  ATT&CK technique, and that attribution shows in the report.** ATT&CK
+  attribution existed only for tagged files; an artefact row like a
+  ShimCache entry has no filesystem handle to tag, so there was no way
+  to attribute one at all, and the report's ATT&CK section stayed
+  empty for it. Right-clicking a ShimCache entry now offers "Attribute
+  ATT&CK technique…", using the same picker and suggested-techniques
+  catalogue tagging a file already has; the attribution appears in the
+  ATT&CK tab and the report exactly as a file's would
+  ([#63](https://github.com/switch-nz/strata/issues/63), the report
+  half — the on-screen "examined, not run" caveat shipped earlier).
+- **Re-running an artefact collector now asks first if it already has a
+  result for that evidence item.** `save_artefact` replaces the earlier
+  row silently, which is fine on a first pass and wrong once an examiner
+  has worked from the earlier output. Running one again from the Run
+  Artefacts picker now confirms first when a result already exists,
+  and does nothing if declined
+  ([#71](https://github.com/switch-nz/strata/issues/71)).
+- **Carving now recovers a fragmented file split by exactly one gap of
+  other data, for footer-terminated types.** A signature carver reads
+  forward in a straight line, so a deleted file whose two fragments were
+  separated by other data that later filled the space between them
+  either carved with that unrelated data spliced into the middle, or
+  missed the file entirely. When a header and its footer (PNG, JPEG,
+  GIF, PDF, ZIP) are separated by exactly one still-allocated extent,
+  the hit is now split into two fragments around it; exporting or
+  marking it reads and concatenates the real fragments, skipping the
+  gap, with a "fragmented" flag and a note on how many bytes were
+  excluded. Two or more gaps, or a gap too close to the header or
+  footer to leave room for it, are left as before, unsplit
+  ([#66](https://github.com/switch-nz/strata/issues/66), two-fragment
+  gap carving of footer-terminated types only).
+
+## [0.2.0] - 2026-09-19
+
+A feature and correctness release: fuzzy hashing and a Find Similar report,
+LUKS2 Argon2 unlock, split raw sets, and PST attachment content, alongside a
+large batch of parser correctness fixes across ext4, exFAT, FAT, EWF, AD1,
+VMDK and the registry that closes out #19 in full. Upgrade from 0.1.2.
+
+### Added
+
+- **A fuzzy hash is now computed alongside MD5, SHA-1 and SHA-256, and a
+  "Find similar" report groups files that are alike rather than
+  identical.** Only exact-digest matches could ever be found before, so an
+  edited or partially-overwritten copy of a file shared nothing with the
+  original. Every hash run now also produces a ssdeep-compatible
+  context-triggered piecewise hash; "Find similar" on the Hashes tab scores
+  every pair of already-hashed files across evidence items and reports
+  those above a similarity threshold, alongside the existing exact-digest
+  "Find duplicates" ([#65](https://github.com/switch-nz/strata/issues/65),
+  fuzzy hashing only; image similarity remains open — it needs pixel-level
+  image decoding this codebase does not otherwise have a reason to carry).
+- **Gallery thumbnails no longer load the full-size image for every
+  picture.** A photo's own embedded EXIF thumbnail — what most camera
+  and phone photos already carry, typically a few KB against a
+  multi-MB original — is used when present. An image with no embedded
+  thumbnail (a screenshot, a thumbnail-less JPEG) falls back to the
+  full-size read exactly as before; nothing is invented for it
+  ([#80](https://github.com/switch-nz/strata/issues/80)).
+- **The Run Artefacts picker now hints at what is actually there before
+  you run anything.** Recycle Bin, Prefetch and browser-profile presence
+  are checked with one or two directory reads each — no parsing, no
+  filesystem walk — and shown as "12 items found" / "3 .pf files found" /
+  "2 browser profiles found" next to the matching row, so a full scan is
+  a choice rather than a guess.
+- **ext4 extended attributes beyond the inline file-data one are now
+  read.** Only the in-inode `system.data` attribute (inline file content
+  kept in the same entry format) was read; every other attribute — other
+  in-inode entries, and anything in an external xattr block reached via
+  `i_file_acl` — was invisible. Every attribute is now listed with its
+  namespace prefix and value, size-capped, in the file inspector
+  ([#52](https://github.com/switch-nz/strata/issues/52)).
+- **A duplicate-files report finds a digest seen under more than one
+  evidence item.** Digests were cached per file but never compared across
+  evidence items, so a file appearing in two exhibits went unnoticed. "Find
+  duplicates" on the Hashes tab groups files by digest and shows every
+  exhibit and path that shares one — only among files a hash run has
+  already covered, since nothing here hashes a file just to compare it
+  ([#67](https://github.com/switch-nz/strata/issues/67)).
+- **A PST attachment's content can now be viewed, not only its name and
+  size.** The mail viewer listed every attachment's filename and size but
+  had no way to read what was inside one. Clicking an attachment now
+  fetches and decodes it on demand — shown inline for an image, as text
+  for anything readable, or noted as binary of a given size and type
+  otherwise — without decoding every attachment in every message up front
+  ([#61](https://github.com/switch-nz/strata/issues/61), attachment
+  content only; ANSI PST files and OST-specific structures remain open).
+- **Hash-set matches now show in the folder and search views, not only in
+  the hash run.** A file already hashed (in this or an earlier run) whose
+  digest is in an imported hash set is flagged directly where it is found —
+  the folder listing and a file-content or file-name search — instead of
+  only in the Hash tab's own results
+  ([#60](https://github.com/switch-nz/strata/issues/60)).
+- **A registry value over 2 KB can now be fetched in full.** It was shown
+  in the interface as its size only, with nothing behind it — the parser
+  reads the full value already, the interface just had no way to ask for
+  it. A "load" affordance on such a value now fetches and decodes it in
+  full ([#79](https://github.com/switch-nz/strata/issues/79)).
 - **Split raw sets** (`.001`, `.002`, …, or numbered from `.000`) are opened
   as one disk. Previously opening the first piece read that piece alone, with
   nothing to say the rest of the disk was missing. The set is joined whichever
@@ -22,15 +133,68 @@ records, not how the code changed.
   size differs from the others is reported, since data after it may be at the
   wrong offset ([#19](https://github.com/switch-nz/strata/issues/19)).
 
+- **LUKS2 volumes with Argon2 keyslots unlock by password.** Argon2d,
+  Argon2i and Argon2id (RFC 9106) are implemented in Python from the RFC's
+  test vectors, so a LUKS2 volume whose keyslots use Argon2 now opens where
+  it was previously refused. The derived key is cached per slot for the
+  session, so reopening the volume does not pay the derivation cost again.
+  Note that Argon2 key derivation in Python is slow: deriving a key with
+  typical parameters (64 MiB, 3 passes) takes on the order of tens of
+  seconds per attempt, and a progress bar shows the work.
+
+### Changed
+
+- **Building the content index no longer walks the whole tree into memory
+  before indexing the first file.** Each file is now read and indexed as
+  the walk reaches it. On a large collection this was measured at
+  roughly 500 bytes and 8 µs per entry regardless of content size — about
+  2.5 GB and 40+ seconds of walking alone at the 5,000,000-entry ceiling,
+  before a single file was read ([#81](https://github.com/switch-nz/strata/issues/81)).
+- **Scrubbing a large video or image no longer re-reads the whole file
+  for every Range request.** `/api/file` read the file again, up to its
+  256 MB stream cap, on each request; it now seeks directly to the
+  requested bytes where the filesystem supports it, or reuses a small
+  file's already-read content for the rest of the session, the same way
+  the hex view already does
+  ([#78](https://github.com/switch-nz/strata/issues/78)).
+- **Times recorded with no time zone are no longer shown as UTC.** FAT
+  timestamps, the DOS times inside shellbags, and exFAT timestamps whose
+  entry records no valid UTC offset are local time on a clock whose zone the
+  media does not say. They were marked and displayed as UTC, and converted to
+  the chosen display zone as if they were. They are now shown exactly as
+  recorded, with no zone, no conversion and no label, in the interface and
+  the report. Deciding which zone they belong to is left to the examiner.
+  The timeline still has to place them somewhere to sort them, and orders
+  them as if they were UTC ([#19](https://github.com/switch-nz/strata/issues/19)).
+
 ### Fixed
-- **Tagged deleted exFAT files that were contiguous could export the wrong
-  content.** The flag saying an exFAT stream is contiguous — no FAT chain,
-  the file is one extent from its start cluster — did not make the trip from
-  the tag to the export. A deleted contiguous file was then read by walking
-  the FAT, which after deletion may describe entirely different clusters,
-  silently exporting the wrong bytes. Contiguity now travels with the tag
-  like deleted status already does, so the export reads the exact extent the
-  directory entry described
+- **A ShimCache entry proves a file was examined, not that it ran — but
+  nothing said so next to the results.** The distinction was stated only in
+  a help string shown before collection ran. It's now a standing note on
+  the results themselves whenever any ShimCache entries are found
+  ([#63](https://github.com/switch-nz/strata/issues/63)).
+- Opening a tagged, deleted, contiguous exFAT file from the Tags panel (not
+  exporting it — viewing it) could show the wrong content, for the same
+  reason #94 fixed for export: the entry built for the hex view carried
+  `deleted` but not `contiguous`. Both now travel with it.
+- **The mail viewer crashed on a PST message with a sender or recipient.**
+  PST gives a single formatted address string per field where mbox gives a
+  list, and the viewer assumed every message used mbox's shape, so any PST
+  message with a `From` or `To` failed to render at all. Both shapes are
+  now handled.
+- **A message's body was never shown.** mbox and PST both decode a
+  message's text server-side already, but the mail viewer only ever listed
+  headers — clicking a message did nothing. A message can now be opened to
+  read its plain-text body (or, for an HTML-only message, its visible text
+  with the markup stripped out — never rendered as HTML) and its attachment
+  names
+  ([#93](https://github.com/switch-nz/strata/issues/93)).
+- **A tagged, deleted, contiguous exFAT file could export the wrong content.**
+  exFAT reads a NoFatChain stream by its extent, not by walking the FAT —
+  the same fix #91 made for FAT and ext4's `deleted` flag, but keyed on a
+  different field this format never carried through a tag. Tagged items now
+  record whether an exFAT stream is contiguous, so re-exporting one by
+  handle alone reads it the way it needs to be read
   ([#94](https://github.com/switch-nz/strata/issues/94)).
 - A damaged AD1's chunk size, if implausible, is no longer trusted for how
   much to allocate when a chunk fails to decompress; a header cut short
@@ -139,17 +303,11 @@ records, not how the code changed.
   rather than silently read as if it were complete
   ([#19](https://github.com/switch-nz/strata/issues/19)).
 
-### Changed
+### Known issues
 
-- **Times recorded with no time zone are no longer shown as UTC.** FAT
-  timestamps, the DOS times inside shellbags, and exFAT timestamps whose
-  entry records no valid UTC offset are local time on a clock whose zone the
-  media does not say. They were marked and displayed as UTC, and converted to
-  the chosen display zone as if they were. They are now shown exactly as
-  recorded, with no zone, no conversion and no label, in the interface and
-  the report. Deciding which zone they belong to is left to the examiner.
-  The timeline still has to place them somewhere to sort them, and orders
-  them as if they were UTC ([#19](https://github.com/switch-nz/strata/issues/19)).
+The known issues listed for 0.1.2 are resolved:
+[#19](https://github.com/switch-nz/strata/issues/19) is closed, including
+the two registry crashes on truncated hives it was tracking.
 
 ## [0.1.2] - 2026-09-17
 
@@ -316,7 +474,8 @@ Corroborate results in these areas with another tool before relying on them.
   ([#15](https://github.com/switch-nz/strata/issues/15),
   [#19](https://github.com/switch-nz/strata/issues/19)).
 
-[Unreleased]: https://github.com/switch-nz/strata/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/switch-nz/strata/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/switch-nz/strata/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/switch-nz/strata/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/switch-nz/strata/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/switch-nz/strata/releases/tag/v0.1.0

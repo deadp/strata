@@ -586,6 +586,21 @@ select:focus, input:focus, textarea:focus { border-color: var(--dim); }
 }
 .result .flag.warn { color: var(--amber); border-color: var(--amber-dim); }
 
+.mail-detail { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line);
+              cursor: default; }
+.mail-detail .empty { padding: 4px 0; }
+.mail-headers { font-size: 11px; color: var(--dimmer); line-height: 1.7; }
+.mail-headers strong { color: var(--text); font-weight: 500; }
+.mail-body { margin: 8px 0 0; padding: 0; white-space: pre-wrap;
+            word-break: break-word; font-size: 12px; line-height: 1.5;
+            color: var(--text); max-height: 320px; overflow-y: auto; }
+.mail-attachments { margin-top: 8px; font-size: 11px; color: var(--dimmer); }
+.mail-att { padding: 2px 0; }
+.mail-att-preview { margin: 4px 0 6px; border: 1px solid var(--line); }
+.mail-att-preview .pv-image { height: 180px; }
+.mail-att-preview .pv-text { max-height: 180px; overflow-y: auto; font-size: 11px; }
+.mail-att-preview .pv-note { padding: 6px 8px; font-size: 11px; }
+
 .empty { color: var(--dimmer); padding: 18px 14px; font-size: 12px;
          line-height: 1.6; }
 
@@ -1294,6 +1309,9 @@ em.kind.notable    { color: var(--amber); }
 .kv dd { margin: 0; word-break: break-all; }
 .kv dd.num { color: var(--amber); }
 
+.xattr-urls { list-style: none; padding: 0; margin: 4px 0 0;
+              display: flex; flex-direction: column; gap: 2px; word-break: break-all; }
+
 .runbar {
   display: flex; align-items: center; gap: 8px;
   padding: 5px 7px; margin: 3px 0;
@@ -1735,6 +1753,16 @@ tr.is-typemis td.nm { color: var(--alarm); }
   padding: 0 4px; margin-left: 5px; text-transform: uppercase;
   letter-spacing: .06em;
 }
+tr.is-match-known_bad td.nm { color: var(--alarm); }
+tr.is-match-notable td.nm { color: var(--amber); }
+tr.is-match-known_good td.nm { color: var(--good); }
+.hash-flag {
+  border: 1px solid; font-size: 9px; padding: 0 4px; margin-left: 5px;
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.hash-flag.known_bad { color: var(--alarm); border-color: var(--alarm); }
+.hash-flag.notable { color: var(--amber); border-color: var(--amber); }
+.hash-flag.known_good { color: var(--good); border-color: var(--good); }
 
 .regrep { border: 1px solid var(--line); margin-bottom: 10px; }
 .regrep-head {
@@ -1797,6 +1825,7 @@ tr.is-typemis td.nm { color: var(--alarm); }
 .pick-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .pick-label { color: var(--text); }
 .pick-answers { color: var(--dim); font-size: 11px; line-height: 1.45; }
+.pick-presence { color: var(--amber); font-size: 10.5px; }
 .pick-why { color: var(--alarm-text); font-size: 10.5px; }
 
 .pick.is-off { cursor: default; }

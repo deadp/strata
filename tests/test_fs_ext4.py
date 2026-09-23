@@ -431,5 +431,66 @@ class Robustness(unittest.TestCase):
         self.assertEqual(journal.read_recovered(12), b"")
 
 
+class ExtendedAttributes(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.image = build.build_ext4_xattrs()
+
+    def setUp(self):
+        self.fs = mount(self.image)
+
+    def test_in_inode_xattrs_are_listed_with_prefix_and_value(self):
+        ino = self.fs.inode(build.INO_XATTR_INLINE)
+        attrs = {a["name"]: a for a in ino.xattrs()}
+        self.assertEqual(attrs["user.comment"]["value"], b"hello world")
+        self.assertEqual(attrs["user.comment"]["size"], len(b"hello world"))
+        self.assertFalse(attrs["user.comment"]["truncated"])
+        self.assertEqual(attrs["security.selinux"]["value"], b"unconfined_u")
+
+    def test_external_block_xattrs_are_read_via_i_file_acl(self):
+        ino = self.fs.inode(build.INO_XATTR_BLOCK)
+        attrs = {a["name"]: a for a in ino.xattrs()}
+        self.assertEqual(attrs["trusted.origin"]["value"], b"remote-server")
+        self.assertNotIn("user.comment", attrs)
+
+    def test_a_file_with_no_xattr_area_reports_none(self):
+        self.assertEqual(self.fs.inode(2).xattrs(), [])
+
+    def test_a_value_over_the_cap_is_truncated(self):
+        ino = self.fs.inode(build.INO_XATTR_INLINE)
+        attrs = {a["name"]: a for a in ino.xattrs(max_value=5)}
+        self.assertEqual(attrs["user.comment"]["value"], b"hello")
+        self.assertEqual(attrs["user.comment"]["size"], len(b"hello world"))
+        self.assertTrue(attrs["user.comment"]["truncated"])
+
+    def test_system_data_is_not_listed_as_an_attribute(self):
+        # system.data is inline file content in this same entry format,
+        # not something an examiner asking for "attributes" wants to see
+        # twice -- confirmed against the main fixture image, which
+        # already has one (inline_long.txt).
+        fs = mount(build.build_ext4())
+        ino = fs.inode(build.INO_INLINE_LONG)
+        names = {a["name"] for a in ino.xattrs()}
+        self.assertNotIn("system.data", names)
+        self.assertEqual(ino.inline_xattr(),
+                         build.CONTENT["inline_long.txt"][60:])
+
+    def test_stat_reports_xattrs_json_safely(self):
+        # stat() feeds /api/stat directly; a raw bytes value would fail
+        # to serialise cleanly to JSON (json.dumps's default=str fallback
+        # would show a literal "b'...'" repr instead of the value).
+        import base64
+        entry = {"inode": build.INO_XATTR_INLINE}
+        info = self.fs.stat(entry)
+        attrs = {a["name"]: a for a in info["xattrs"]}
+        self.assertEqual(base64.b64decode(attrs["user.comment"]["value"]),
+                         b"hello world")
+        self.assertEqual(attrs["user.comment"]["size"], len(b"hello world"))
+
+    def test_stat_omits_xattrs_entirely_when_there_are_none(self):
+        info = self.fs.stat({"inode": 2})
+        self.assertNotIn("xattrs", info)
+
+
 if __name__ == "__main__":
     unittest.main()

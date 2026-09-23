@@ -7,6 +7,7 @@ import threading
 import time
 from urllib.request import pathname2url
 
+from . import fuzzyhash
 from . import version as version_mod
 from .text import t as _t
 
@@ -67,7 +68,9 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 -- from a bookmark. It is identified by the filesystem's own handle (MFT
 -- record, inode, object id, start cluster) so it survives reopening the case,
 -- and it carries a copy of the metadata so a report can be written without
--- re-reading the evidence.
+-- re-reading the evidence. `contiguous` is exFAT-specific: a NoFatChain
+-- stream is read by extent rather than by walking the FAT, and getting that
+-- wrong on a deleted item silently returns the wrong content (#94).
 CREATE TABLE IF NOT EXISTS tagged_items (
     id INTEGER PRIMARY KEY,
     evidence_id INTEGER NOT NULL,
@@ -127,6 +130,10 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     node TEXT, path TEXT, name TEXT, size INTEGER,
     deleted INTEGER DEFAULT 0,
     md5 TEXT, sha1 TEXT, sha256 TEXT,
+    -- ssdeep-style context-triggered piecewise hash (engine/fuzzyhash.py):
+    -- unlike the three above, a partial match here means the files are
+    -- alike, not identical.
+    fuzzy TEXT,
     -- How many bytes the digests were actually taken over. Equal to `size`
     -- for a file that read whole. Stored because a digest over a short read
     -- is not the file's digest, and sixty-four hex characters say nothing
@@ -411,6 +418,7 @@ class Case:
         self.db.executescript(SCHEMA)
         self._migrate_bookmarks()
         self._migrate_file_hashes()
+        self._migrate_fuzzy_hash()
         self._migrate_bookmark_frame()
         self._migrate_evidence_kind()
         self._migrate_tagged_items()
@@ -458,6 +466,13 @@ class Case:
                              row["id"]))
         self.db.commit()
 
+    def _migrate_tagged_items(self):
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(tagged_items)")}
+        if "contiguous" not in cols:
+            self.db.execute(
+                "ALTER TABLE tagged_items ADD COLUMN contiguous INTEGER")
+            self.db.commit()
+
     def _migrate_bookmarks(self):
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(bookmarks)")}
         for name, decl in (("category", "TEXT"), ("colour", "TEXT"),
@@ -474,12 +489,10 @@ class Case:
                             "read_bytes INTEGER")
         self.db.commit()
 
-    def _migrate_tagged_items(self):
-        cols = {r[1] for r in self.db.execute("PRAGMA table_info(tagged_items)")}
-        if "contiguous" in cols:
-            return
-        self.db.execute("ALTER TABLE tagged_items ADD COLUMN "
-                        "contiguous INTEGER")
+    def _migrate_fuzzy_hash(self):
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(file_hashes)")}
+        if "fuzzy" not in cols:
+            self.db.execute("ALTER TABLE file_hashes ADD COLUMN fuzzy TEXT")
         self.db.commit()
 
     def _migrate_bookmark_frame(self):
@@ -903,16 +916,15 @@ class Case:
                    else item.get("start_cluster"))
         cur = self.db.execute(
             "INSERT INTO tagged_items (evidence_id,part,node,path,name,size,"
-            "is_dir,deleted,contiguous,tag,note,created_at,examiner,"
-            "modified,accessed,file_created) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "is_dir,deleted,tag,note,created_at,examiner,modified,accessed,"
+            "file_created,contiguous) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(evidence_id,part,node,tag) DO UPDATE SET note=excluded.note",
             (evidence_id, part, node, item.get("path"), item.get("name"),
              item.get("size"), int(bool(item.get("is_dir"))),
-             int(bool(item.get("deleted"))),
-             int(bool(item.get("contiguous"))), tag, note, utcnow(),
-             self.examiner, item.get("modified"), item.get("accessed"),
-             item.get("created")))
+             int(bool(item.get("deleted"))), tag, note, utcnow(), self.examiner,
+             item.get("modified"), item.get("accessed"), item.get("created"),
+             int(bool(item.get("contiguous")))
+             if item.get("contiguous") is not None else None))
         self.db.commit()
         self.log("item.tag", {"path": item.get("path"), "name": item.get("name"),
                               "tag": tag, "node": node})
@@ -1005,14 +1017,16 @@ class Case:
     def record_hashes(self, evidence_id, rows, part=0):
         self.db.executemany(
             "INSERT INTO file_hashes (evidence_id,part,node,path,name,size,"
-            "deleted,md5,sha1,sha256,read_bytes,computed_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+            "deleted,md5,sha1,sha256,fuzzy,read_bytes,computed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(evidence_id,part,node) DO UPDATE SET "
             "md5=excluded.md5, sha1=excluded.sha1, sha256=excluded.sha256, "
+            "fuzzy=excluded.fuzzy, "
             "read_bytes=excluded.read_bytes, computed_at=excluded.computed_at",
             [(evidence_id, part, r["node"], r.get("path"), r.get("name"),
               r.get("size"), int(bool(r.get("deleted"))), r.get("md5"),
-              r.get("sha1"), r.get("sha256"), r.get("read"), utcnow())
+              r.get("sha1"), r.get("sha256"), r.get("fuzzy"), r.get("read"),
+              utcnow())
              for r in rows])
         self.db.commit()
         return len(rows)
@@ -1161,9 +1175,9 @@ class Case:
 
     def hash_map(self, evidence_id, part):
         return {r["node"]: {"md5": r["md5"], "sha1": r["sha1"],
-                            "sha256": r["sha256"]}
+                            "sha256": r["sha256"], "fuzzy": r["fuzzy"]}
                 for r in self.db.execute(
-                    "SELECT node,md5,sha1,sha256 FROM file_hashes "
+                    "SELECT node,md5,sha1,sha256,fuzzy FROM file_hashes "
                     "WHERE evidence_id=? AND part=?", (evidence_id, part))
                 if r["node"] is not None}
 
@@ -1172,6 +1186,71 @@ class Case:
             "SELECT * FROM file_hashes WHERE evidence_id=? AND part=? AND node=?",
             (evidence_id, part, str(node))).fetchone()
         return dict(r) if r else None
+
+    def duplicate_files(self):
+        """Files whose SHA-256 was seen under more than one evidence item
+        -- only among files a hash run has actually covered, since a
+        digest is never computed implicitly here. Largest group first."""
+        rows = self.db.execute(
+            "SELECT h.* FROM file_hashes h JOIN ("
+            " SELECT sha256 FROM file_hashes"
+            " WHERE sha256 IS NOT NULL AND sha256 != ''"
+            " GROUP BY sha256 HAVING COUNT(DISTINCT evidence_id) > 1"
+            ") dup ON h.sha256 = dup.sha256 "
+            "ORDER BY h.sha256, h.evidence_id, h.part").fetchall()
+        groups = {}
+        for r in rows:
+            groups.setdefault(r["sha256"], []).append(dict(r))
+        out = [{"sha256": k, "items": v} for k, v in groups.items()]
+        out.sort(key=lambda g: len(g["items"]), reverse=True)
+        return out
+
+    def similar_files(self, threshold=60, limit=500):
+        """Pairs of files whose fuzzy hashes are alike (score >= threshold),
+        across all evidence -- like duplicate_files, this only compares what
+        a hash run has already fuzzy-hashed, never hashes anything itself.
+        Unlike an exact digest, ssdeep similarity isn't transitive, so
+        results are scored pairs rather than groups, and exact duplicates
+        (same SHA-256) are left to Find Duplicates rather than repeated here.
+
+        ssdeep hashes only ever score non-zero when their block sizes match
+        or one is double the other, so files are bucketed by block size
+        first -- comparing every fuzzy-hashed file against every other
+        would be needless work on a case of any size."""
+        rows = [dict(r) for r in self.db.execute(
+            "SELECT * FROM file_hashes WHERE fuzzy IS NOT NULL AND fuzzy != ''")]
+        buckets = {}
+        for r in rows:
+            try:
+                bs = int(r["fuzzy"].split(":", 1)[0])
+            except (ValueError, IndexError):
+                continue
+            buckets.setdefault(bs, []).append(r)
+
+        def consider(a, b, pairs, seen):
+            key = (a["id"], b["id"]) if a["id"] < b["id"] else (b["id"], a["id"])
+            if key in seen:
+                return
+            seen.add(key)
+            if a["sha256"] and b["sha256"] and a["sha256"] == b["sha256"]:
+                return
+            score = fuzzyhash.compare(a["fuzzy"], b["fuzzy"])
+            if score >= threshold:
+                pairs.append((score, a, b))
+
+        pairs, seen = [], set()
+        for bs, group in buckets.items():
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    consider(group[i], group[j], pairs, seen)
+            for other in buckets.get(bs * 2, []):
+                for a in group:
+                    for b in other:
+                        consider(a, b, pairs, seen)
+
+        pairs.sort(key=lambda p: -p[0])
+        return [{"score": score, "a": a, "b": b}
+                for score, a, b in pairs[:limit]]
 
     @_writes
     def add_hash_set(self, name, kind, source, digests):

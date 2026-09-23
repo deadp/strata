@@ -103,8 +103,17 @@ def shimcache_from_system(hive):
             parsed = parse_shimcache(raw)
             parsed["control_set"] = cs
             parsed["bytes"] = len(raw)
+            if parsed["entries"]:
+                parsed["findings"].append(SHIMCACHE_CAVEAT)
             out.append(parsed)
     return out
+
+SHIMCACHE_CAVEAT = (
+    "An AppCompatCache/ShimCache entry proves the file was present and "
+    "examined by the compatibility subsystem -- typically at execution, but "
+    "also on some file-open and file-copy operations. It is not proof the "
+    "program ran; Amcache records execution more directly and is not "
+    "cleared by ShimCache-clearing tools.")
 
 LEGACY_FILE_FIELDS = {
     "0": "product_name", "1": "company_name", "5": "product_version",

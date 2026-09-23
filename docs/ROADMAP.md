@@ -56,9 +56,6 @@ recognised and refused by name today; these entries are about *reading* it.
       and hard links through the private metadata directory.
 - [ ] **APFS snapshots** — the superblock's snapshot metadata is located but
       snapshots are not listed or read.
-- [ ] **ext4 extended attributes** — only the in-inode `system.data`
-      attribute that holds inline data is read; the rest (in-inode and
-      external xattr blocks) are not shown.
 
 ### Encryption
 
@@ -67,8 +64,10 @@ recognised and refused by name today; these entries are about *reading* it.
       recovery key, so neither can be used yet.
 - [ ] **BitLocker with the Elephant diffuser** — Vista and Windows 7 volumes
       are identified and refused rather than decrypted wrongly.
-- [ ] **LUKS2 with Argon2** — needs a standard-library-only Argon2, which is
-      the hard part; the rest of LUKS2 is the same shape as LUKS1.
+- [ ] **LUKS2 with Argon2 against real cryptsetup images** — implemented and
+      verified against synthetic images built to cryptsetup's layout; real
+      cryptsetup-written volumes still need to be confirmed before this can
+      be called done.
 - [ ] **FileVault 2** (APFS and Core Storage).
 
 ---
@@ -81,16 +80,11 @@ recognised and refused by name today; these entries are about *reading* it.
 - [ ] **Browser disk cache** — the on-disk cache format, separate from the
       history databases already read.
 - [ ] **Event ID descriptions**, and timelining across logs.
-- [ ] **Hash-set matches shown in the folder and search views**, not only in
-      the hash run.
-- [ ] **PST:** ANSI (32-bit) files are refused today; attachment *content*
-      (only names and sizes are read); OST-specific structures.
+- [ ] **PST:** ANSI (32-bit) files are refused today; OST-specific
+      structures are not handled.
 - [ ] **Legacy Office body text** — Word's piece table, Excel's BIFF stream,
       PowerPoint's records. Properties are read; the body is deliberately left
       unread rather than guessed at.
-- [ ] **ShimCache caveat on screen** — an entry proves a file was examined,
-      not that it ran. The distinction exists in the parser's reasoning but is
-      not shown to the examiner.
 
 ---
 
@@ -153,9 +147,15 @@ Agreeing with another tool is agreement, not verification.
 
 ## Analysis
 
-- [ ] Fuzzy hashing (ssdeep-style) and image similarity.
-- [ ] Carving across fragments, starting with bi-fragment gap carving.
-- [ ] Duplicate detection across evidence items.
+- [ ] Image similarity (perceptual hashing) -- needs pixel-level image
+      decoding this codebase does not otherwise have a reason to carry, so
+      it is scoped separately from fuzzy hashing (done).
+- [ ] Carving across fragments beyond the first slice: a gap that is not a
+      currently-allocated extent (both fragments sit in unallocated space,
+      with unrelated deleted data between them), sizer-only (no-footer)
+      signatures, and three or more fragments. The first slice --
+      footer-terminated types split around exactly one allocated gap -- is
+      done.
 - [ ] A map view for GPS coordinates.
 
 ---
@@ -165,11 +165,6 @@ Agreeing with another tool is agreement, not verification.
 - [ ] Configurable columns in the folder view, and the filter controls search
       already has (both can share `filesearch.matches_filters`).
 - [ ] Read-only mode that refuses export and report writing.
-- [ ] Ask before re-running an artefact replaces its earlier result — fine on a
-      first pass, wrong once someone has worked from the earlier output.
-- [ ] Cheap artefact *presence* checks that could honestly run on open — is
-      there a Recycle Bin with content, a browser profile, a prefetch folder —
-      as counts rather than parses.
 - [ ] Template editor, so an examiner can define a structure without Python.
       The templates in `engine/structure.py` are already declarative enough to
       make this mostly an interface problem.
@@ -183,18 +178,6 @@ Agreeing with another tool is agreement, not verification.
 
 ## Performance and debt
 
-- [ ] `/api/file` reads the whole file again on every Range request (up to the
-      stream cap). Wants a cached extent map before anyone scrubs a large video.
-- [ ] Registry values over 2 KB are not inlined and have no fetch path in the
-      interface.
-- [ ] Gallery thumbnails load the full-size image for every picture.
-- [ ] The content index is rebuilt in full each time; there is no incremental
-      update. Confirmed and quantified (#85): the whole tree is walked into
-      one in-memory list before anything is written, at roughly 500 bytes
-      and 8 µs per entry regardless of content size — about 2.5 GB and 40+
-      seconds of walking alone at the 5,000,000-entry collection ceiling,
-      before a single file is read. A streaming walk that writes as it goes
-      removes both costs together (#81).
 - [ ] Tagged items are keyed on the filesystem handle (MFT record / inode):
       stable within an image, but a tag will not follow the same volume
       re-acquired into another image.

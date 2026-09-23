@@ -1911,6 +1911,41 @@ async function showEntry(e, part, from = null, stream = null) {
       directory listing and are not counted in the file's size. Select one to
       read it.</p>` : ''}`;
 
+  const xattrList = st.xattrs || [];
+  const xattrDecoded = d => {
+    if (Array.isArray(d)) {
+      return `<ul class="xattr-urls">${d.map(u => `<li class="mono">${esc(u)}</li>`).join('')}</ul>`;
+    }
+    return kv([
+      d.flags != null && [txt('ui.xattr.flags'), esc(d.flags)],
+      d.agent != null && [txt('ui.xattr.agent'), esc(d.agent)],
+      d.downloaded_at != null && [txt('ui.xattr.downloaded_at'), esc(d.downloaded_at)],
+      d.event_id != null && [txt('ui.xattr.event_id'), esc(d.event_id)],
+    ]);
+  };
+  const xattrs = !xattrList.length ? '' : `<h3>${txt('ui.extended_attributes')}</h3>
+    ${xattrList.map(a => {
+      const header = `<div class="runbar">
+          <span>${esc(a.name)}${a.truncated ? ' · truncated' : ''}</span>
+          <span class="len">${fmt.bytes(a.size)}</span>
+        </div>`;
+      if (a.value == null) {
+        return `${header}<p class="hint">${txt('ui.xattr.value_not_captured')}</p>`;
+      }
+      const bytes = Uint8Array.from(atob(a.value), c => c.charCodeAt(0));
+      if (a.decoded != null) {
+        return `${header}${a.name === 'com.apple.metadata:kMDItemWhereFroms'
+          ? `<p class="hint">${txt('ui.xattr.origin_urls')}</p>${xattrDecoded(a.decoded)}`
+          : xattrDecoded(a.decoded)}`;
+      }
+      const preview = looksTextual(bytes)
+        ? esc(decodeText(bytes).slice(0, 200))
+        : Array.from(bytes.slice(0, 32))
+            .map(b => b.toString(16).padStart(2, '0')).join(' ')
+          + (bytes.length > 32 ? '…' : '');
+      return `${header}<div class="hint mono">${preview}</div>`;
+    }).join('')}`;
+
   const ent = st.entropy && st.entropy.entropy !== null ? `<h3>${txt('ui.show_entry.entropy')}</h3>
     ${kv([
       [txt('ui.kv.bits_per_byte'), `${st.entropy.entropy.toFixed(3)} / 8`, true],
@@ -2007,6 +2042,7 @@ async function showEntry(e, part, from = null, stream = null) {
       e.mft_modified && [txt('ui.kv.mft_changed'), fmt.time(e.mft_modified)],
     ])}
     ${streams}
+    ${xattrs}
     ${exifBlock}
     ${ent}
     ${hashBlock}
@@ -2416,6 +2452,11 @@ function fileURL(entry, part) {
   return `/api/file?${q}`;
 }
 
+function thumbnailURL(entry, part) {
+  const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  return `/api/thumbnail?${q}`;
+}
+
 function dirSet(name, meta, html) {
   $('#dir-name').textContent = name;
   $('#dir-meta').textContent = meta || '';
@@ -2512,6 +2553,11 @@ function enterCase(next) {
 function hashOf(e, which = 'sha256') {
   const h = hashMap.map[nodeOf(e)];
   return h ? h[which] : null;
+}
+
+function matchOf(e) {
+  const h = hashMap.map[nodeOf(e)];
+  return h ? h.match_kind : null;
 }
 
 function glyphFor(e) {
@@ -2680,12 +2726,15 @@ function renderDirView() {
     const i = from + n;
     const t = e.type_check;
     const bad = t && t.mismatch;
+    const mk = matchOf(e);
     return `
         <tr data-i="${i}" class="${e._nav ? 'is-nav ' : ''}${
-      e.deleted ? 'is-del' : ''}${bad ? ' is-typemis' : ''}">
+      e.deleted ? 'is-del' : ''}${bad ? ' is-typemis' : ''}${
+      mk ? ' is-match-' + mk : ''}">
           <td class="nm"><span class="g">${e._nav ? '▲' : glyphFor(e)}</span>${
       esc(e.name)}${e._nav ? ` <span class="mis">${esc(e._label)}</span>` : ''}${
-      bad ? ` <span class="mis" title="${esc(t.why)}">renamed?</span>` : ''}</td>
+      bad ? ` <span class="mis" title="${esc(t.why)}">renamed?</span>` : ''}${
+      mk ? ` <span class="hash-flag ${esc(mk)}">${esc(mk.replace('_', ' '))}</span>` : ''}</td>
           ${wide ? `<td class="c-path" title="${esc(e.path || '')}">${
         esc(folderOf(e))}</td>` : ''}
           <td class="sz">${e.is_dir ? '—' : fmt.bytes(e.size)}</td>
@@ -2707,7 +2756,8 @@ function renderDirView() {
                        .filter(([e]) => !e.is_dir && IMG_RE.test(e.name));
   const shotsHTML = (from, to) => shots.slice(from, to).map(([e, i]) => `
         <figure class="dv-shot" data-i="${i}">
-          <img loading="lazy" alt="" src="${fileURL(e, part)}">
+          <img loading="lazy" alt="" src="${thumbnailURL(e, part)}"
+               data-full="${esc(fileURL(e, part))}">
           <figcaption class="${e.deleted ? 'is-del' : ''}"
             title="${esc(e.name)}">${esc(e.name)}</figcaption>
         </figure>`).join('');
@@ -2785,6 +2835,17 @@ function renderDirView() {
     const el = rowUnder(ev.target);
     if (el) menu(el, ev);
   });
+  // Thumbnails try the (much cheaper) embedded EXIF thumbnail first; img
+  // error events don't bubble, so this listens on the capture phase to
+  // catch them from any <img> under bodyEl, including ones grow() adds
+  // later. data-retried guards against looping if the full image 404s too.
+  bodyEl?.addEventListener('error', ev => {
+    const img = ev.target;
+    if (img.tagName === 'IMG' && img.dataset.full && !img.dataset.retried) {
+      img.dataset.retried = '1';
+      img.src = img.dataset.full;
+    }
+  }, true);
 
   if (bodyEl && shown < total) {
     let drawn = shown;
@@ -3623,7 +3684,11 @@ function renderRegistry(r) {
       <tbody>${r.values.map(v => `<tr class="${v.deleted ? 'is-del' : ''}">
         <td class="nm">${esc(v.name)}</td>
         <td class="ty">${esc(v.type)}</td>
-        <td class="dv" title="${esc(regValueText(v))}">${esc(regValueText(v))}</td>
+        <td class="dv"${v.truncated ? '' : ` title="${esc(regValueText(v))}"`}>${
+          v.truncated
+            ? `<button class="linkish reg-load-value" data-offset="${v.offset}">${
+                esc(regValueText(v))} — load</button>`
+            : esc(regValueText(v))}</td>
       </tr>`).join('')}</tbody>
     </table>` : `<p class="empty">${txt('ui.values_key')}</p>`;
 
@@ -3662,6 +3727,20 @@ function renderRegistry(r) {
   $$('#preview-body .crumb').forEach(el => el.addEventListener('click', () =>
     openRegistry(reg.entry, reg.part, el.dataset.p)));
   $('#reg-del')?.addEventListener('click', showRegistryDeleted);
+  $$('#preview-body .reg-load-value').forEach(el =>
+    el.addEventListener('click', () => loadRegistryValue(el)));
+}
+
+async function loadRegistryValue(el) {
+  const td = el.closest('td');
+  const offset = +el.dataset.offset;
+  td.textContent = txt('ui.render_registry.loading_value');
+  const v = await api.get('registry/value', {
+    part: reg.part.offset, entry: JSON.stringify(reg.entry), offset });
+  if (v.error) { td.textContent = v.error; return; }
+  const text = regValueText(v);
+  td.textContent = text;
+  td.title = text;
 }
 
 async function showRegistryDeleted() {
@@ -4285,24 +4364,27 @@ async function pickPath({ mode = 'open', title = '', dir = '', file = '',
   return r.path || '';
 }
 
-function rangeMenu({ offset, length, part = null, label = 'range', ext = '' }) {
+function rangeMenu({ offset, length, part = null, label = 'range', ext = '',
+                     fragments = null }) {
   const len = Math.max(1, length || 1);
   return [
     { label: txt('ui.show_bytes'), action: () => jumpTo(part, offset, len) },
     { sep: true },
     { label: 'Mark…',
       action: () => saveMark(offset + (part || 0), len, label, 'result') },
-    { label: txt('ui.export_bytes'), action: () => exportRange({ offset, length: len, part, ext }) },
+    { label: txt('ui.export_bytes'),
+      action: () => exportRange({ offset, length: len, part, ext, fragments }) },
     { label: txt('ui.export_bytes_2'),
-      action: () => exportRangeAs({ offset, length: len, part, ext, label }) },
+      action: () => exportRangeAs({ offset, length: len, part, ext, label, fragments }) },
     { sep: true },
     { label: txt('ui.copy_offset'), action: () => copyText('0x' + fmt.hex(offset, 8)) },
   ];
 }
 
-async function exportRange({ offset, length, part = null, ext = '', dest = null }) {
+async function exportRange({ offset, length, part = null, ext = '', dest = null,
+                             fragments = null }) {
   const r = await api.post('export', { part: part ?? undefined, offset, length,
-                                       ext: ext || undefined, dest });
+                                       ext: ext || undefined, dest, fragments });
   if (r.error) return toast(r.error);
   toast(txt('messages.toast.exported_with_digest', { size: fmt.bytes(r.bytes), digest: (r.sha256 || '').slice(0, 16) }), 'action');
 }
@@ -4337,8 +4419,8 @@ async function loadAttack(suggestFor = null) {
   return r;
 }
 
-function fillAttackPicker(suggested) {
-  const sel = $('#tag-attack');
+function fillAttackPicker(suggested, selId = 'tag-attack', noteId = 'tag-attack-note') {
+  const sel = $('#' + selId);
   if (!sel || !attackState.catalogue) return;
   const cat = attackState.catalogue;
   const byTactic = new Map();
@@ -4361,7 +4443,7 @@ function fillAttackPicker(suggested) {
   }
   sel.innerHTML = html;
 
-  const note = $('#tag-attack-note');
+  const note = $('#' + noteId);
   if (note) {
     note.hidden = false;
     note.textContent = cat.complete
@@ -4511,6 +4593,41 @@ async function tagDialog(entry, part) {
   fillAttackPicker(r && r.suggestions);
   $('#dlg-tag').showModal();
 }
+
+async function attackArtefactDialog(kind, index, label, part) {
+  $('#attack-artefact-item').textContent = label || `${kind} #${index}`;
+  const dlg = $('#dlg-attack-artefact');
+  dlg.dataset.kind = kind;
+  dlg.dataset.index = index;
+  dlg.dataset.part = part ?? 0;
+  $('#attack-artefact-technique').value = '';
+  $('#attack-artefact-text').value = '';
+  const r = await loadAttack(kind);
+  fillAttackPicker(r && r.suggestions, 'attack-artefact-technique',
+                   'attack-artefact-note');
+  dlg.showModal();
+}
+
+$('#dlg-attack-artefact').addEventListener('close', async () => {
+  const dlg = $('#dlg-attack-artefact');
+  if (dlg.returnValue !== 'ok') return;
+  const tech = $('#attack-artefact-technique').value;
+  if (!tech) return toast(txt('messages.toast.pick_a_technique'));
+  const t = (attackState.catalogue?.techniques || []).find(x => x.id === tech);
+  const a = await api.post('attack/tag', {
+    part: +dlg.dataset.part,
+    target_kind: 'artefact',
+    target_ref: `${dlg.dataset.kind}:${dlg.dataset.index}`,
+    technique: tech, technique_name: t?.name, tactic: t?.tactic,
+    note: $('#attack-artefact-text').value.trim(), asserted: true,
+    catalogue: attackState.catalogue?.version,
+  });
+  if (a.error) return toast(a.error);
+  attackState.tags = a.tags || [];
+  attackState.summary = a.summary || [];
+  renderAttackTactics();
+  renderAttackList();
+});
 
 async function loadTags() {
   const r = await api.get('tags');
@@ -4935,6 +5052,7 @@ function renderCarve(part) {
         <span class="kind">${esc(h.ext.toUpperCase())}</span>
         <span>${fmt.bytes(h.length)}</span>
         ${h.bounded ? '' : `<span class="flag warn">${txt('ui.carve.estimated')}</span>`}
+        ${h.fragments ? `<span class="flag warn">${txt('ui.carve.fragmented')}</span>` : ''}
         ${h.custom ? `<span class="flag">${txt('ui.carve.custom_flag')}</span>` : ''}
         <span class="off">0x${fmt.hex(h.offset, 8)}</span>
       </div>
@@ -4950,6 +5068,7 @@ function renderCarve(part) {
     const h = S.carveHits[+el.dataset.i];
     return h && rangeMenu({ offset: h.offset, length: h.length,
                             part: carvePart(el), ext: h.ext,
+                            fragments: h.fragments,
                             label: `Carved ${(h.ext || '').toUpperCase()}` });
   });
   core.draw();
@@ -4965,15 +5084,18 @@ function showCarveHit(h, part) {
       [txt('ui.kv.extension'), h.ext],
       [txt('ui.kv.length_from'), carveMethod(h.method)],
       h.entropy != null && [txt('ui.kv.entropy'), h.entropy + ' bits/byte'],
+      h.gap && [txt('ui.kv.gap'), fmt.bytes(h.gap.length)],
     ])}
     ${h.bounded ? '' : `<div class="notice">${txt('help.carve.estimated_notice')}</div>`}
+    ${h.gap ? `<div class="notice">${txt('help.carve.fragmented_notice',
+      { bytes: fmt.bytes(h.gap.length) })}</div>` : ''}
     <div class="actions">
       <button class="ghost" id="btn-carve-export">${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-carve-mark">${txt('ui.show_carve_hit.mark')}</button>
     </div>`;
   $('#btn-carve-export').addEventListener('click', async () => {
     const r = await api.post('export', { part, offset: h.offset,
-      length: h.length, ext: h.ext });
+      length: h.length, ext: h.ext, fragments: h.fragments });
     toast(txt('messages.toast.exported_with_digest', { size: fmt.bytes(r.bytes), digest: r.sha256.slice(0, 16) }), 'action');
   });
   $('#btn-carve-mark').addEventListener('click', () =>
@@ -5502,7 +5624,7 @@ function renderFileHits(hits, part, headline, prefix = '') {
   }
   box.innerHTML = prefix + `<div class="results-head">${esc(headline)}</div>` +
     hits.map((h, i) => `
-      <div class="result" data-i="${i}">
+      <div class="result ${h.match_kind ? 'match-' + h.match_kind : ''}" data-i="${i}">
         <div class="top">
           <span class="kind">${esc(
             h.kind === 'usn' ? 'change journal'
@@ -5515,7 +5637,9 @@ function renderFileHits(hits, part, headline, prefix = '') {
             : h.file_offset != null
             ? '+0x' + fmt.hex(h.file_offset, 6) : ''}</span>
         </div>
-        <div class="name ${h.deleted ? 'is-del' : ''}">${esc(h.name || '')}</div>
+        <div class="name ${h.deleted ? 'is-del' : ''}">${esc(h.name || '')}${
+          h.match_kind ? ` <span class="hash-flag ${esc(h.match_kind)}">${
+            esc(h.match_kind.replace('_', ' '))}</span>` : ''}</div>
         <div class="path">${esc(h.path || '')}</div>
         <div class="sub">${esc(h.context || '')}</div>
         <div class="meta">${fmt.bytes(h.size)} · ${fmt.time(h.modified)}${
@@ -5615,6 +5739,74 @@ function renderHashes(r, part) {
     openHit({ ...h, node: h.node }, part);
   });
   tabCount('hash', r.hashed);
+}
+
+async function doDuplicates() {
+  const box = $('#hash-results');
+  box.innerHTML = `<p class="empty">${txt('ui.preview_entry.reading')}</p>`;
+  const r = await api.get('hashes/duplicates');
+  renderDuplicates(r);
+}
+
+function renderDuplicates(r) {
+  const box = $('#hash-results');
+  const groups = r.groups || [];
+  if (!groups.length) {
+    box.innerHTML = `<p class="empty">${txt('ui.render_duplicates.none_found')}</p>`;
+    tabCount('hash', 0);
+    return;
+  }
+  const totalFiles = groups.reduce((n, g) => n + g.items.length, 0);
+  const summary = txt('ui.render_duplicates.summary',
+    { sets: groups.length, files: totalFiles });
+  box.innerHTML = `<div class="results-head">${esc(summary)}</div>` +
+    groups.map(g => `
+      <div class="result">
+        <div class="top">
+          <span class="kind">${txt('ui.render_duplicates.copies',
+            { count: g.items.length })}</span>
+          <span class="off">${fmt.bytes(g.items[0].size)}</span>
+        </div>
+        <div class="sub mono">${esc(g.sha256.slice(0, 32))}</div>
+        ${g.items.map(it => `<div class="path">${
+          esc(it.exhibit || '?')} — ${esc(it.path || it.name || '')}${
+          it.deleted ? ' <span class="mis">deleted</span>' : ''}</div>`).join('')}
+      </div>`).join('');
+  tabCount('hash', totalFiles);
+}
+
+async function doSimilar() {
+  const box = $('#hash-results');
+  box.innerHTML = `<p class="empty">${txt('ui.preview_entry.reading')}</p>`;
+  const r = await api.get('hashes/similar');
+  renderSimilar(r);
+}
+
+function renderSimilar(r) {
+  const box = $('#hash-results');
+  const pairs = r.pairs || [];
+  if (!pairs.length) {
+    box.innerHTML = `<p class="empty">${txt('ui.render_similar.none_found')}</p>`;
+    tabCount('hash', 0);
+    return;
+  }
+  const summary = txt('ui.render_similar.summary', { pairs: pairs.length });
+  box.innerHTML = `<div class="results-head">${esc(summary)}</div>` +
+    pairs.map(p => `
+      <div class="result">
+        <div class="top">
+          <span class="kind">${esc(txt('ui.render_similar.score',
+            { score: p.score }))}</span>
+          <span class="off">${fmt.bytes(p.a.size)}</span>
+        </div>
+        <div class="path">${esc(p.a.exhibit || '?')} — ${
+          esc(p.a.path || p.a.name || '')}${p.a.deleted
+            ? ' <span class="mis">deleted</span>' : ''}</div>
+        <div class="path">${esc(p.b.exhibit || '?')} — ${
+          esc(p.b.path || p.b.name || '')}${p.b.deleted
+            ? ' <span class="mis">deleted</span>' : ''}</div>
+      </div>`).join('');
+  tabCount('hash', pairs.length);
 }
 
 async function loadHashSets() {
@@ -5868,10 +6060,26 @@ function cacheArtefact(mode, part, r) {
   return r;
 }
 
+function confirmRerunArtefact(label) {
+  return new Promise(resolve => {
+    const dlg = $('#dlg-rerun-artefact');
+    $('#rerun-artefact-text').textContent =
+      txt('help.rerun_artefact.replaces_named', { name: label });
+    dlg.returnValue = '';
+    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'),
+                         { once: true });
+    dlg.showModal();
+  });
+}
+
 async function doArtifacts(force = false) {
   const partVal = $('#art-scope').value;
   if (partVal === '') return toast(txt('messages.toast.pick_filesystem'));
   const part = +partVal;
+  if (force && artCache.has(artKey(artMode, part))) {
+    const ok = await confirmRerunArtefact(ART_LABEL[artMode] || artMode);
+    if (!ok) return;
+  }
   const box = $('#art-results');
   $('#triage-results').hidden = true;
   $('#art-results').hidden = false;
@@ -6187,7 +6395,8 @@ function renderAppcompat(r, part) {
   ].filter(Boolean).join(' · ');
 
   const rows = shim.map((e, i) => `
-    <div class="result" data-k="shim" data-i="${i}">
+    <div class="result" data-k="shim" data-i="${i}"
+         data-label="${esc((e.path || '').split('\\').pop())}">
       <div class="top"><span class="kind">shimcache #${e.order}</span>
         <span class="off">${esc(e.control_set || '')}</span></div>
       <div class="name">${esc((e.path || '').split('\\').pop())}</div>
@@ -6207,6 +6416,11 @@ function renderAppcompat(r, part) {
     </div>`)).join('');
 
   box.innerHTML = notes + `<div class="results-head">${esc(head)}</div>` + rows;
+  bindResults(box, () => {}, el => el.dataset.k === 'shim'
+    ? [{ label: txt('ui.attack_artefact.attribute_menu'),
+         action: () => attackArtefactDialog('appcompat', +el.dataset.i,
+                                            el.dataset.label, part) }]
+    : null);
   tabCount('triage', shim.length + files.length);
 }
 
@@ -6395,6 +6609,100 @@ function renderShellbags(r, part) {
   tabCount('triage', all.length);
 }
 
+function mailAddr(v) {
+  // mbox gives a list of addresses; PST gives one already-formatted
+  // display string (or nothing). Normalised to a single string either way.
+  if (!v) return '';
+  return Array.isArray(v) ? v.join(', ') : String(v);
+}
+
+function mailBody(m) {
+  // What to show for a message's content, in the order this codebase's own
+  // rule prefers: decoded plain text, then visible text lifted out of an
+  // HTML-only part (never the markup itself, never rendered as HTML), then
+  // an honest note that there is nothing readable to show.
+  const LIMIT = 20000;
+  const cut = s => s.length > LIMIT
+    ? s.slice(0, LIMIT) + '\n\n[truncated]' : s;
+  if (m.text) return { kind: 'text', text: cut(m.text) };
+  if (m.body) return { kind: 'text', text: cut(m.body) };       // PST
+  if (m.html_text) return { kind: 'html_text', text: cut(m.html_text) };
+  if (m.html_bytes) return { kind: 'html_only', text: null };
+  if (m.unparsed) return { kind: 'unparsed', text: null };
+  return { kind: 'none', text: null };
+}
+
+function mailDetailHtml(m) {
+  const rows = [
+    ['From', mailAddr(m.from)], ['To', mailAddr(m.to)],
+    ['Cc', mailAddr(m.cc)], ['Date', m.date_raw || m.date],
+  ].filter(([, v]) => v);
+  const body = mailBody(m);
+  const bodyHtml = {
+    text: `<pre class="mail-body">${escText(body.text)}</pre>`,
+    html_text: `<div class="notice">This message has no plain-text part; ` +
+      `tags have been stripped from its HTML part to show the text ` +
+      `below, which is not rendered as HTML.</div>` +
+      `<pre class="mail-body">${escText(body.text)}</pre>`,
+    html_only: `<p class="empty">HTML-only message; no readable text ` +
+      `could be lifted out of it.</p>`,
+    unparsed: `<p class="empty">This message could not be parsed.</p>`,
+    none: `<p class="empty">No body text recorded for this message.</p>`,
+  }[body.kind];
+  const atts = (m.attachments || []).map((a, i) => {
+    const label = `${esc(a.filename || a.name || '(unnamed)')}${
+      a.content_type ? ' · ' + esc(a.content_type) : ''}${
+      (a.bytes ?? a.size) ? ' · ' + fmt.bytes(a.bytes ?? a.size) : ''}`;
+    if (a.nid == null) return `<div class="mail-att">${label}</div>`;
+    return `<div class="mail-att">
+      <button class="linkish mail-load-att" data-i="${i}">${label} — view</button>
+    </div>`;
+  }).join('');
+  return `<div class="mail-detail">
+    <div class="mail-headers">${rows.map(([k, v]) =>
+      `<div><strong>${k}:</strong> ${esc(v)}</div>`).join('')}</div>
+    ${bodyHtml}
+    ${atts ? `<div class="mail-attachments">${atts}</div>` : ''}
+  </div>`;
+}
+
+async function loadMailAttachment(btn, m, part) {
+  const a = (m.attachments || [])[+btn.dataset.i];
+  const holder = btn.closest('.mail-att');
+  btn.disabled = true;
+  btn.textContent = txt('ui.render_registry.loading_value');
+  const r = await api.get('mail/attachment', {
+    part, entry: JSON.stringify(m.store_entry), msg: m.nid, att: a.nid,
+  });
+  btn.remove();
+  if (r.error) {
+    holder.insertAdjacentHTML('beforeend',
+      `<p class="hint warn">${esc(r.error)}</p>`);
+    return;
+  }
+  const bytes = Uint8Array.from(atob(r.preview || ''), c => c.charCodeAt(0));
+  if (!bytes.length) {
+    holder.insertAdjacentHTML('beforeend',
+      `<p class="empty">${txt('ui.content_show')}</p>`);
+    return;
+  }
+  const kind = sniff(bytes);
+  let body;
+  if (kind?.raster || (kind?.kind === 'image' && kind.mime)) {
+    body = `<div class="pv-image"><img alt="" src="data:${
+      kind.mime};base64,${r.preview}"></div>`;
+  } else if (looksTextual(bytes)) {
+    body = `<pre class="pv-text">${escText(decodeText(bytes).slice(0, 20000))}</pre>`;
+  } else {
+    body = `<p class="pv-note">${txt('help.mail_attachment_no_inline_viewer', {
+      content_type: esc(r.content_type || 'application/octet-stream'),
+      size: fmt.bytes(r.bytes) })}${
+      r.truncated ? ' (preview truncated)' : ''}</p>`;
+  }
+  holder.insertAdjacentHTML('beforeend',
+    `<div class="mail-att-preview">${body}</div>`);
+}
+
 function renderMail(r, part) {
   const box = $('#art-results');
   const msgs = r.messages || [];
@@ -6423,11 +6731,23 @@ function renderMail(r, part) {
           <span class="off">${fmt.bytes(m.bytes)}</span>
         </div>
         <div class="name">${esc(m.subject || '(no subject)')}</div>
-        <div class="path">${esc((m.from || []).join(', '))} →
-          ${esc((m.to || []).join(', ').slice(0, 80))}</div>
+        <div class="path">${esc(mailAddr(m.from))} →
+          ${esc(mailAddr(m.to).slice(0, 80))}</div>
         <div class="meta">${esc(m.date || m.date_raw || 'no date')}${
           m.store ? ' · ' + esc(m.store.split('/').pop()) : ''}</div>
       </div>`).join('');
+  bindResults(box, (el, ev) => {
+    if (ev.target.closest('.mail-detail')) return;
+    const open = el.querySelector('.mail-detail');
+    if (open) { open.remove(); return; }
+    $$('.mail-detail', box).forEach(n => n.remove());
+    const m = msgs[+el.dataset.i];
+    el.insertAdjacentHTML('beforeend', mailDetailHtml(m));
+    $$('.mail-load-att', el).forEach(btn => btn.addEventListener('click', ev2 => {
+      ev2.stopPropagation();
+      loadMailAttachment(btn, m, part);
+    }));
+  });
   tabCount('triage', msgs.length);
 }
 
@@ -6474,10 +6794,10 @@ const escText = s => (s === null || s === undefined ? '' : String(s))
 
 function bindResults(box, fn, menuFor = null) {
   $$('.result', box).forEach(el => {
-    el.addEventListener('click', () => {
+    el.addEventListener('click', ev => {
       $$('.result.is-on', box).forEach(n => n.classList.remove('is-on'));
       el.classList.add('is-on');
-      fn(el);
+      fn(el, ev);
     });
     if (!menuFor) return;
     el.addEventListener('contextmenu', ev => {
@@ -7662,10 +7982,14 @@ const picked = new Set();
 
 const COST_RANK = { instant: 0, quick: 1, minutes: 2, long: 3 };
 
+let pickerPresence = {};
+
 async function openPicker() {
   if (!S.open) return toast(txt('messages.toast.open_evidence_first'));
-  const r = await api.get('artifacts');
+  const [r, presence] = await Promise.all([
+    api.get('artifacts'), api.get('artifacts/presence')]);
   pickerRows = r.artifacts || [];
+  pickerPresence = presence || {};
   if (!picked.size) {
     const ok = new Set(pickerRows.filter(a => a.available !== false)
                                  .map(a => a.id));
@@ -7673,6 +7997,20 @@ async function openPicker() {
   }
   renderPicker();
   $('#dlg-picker').showModal();
+}
+
+function presenceHint(id) {
+  const p = pickerPresence;
+  if (id === 'recyclebin' && p.recyclebin?.found) {
+    return txt('ui.presence.recyclebin_found', { count: p.recyclebin.count });
+  }
+  if (id === 'prefetch' && p.prefetch?.found) {
+    return txt('ui.presence.prefetch_found', { count: p.prefetch.count });
+  }
+  if (id === 'browser' && p.browser?.found) {
+    return txt('ui.presence.browser_found', { count: p.browser.profiles.length });
+  }
+  return null;
 }
 
 function renderPicker() {
@@ -7686,6 +8024,7 @@ function renderPicker() {
         <span class="pick-costnote">${esc(groups[cost][0].cost_note)}</span></div>
       ${groups[cost].map(a => {
         const off = a.available === false;
+        const hint = !off && presenceHint(a.id);
         return `
         <label class="pick${off ? ' is-off' : ''}">
           <input type="checkbox" data-id="${esc(a.id)}"
@@ -7694,6 +8033,7 @@ function renderPicker() {
           <span class="pick-body">
             <span class="pick-label">${esc(a.label)}</span>
             <span class="pick-answers">${esc(a.answers)}</span>
+            ${hint ? `<span class="pick-presence">${esc(hint)}</span>` : ''}
             ${off ? `<span class="pick-why">${
               esc(a.unavailable_because || 'Not available for this image.')
             }</span>` : ''}
@@ -9050,6 +9390,8 @@ $('#btn-index-clear').addEventListener('click', async () => {
 $('#find-scope').addEventListener('change', refreshIndexState);
 $('#btn-save-search').addEventListener('click', saveCurrentSearch);
 $('#btn-hash').addEventListener('click', doHash);
+$('#btn-duplicates').addEventListener('click', doDuplicates);
+$('#btn-similar').addEventListener('click', doSimilar);
 $('#btn-artifacts').addEventListener('click', () => doArtifacts(true));
 $('#art-scope')?.addEventListener('change', () => { artPick = null; renderArtTree(); });
 
