@@ -268,7 +268,7 @@ FTS_COLUMNS = {"name", "path", "body", "node", "part", "size", "deleted",
                "modified", "abs_offset", "kind", "evidence"}
 
 ARTEFACT_VERSION = {
-    "browser": 2, "recyclebin": 1, "lnk": 2, "appcompat": 1, "prefetch": 1,
+    "browser": 3, "recyclebin": 1, "lnk": 2, "appcompat": 1, "prefetch": 1,
     "shellbags": 1, "mail": 1, "leveldb": 1, "vss": 1, "usn": 1,
     "carve": 1, "timeline": 1, "evtx": 1, "wallets": 1,
 }
