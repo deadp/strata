@@ -50,9 +50,9 @@ unallocated space are reachable throughout.
 | **APFS** | container superblock, object map, B-tree walking, volume records, file extents, and the allocation map |
 | **HFS+/HFSX** | catalog and extents-overflow B-trees, and both forks |
 
-**Encrypted volumes** — BitLocker (FVE) and LUKS1 unlock with a password or
-recovery key. The key is held for the session only, and is never written into
-the case.
+**Encrypted volumes** — BitLocker (FVE), LUKS1 and LUKS2 (Argon2id/i/d and
+PBKDF2 keyslots) unlock with a password or recovery key. The key is held for
+the session only, and is never written into the case.
 
 ## The core sample
 
@@ -150,9 +150,9 @@ separate from the tool's suggestions, and never promotes one to the other.
 
 ## Not implemented
 
-EWF v2 (Ex01), FileVault, BitLocker with the Elephant diffuser, LUKS2 with
-Argon2, ANSI PST, `$LogFile`, and carving across fragments. Shadow copies are
-listed but cannot yet be opened.
+EWF v2 (Ex01), FileVault, BitLocker with the Elephant diffuser, ANSI PST,
+`$LogFile`, and carving across fragments. Shadow copies are listed but
+cannot yet be opened.
 
 ---
 

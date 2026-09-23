@@ -3,6 +3,7 @@ import json
 import struct
 
 from .crypto import aes
+from .crypto import argon2
 
 from .text import t as _t
 
@@ -82,22 +83,34 @@ class KeySlot:
         self.salt = salt
         self.offset = offset
         self.stripes = stripes
+        self.kdf_type = None
+        self.kdf_params = {}
+        self.area = {}
+        self.af = {}
+        self.digest = None
 
     def info(self):
-        return {"slot": self.index, "active": self.active,
-                "iterations": self.iterations, "stripes": self.stripes,
-                "key_material_offset": self.offset * SECTOR}
+        d = {"slot": self.index, "active": self.active,
+             "iterations": self.iterations, "stripes": self.stripes,
+             "key_material_offset": self.offset * SECTOR}
+        if self.kdf_type:
+            d["kdf"] = {"type": self.kdf_type}
+            d["kdf"].update({k: v for k, v in self.kdf_params.items()
+                             if k != "salt"})
+        return d
 
 class Luks:
 
     def __init__(self, source, size=None):
         self.source = source
         self.size = size if size is not None else getattr(source, "size", 0)
-        self.valid = False
+        self.sector_size = SECTOR
         self.findings = []
         self.slots = []
         self.master_key = None
         self.version = None
+        self.valid = False
+        self._slot_cache = {}
         self._parse()
 
     def _parse(self):
@@ -140,12 +153,17 @@ class Luks:
         blob = self.source.read_at(0, 64 << 10)
         self.uuid = _cstr(blob[168:208])
         hdr_size = struct.unpack_from(">Q", blob, 8)[0] if len(blob) > 16 else 0
-        text = blob[4096:min(len(blob), max(8192, hdr_size))]
-        end = text.find(b"\x00")
-        try:
-            meta = json.loads(text[:end if end > 0 else len(text)].decode("utf-8"))
-        except Exception:
-            self.findings.append("The LUKS2 JSON metadata area did not parse.")
+        meta = self._json_area(blob, 4096, min(len(blob),
+                                               max(8192, hdr_size)))
+        if meta is None:
+            if hdr_size:
+                back = self.source.read_at(hdr_size, 64 << 10)
+                meta = self._json_area(back, 4096, min(len(back), 64 << 10))
+                if meta is not None:
+                    self.findings.append(_t("luks.backup_header_used"))
+        if meta is None:
+            self.findings.append(
+                "The LUKS2 JSON metadata area did not parse.")
             return
         self.meta = meta
         segs = meta.get("segments") or {}
@@ -157,50 +175,70 @@ class Luks:
         self.cipher_mode = "-".join(bits[1:]) or "xts-plain64"
         self.sector_size = int(seg.get("sector_size") or SECTOR)
 
-        kdfs = set()
+        digests = meta.get("digests") or {}
+        digest_by_slot = {}
+        for dig in digests.values():
+            for sid in dig.get("keyslots") or []:
+                digest_by_slot[sid] = {
+                    "hash": dig.get("hash") or "sha256",
+                    "salt": _b64(dig.get("salt") or ""),
+                    "iterations": int(dig.get("iterations") or 0),
+                    "digest": _b64(dig.get("digest") or ""),
+                }
+        slow = []
         for sid, slot in sorted((meta.get("keyslots") or {}).items()):
-            kdf = (slot.get("kdf") or {}).get("type", "?")
-            kdfs.add(kdf)
+            kdf = slot.get("kdf") or {}
             area = slot.get("area") or {}
             af = slot.get("af") or {}
+            kdf_type = kdf.get("type") or "?"
             ks = KeySlot(int(sid), SLOT_ENABLED,
-                         int((slot.get("kdf") or {}).get("iterations") or 0),
-                         _b64(slot.get("kdf", {}).get("salt", "")),
+                         int(kdf.get("iterations") or 0),
+                         _b64(kdf.get("salt") or ""),
                          int(area.get("offset") or 0) // SECTOR,
                          int(af.get("stripes") or 4000))
             ks.key_bytes = int(slot.get("key_size") or 32)
-            ks.kdf = slot.get("kdf") or {}
-            ks.af_hash = (af.get("hash") or "sha256")
-            ks.area_encryption = area.get("encryption") or "aes-xts-plain64"
+            ks.kdf_type = kdf_type
+            ks.kdf_params = dict(kdf)
+            ks.area = {"offset": int(area.get("offset") or 0),
+                       "size": int(area.get("size") or 0),
+                       "encryption": area.get("encryption")
+                                     or "aes-xts-plain64",
+                       "key_size": int(area.get("key_size") or 0)}
+            ks.af = {"stripes": int(af.get("stripes") or 4000),
+                     "hash": af.get("hash") or "sha256"}
+            ks.digest = digest_by_slot.get(sid)
             self.slots.append(ks)
+            if kdf_type.startswith("argon2"):
+                slow.append((ks.index,
+                             int(kdf.get("memory") or 0),
+                             int(kdf.get("time") or 0)))
         self.key_bytes = max([getattr(s, "key_bytes", 32)
                               for s in self.slots] or [32])
         self.hash_spec = "sha256"
         self.valid = True
-        hard = {k for k in kdfs if k.startswith("argon2")}
-        if hard:
-            self.findings.append(
-                "Every key slot on this volume uses %s. That is a memory-hard "
-                "function with no implementation in the Python standard "
-                "library, so this tool will not attempt it rather than pretend "
-                "to try. The volume is identified but cannot be unlocked here; "
-                "cryptsetup on a Linux host will do it."
-                % ", ".join(sorted(hard))
-                if kdfs <= hard else
-                "Some key slots use %s, which cannot be attempted here. Slots "
-                "using PBKDF2 can still be tried." % ", ".join(sorted(hard)))
+        if slow and not any(s.kdf_type == "pbkdf2" for s in self.slots):
+            for index, memory, tm in slow:
+                self.findings.append(_t("luks.argon2_slow_note")
+                                     % (index, memory // 1024, tm))
 
-    @property
-    def unlocked(self):
-        return self.master_key is not None
+    def _json_area(self, blob, start, stop):
+        text = blob[start:stop]
+        end = text.find(b"\x00")
+        try:
+            return json.loads(
+                text[:end if end > 0 else len(text)].decode("utf-8"))
+        except Exception:
+            return None
 
     def unlock(self, password, progress=None):
         if not self.valid:
             return {"unlocked": False, "reason": _t("luks.usable_luks_header")}
-        if self.version == 2:
-            return self._unlock_v2(password, progress)
         if not password:
             return {"unlocked": False, "reason": _t("luks.password_supplied")}
+        if isinstance(password, bytes):
+            password = password.decode("utf-8")
+        if self.version == 2:
+            return self._unlock_v2(password, progress)
         active = [s for s in self.slots if s.active]
         if not active:
             return {"unlocked": False,
@@ -242,18 +280,96 @@ class Luks:
         return mk if digest == self.mk_digest else None
 
     def _unlock_v2(self, password, progress=None):
-        usable = [s for s in self.slots
-                  if (getattr(s, "kdf", {}) or {}).get("type") == "pbkdf2"]
-        if not usable:
+        active = [s for s in self.slots if s.active]
+        if not active:
             return {"unlocked": False,
-                    "reason": _t("luks.all_key_slots_use")}
+                    "reason": _t("luks.every_key_slot_volume")}
+        pbkdf2 = [s for s in active if s.kdf_type == "pbkdf2"]
+        slow = [s for s in active if s.kdf_type.startswith("argon2")]
+        unknown = [s for s in active
+                   if s.kdf_type not in ("pbkdf2",)
+                   and not s.kdf_type.startswith("argon2")]
+        for s in unknown:
+            self.findings.append(_t("luks.kdf_slot_d_unsupported")
+                                 % (s.index, s.kdf_type))
+        ordered = pbkdf2 + slow
+        total = len(ordered)
+        for n, slot in enumerate(ordered):
+            if progress:
+                scaled = lambda frac, n=n: progress(
+                    (n + frac) / total)
+            else:
+                scaled = None
+            try:
+                mk = self._try_slot_v2(slot, password, scaled)
+            except argon2.OutOfMemory as exc:
+                return {"unlocked": False, "reason": str(exc)}
+            except Unsupported as exc:
+                return {"unlocked": False, "reason": str(exc)}
+            if mk is not None:
+                self.master_key = mk
+                if progress:
+                    progress(1.0)
+                return {"unlocked": True, "slot": slot.index,
+                        "encryption": "%s-%s" % (self.cipher_name,
+                                                 self.cipher_mode),
+                        "verified": True,
+                        "key_bits": self.key_bytes * 8, "reason": None}
+        if progress:
+            progress(1.0)
         return {"unlocked": False,
-                "reason": _t("luks.luks2_pbkdf2_slots_parsed")}
+                "reason": _t("luks.incorrect_password_all_d")
+                          % (len(ordered), ""
+                             if len(ordered) == 1 else "s")}
+
+    def _try_slot_v2(self, slot, password, progress=None):
+        cached = self._slot_cache.get((slot.index, password))
+        if cached is not None:
+            return cached
+        kdf = slot.kdf_params
+        area_bits = slot.area.get("key_size") or 0
+        # cryptsetup writes area key_size in bits (512 = 64-byte XTS key).
+        key_len = (area_bits // 8) or slot.key_bytes
+        if slot.kdf_type == "pbkdf2":
+            pk = hashlib.pbkdf2_hmac(kdf.get("hash") or "sha256",
+                                     password.encode("utf-8"), slot.salt,
+                                     slot.iterations, key_len)
+        else:
+            pk = argon2.derive(password.encode("utf-8"), slot.salt,
+                               t=int(kdf.get("time") or 0),
+                               m_kib=int(kdf.get("memory") or 0),
+                               p=int(kdf.get("cpus") or 0),
+                               out_len=key_len, kind=slot.kdf_type,
+                               progress=progress)
+        area = slot.area
+        material = self.source.read_at(area["offset"], area["size"])
+        if len(material) < area["size"]:
+            raise Unsupported(_t("luks.key_material_slot_d") % slot.index)
+        mode = area["encryption"]
+        if mode.startswith("aes-"):
+            mode = mode[len("aes-"):]
+            cipher = self.cipher_name
+        else:
+            cipher, mode = mode.split("-", 1)
+        split = _decrypt_region(cipher, mode, pk, material,
+                                area["offset"] // 512, 512)
+        mk = af_merge(split, slot.key_bytes, slot.af["stripes"],
+                      slot.af["hash"])
+        dig = slot.digest
+        if not dig:
+            self.findings.append(_t("luks.no_digest_slot") % slot.index)
+            return None
+        check = hashlib.pbkdf2_hmac(dig["hash"], mk, dig["salt"],
+                                    dig["iterations"], len(dig["digest"]))
+        if check != dig["digest"]:
+            return None
+        self._slot_cache[(slot.index, password)] = mk
+        return mk
 
     def read(self, offset, length):
         if not self.master_key:
             raise Unsupported(_t("bitlocker.volume_locked"))
-        ss = SECTOR
+        ss = self.sector_size
         start = offset - (offset % ss)
         n = ((offset + length) - start + ss - 1) // ss
         raw = self.source.read_at(self.payload_offset + start, n * ss)
@@ -261,6 +377,7 @@ class Luks:
                                 self.master_key, raw, start // ss)
         head = offset - start
         return plain[head:head + length]
+
 
     def info(self):
         active = [s for s in self.slots if s.active]
@@ -274,7 +391,7 @@ class Luks:
             "payload_offset": getattr(self, "payload_offset", 0),
             "slots": [s.info() for s in self.slots],
             "active_slots": len(active),
-            "recoverable": bool(active) and self.version == 1,
+            "recoverable": bool(active),
             "accepts": ["password"] if active else [],
             "findings": self.findings + (
                 [] if active else

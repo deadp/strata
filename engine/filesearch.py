@@ -62,6 +62,36 @@ def collect(fs, root_node, path="/", max_depth=64, budget=DEFAULT_BUDGET,
           state=state if state is not None else {})
     return out
 
+class _StreamSink:
+    """Duck-types list's append()/len() for _walk(), so on_entry() sees
+    each entry as the walk reaches it instead of the whole tree being
+    held in memory first."""
+
+    __slots__ = ("on_entry", "count")
+
+    def __init__(self, on_entry):
+        self.on_entry = on_entry
+        self.count = 0
+
+    def append(self, e):
+        self.count += 1
+        self.on_entry(e)
+
+    def __len__(self):
+        return self.count
+
+def walk_stream(fs, root_node, on_entry, path="/", max_depth=64,
+                budget=DEFAULT_BUDGET, state=None):
+    """Like collect(), but calls on_entry(e) for each entry as the walk
+    reaches it rather than returning them all in one list -- for a caller
+    that reads and processes a file immediately (engine.textindex.build),
+    so the cost of walking a large tree is not paid twice: once to build
+    the list, once to use it. Returns the number of entries walked."""
+    sink = _StreamSink(on_entry)
+    _walk(fs, root_node, path, sink, 0, max_depth, {root_node},
+          budget=budget, state=state if state is not None else {})
+    return sink.count
+
 def matches_filters(e, f):
     if not f:
         return True

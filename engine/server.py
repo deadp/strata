@@ -767,8 +767,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_range(self, data, ctype):
-        total = len(data)
+    def _parse_range(self, total):
         rng = self.headers.get("Range", "")
         start, end = 0, total - 1
         partial = False
@@ -785,7 +784,9 @@ class Handler(BaseHTTPRequestHandler):
                 start, end = 0, total - 1
             else:
                 partial = True
-        body = data[start:end + 1]
+        return start, end, partial
+
+    def _write_range(self, body, ctype, start, end, total, partial):
         self.send_response(206 if partial else 200)
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
@@ -798,6 +799,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_range(self, data, ctype):
+        total = len(data)
+        start, end, partial = self._parse_range(total)
+        self._write_range(data[start:end + 1], ctype, start, end, total,
+                          partial)
+
+    def _send_range_region(self, region, total, ctype):
+        """Like _send_range, but reads only the bytes a Range request asks
+        for from `region` (a FileRegion) instead of the whole file --
+        region.read_at() already seeks directly via fs.read_range() where
+        the filesystem supports it, or caches a small file's full content
+        across requests rather than re-reading it from the image every
+        time (#78)."""
+        start, end, partial = self._parse_range(total)
+        body = region.read_at(start, end - start + 1) if total else b""
+        self._write_range(body, ctype, start, end, total, partial)
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -1195,6 +1213,51 @@ class Handler(BaseHTTPRequestHandler):
                 "values": hive.values(k),
             })
 
+        if path == "/api/registry/value":
+            off = self._q("part", 0, int)
+            entry = json.loads(self._q("entry", "{}"))
+            hive = s.hive(off, entry)
+            if hive is None:
+                return self._send(400, {"error": _t("server.registry.registry_hive")})
+            vk_offset = self._q("offset", -1, int)
+            v = hive.value(vk_offset, inline=False)
+            if v is None:
+                return self._send(404, {"error": _t("server.registry.such_value")})
+            raw = hive.value_bytes(vk_offset)
+            v["value"] = hive.decode(v["type_id"], raw)
+            v.pop("truncated", None)
+            return self._send(200, v)
+
+        if path == "/api/mail/attachment":
+            off = self._q("part", 0, int)
+            fs = s.fs(off)
+            entry = json.loads(self._q("entry", "{}"))
+            data = fs.read_file(entry, 512 << 20)
+            p = pst_mod.open_pst(data) if pst_mod.looks_like_pst(data[:8]) \
+                else None
+            if p is None:
+                return self._send(400,
+                                  {"error": _t("server.mail.not_pst")})
+            node = p.nbt().get(self._q("msg", -1, int))
+            if not node:
+                return self._send(404,
+                                  {"error": _t("server.mail.no_message")})
+            att_nid = self._q("att", -1, int)
+            content = p.attachment_bytes(node, att_nid)
+            if content is None:
+                return self._send(404,
+                                  {"error": _t("server.mail.no_attachment")})
+            ctype = None
+            for a in p.attachments(node):
+                if a.get("nid") == att_nid:
+                    ctype = a.get("content_type")
+                    break
+            return self._send(200, {
+                "bytes": len(content), "content_type": ctype or _sniff_mime(content),
+                "preview": base64.b64encode(content[:MAX_INLINE]).decode(),
+                "truncated": len(content) > MAX_INLINE,
+            })
+
         if path == "/api/registry/deleted":
             off = self._q("part", 0, int)
             entry = json.loads(self._q("entry", "{}"))
@@ -1207,10 +1270,33 @@ class Handler(BaseHTTPRequestHandler):
             off = self._q("part", 0, int)
             fs = s.fs(off)
             entry = json.loads(self._q("entry", "{}"))
-            size = int(entry.get("size") or 0)
-            data = fs.read_file(entry, min(size or MAX_STREAM, MAX_STREAM))
-            ctype = _sniff_mime(data)
-            return self._send_range(data, ctype)
+            try:
+                info = fs.stat(entry)
+            except Exception:
+                info = {}
+            size = info.get("size")
+            if size is None:
+                size = entry.get("size") or 0
+            size = min(size, MAX_STREAM)
+            cur = s.current
+            region = FileRegion(fs, entry, size, "",
+                                cur.file_bytes if cur is not None else None)
+            ctype = _sniff_mime(region.read_at(0, 64))
+            return self._send_range_region(region, size, ctype)
+
+        if path == "/api/thumbnail":
+            off = self._q("part", 0, int)
+            fs = s.fs(off)
+            entry = json.loads(self._q("entry", "{}"))
+            try:
+                sample = fs.read_file(entry, 1 << 20)
+            except Exception:
+                sample = None
+            thumb = exif_mod.thumbnail(sample) if sample else None
+            if not thumb:
+                return self._send(404,
+                                  {"error": _t("server.thumbnail.no_thumbnail")})
+            return self._send_range(thumb, _sniff_mime(thumb))
 
         if path == "/api/document":
             off = self._q("part", 0, int)
@@ -1371,7 +1457,8 @@ class Handler(BaseHTTPRequestHandler):
             if not s.case or s.evidence_id is None:
                 return self._send(200, {"map": {}})
             return self._send(200, {
-                "map": s.case.hash_map(s.evidence_id, self._q("part", 0, int))})
+                "map": hashing_mod.matched_hash_map(
+                    s.case, s.evidence_id, self._q("part", 0, int))})
 
         if path == "/api/attack":
             cat = None
@@ -1395,6 +1482,27 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/hashsets":
             return self._send(200, {"sets": s.case.hash_sets()})
+
+        if path == "/api/hashes/duplicates":
+            if not s.case:
+                return self._send(200, {"groups": []})
+            groups = s.case.duplicate_files()
+            for g in groups:
+                for it in g["items"]:
+                    held = s.items.get(it.get("evidence_id"))
+                    it["exhibit"] = held.label if held else None
+            return self._send(200, {"groups": groups})
+
+        if path == "/api/hashes/similar":
+            if not s.case:
+                return self._send(200, {"pairs": []})
+            pairs = s.case.similar_files(
+                threshold=self._q("threshold", 60, int))
+            for p in pairs:
+                for side in ("a", "b"):
+                    held = s.items.get(p[side].get("evidence_id"))
+                    p[side]["exhibit"] = held.label if held else None
+            return self._send(200, {"pairs": pairs})
 
         if path == "/api/recyclebin":
             part = self._q("part", 0, int)
@@ -1633,6 +1741,28 @@ class Handler(BaseHTTPRequestHandler):
                 "open": ev is not None,
                 "note": _t("server.artifacts.cost_what_will_take"),
             })
+
+        if path == "/api/artifacts/presence":
+            ev = s.current
+            agg = {"recyclebin": {"found": False, "count": 0},
+                  "prefetch": {"found": False, "count": 0},
+                  "browser": {"found": False, "profiles": []}}
+            if ev is not None:
+                parts = [p for p in ev.volumes["partitions"]
+                        if p.get("allocated") and p.get("detected")]
+                for p in parts:
+                    try:
+                        fs = s.fs(p["offset"])
+                    except Exception:
+                        continue
+                    got = artifacts_mod.presence(fs, _root_node(fs))
+                    for key in ("recyclebin", "prefetch"):
+                        agg[key]["found"] = agg[key]["found"] or got[key]["found"]
+                        agg[key]["count"] += got[key]["count"]
+                    if got["browser"]["found"]:
+                        agg["browser"]["found"] = True
+                        agg["browser"]["profiles"] += got["browser"]["profiles"]
+            return self._send(200, agg)
 
         if path == "/api/triage":
             return self._send(200, _triage(s))
@@ -2373,6 +2503,12 @@ class Handler(BaseHTTPRequestHandler):
                         progress=(lambda f, i=i: progress((i + f) / n)))
                     if got.get("error"):
                         return got
+                    if s.case and s.evidence_id is not None:
+                        matched = hashing_mod.matched_hash_map(
+                            s.case, s.evidence_id, p["offset"])
+                        if matched:
+                            hashing_mod.annotate_hits(
+                                got.get("hits") or [], matched)
                     for h in got.get("hits") or []:
                         h["part"] = p["offset"]
                         h["volume"] = p.get("slot")
@@ -2820,8 +2956,15 @@ class Handler(BaseHTTPRequestHandler):
                                    "messages": r["count"]})
                     for f in r.get("findings") or []:
                         findings.append("%s: %s" % (e.get("path"), f))
+                    store_entry = {
+                        "name": e.get("name"), "path": e.get("path"),
+                        "size": e.get("size"), "deleted": e.get("deleted"),
+                        "mft": e.get("mft"), "inode": e.get("inode"),
+                        "oid": e.get("oid"),
+                        "start_cluster": e.get("start_cluster")}
                     for m in r["messages"]:
                         m["store"] = e.get("path")
+                        m["store_entry"] = store_entry
                         messages.append(m)
                 progress(1.0)
                 messages.sort(key=lambda m: m.get("date") or "", reverse=True)
@@ -3225,7 +3368,8 @@ class Handler(BaseHTTPRequestHandler):
                         "truncated": len(rows) > 2000}
 
             t = s.start_task("hash", run, label="Hashing files",
-                              detail="MD5, SHA-1 and SHA-256 in one pass per file.")
+                              detail="MD5, SHA-1, SHA-256 and a fuzzy hash "
+                                      "in one pass per file.")
             s.case.log("hash.run", {"part": part, "scope": scope})
             return self._send(200, t)
 
@@ -3436,6 +3580,12 @@ class Handler(BaseHTTPRequestHandler):
             part = body.get("part", 0)
             off = int(body["offset"]) + int(part or 0)
             length = int(body["length"])
+            fragments = body.get("fragments")
+            if fragments is not None and not (
+                    isinstance(fragments, list) and fragments and all(
+                        isinstance(fr, (list, tuple)) and len(fr) == 2
+                        for fr in fragments)):
+                return self._send(400, {"error": "Invalid fragments."})
             chosen = body.get("dest")
             if chosen:
                 dest = os.path.abspath(os.path.expanduser(chosen))
@@ -3448,16 +3598,28 @@ class Handler(BaseHTTPRequestHandler):
                 dest = os.path.join(out_dir, name)
             os.makedirs(out_dir or ".", exist_ok=True)
             src = s.region(part) if part else s.image
-            written = 0
-            with open(dest, "wb") as f:
-                pos = int(body["offset"]) if part else off
-                while written < length:
-                    chunk = src.read_at(pos, min(1 << 20, length - written))
+
+            def read_range(rel_offset, rel_length, f):
+                pos = int(rel_offset)
+                remaining = int(rel_length)
+                n = 0
+                while remaining > 0:
+                    chunk = src.read_at(pos, min(1 << 20, remaining))
                     if not chunk:
                         break
                     f.write(chunk)
-                    written += len(chunk)
+                    n += len(chunk)
                     pos += len(chunk)
+                    remaining -= len(chunk)
+                return n
+
+            written = 0
+            with open(dest, "wb") as f:
+                if fragments:
+                    for frag_off, frag_len in fragments:
+                        written += read_range(frag_off, frag_len, f)
+                else:
+                    written = read_range(body["offset"], length, f)
             h = hashlib.sha256()
             with open(dest, "rb") as f:
                 for blk in iter(lambda: f.read(1 << 20), b""):
