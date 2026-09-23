@@ -211,6 +211,7 @@
   "server.open.read_by_strata": "%s cannot be read by Strata.",
   "server.opened_evidence": "Opened with no evidence in it.",
   "server.pick.interface_running_same_machine": "The interface is not running on the same machine as the engine, so a file dialog opened here would appear on the engine's screen. Use the built-in browser instead.",
+  "server.readonly.refused": "This session is read-only. Export and report writing are disabled.",
   "server.recurse.detail": "Walking the tree from this folder down and collecting every file and folder underneath it.",
   "server.recurse.label": "Listing everything below %s",
   "server.registry.registry_hive": "Not a registry hive.",

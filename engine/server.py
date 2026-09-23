@@ -78,6 +78,25 @@ _BOUND = {"host": "127.0.0.1", "port": 8722}
 
 _LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
+# Set once by serve() from --read-only, before the server starts accepting
+# requests. Session.read_only reads this live rather than capturing it at
+# construction time, because the module-level SESSION singleton below is
+# built at import time -- before serve() has parsed the CLI flag.
+READ_ONLY = False
+
+# Server-side export and report-writing routes refused while READ_ONLY is
+# set. Analysis endpoints that only compute or cache results (registry
+# report, artefact collectors, ...) are not export/report writes and are
+# deliberately left out -- read-only mode narrows to what issue #70 asks
+# for, not every write.
+_READONLY_BLOCKED_PATHS = frozenset({
+    "/api/export", "/api/export/file", "/api/export/folder",
+    "/api/export/manifest", "/api/report/write",
+})
+
+def _blocked_by_readonly(read_only, path):
+    return bool(read_only) and path in _READONLY_BLOCKED_PATHS
+
 def set_bound_address(host, port):
     _BOUND["host"] = host or "127.0.0.1"
     _BOUND["port"] = int(port)
@@ -255,6 +274,10 @@ class Session:
     def current(self):
         return self.items.get(self.active_id)
 
+    @property
+    def read_only(self):
+        return READ_ONLY
+
     def __getattr__(self, name):
         if name in Session._PER_EVIDENCE:
             cur = self.__dict__.get("items", {}).get(
@@ -418,7 +441,8 @@ class Session:
         cur = self.current
         if cur is None:
             return {"open": False,
-                    "case": self.case.summary() if self.case else None}
+                    "case": self.case.summary() if self.case else None,
+                    "read_only": self.read_only}
         return {
             "open": True, "path": cur.path,
             "image": cur.image.info(),
@@ -430,6 +454,7 @@ class Session:
             "active_id": self.active_id,
             "index_reset": bool(getattr(self.case, "index_reset", False)),
             "index_pending": int(getattr(self.case, "index_pending", 0) or 0),
+            "read_only": self.read_only,
         }
 
     def reader(self, offset, size, slot="?", ev=None):
@@ -1793,8 +1818,18 @@ class Handler(BaseHTTPRequestHandler):
             return sess.image
         return sess.region(part)
 
+    def _readonly_refusal(self, s, path):
+        if s.case is not None:
+            try:
+                s.case.log("readonly.refused", {"path": path})
+            except Exception:
+                pass
+        return {"error": _t("server.readonly.refused")}
+
     def _api_post(self, path, body):
         s = self._session()
+        if _blocked_by_readonly(s.read_only, path):
+            return self._send(403, self._readonly_refusal(s, path))
         if path == "/api/whoami":
             name = (body.get("name") or "").strip()
             if not name:
@@ -4147,7 +4182,10 @@ class _Server(ThreadingHTTPServer):
         self.server_name = host
         self.server_port = port
 
-def serve(host="127.0.0.1", port=8722, image=None, examiner=None):
+def serve(host="127.0.0.1", port=8722, image=None, examiner=None,
+          read_only=False):
+    global READ_ONLY
+    READ_ONLY = bool(read_only)
     if image:
         SESSION.open(image, examiner=examiner)
     set_bound_address(host, port)

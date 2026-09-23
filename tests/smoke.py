@@ -86,6 +86,21 @@ def post_json(opener, url, payload):
         return json.loads(r.read().decode("utf-8"))
 
 
+def post_expect(opener, url, payload, want=200):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        r = opener.open(req, timeout=20)
+    except urllib.error.HTTPError as exc:
+        r = exc
+    body = r.read()
+    if r.status != want:
+        raise AssertionError("POST %s returned %d, expected %d"
+                             % (url, r.status, want))
+    return json.loads(body.decode("utf-8"))
+
+
 def raw_get(port, path):
     """Send path verbatim, without the normalising urllib does."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
@@ -320,6 +335,72 @@ def run(config_dir, log_path):
     log(read_log(log_path))
 
 
+def run_readonly(config_dir, log_path):
+    """A second, short-lived server run with --read-only: export and report
+    writing must be refused straight at the API, not just hidden in the
+    interface (issue #70)."""
+    port = free_port()
+    base = "http://127.0.0.1:%d" % port
+
+    env = dict(os.environ)
+    env["STRATA_CONFIG_DIR"] = config_dir
+    env["PYTHONUNBUFFERED"] = "1"
+
+    print("starting %s run.py --read-only --port %d"
+          % (os.path.basename(sys.executable), port))
+    with open(log_path, "wb") as sink:
+        proc = subprocess.Popen(
+            [sys.executable, "run.py", "--read-only",
+             "--port", str(port), "--host", "127.0.0.1"],
+            cwd=ROOT, env=env, stdout=sink, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL)
+
+    try:
+        wait_for_server(proc, base, log_path)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor())
+
+        def state_reports_read_only():
+            d = get_json(opener, base + "/api/state")
+            if d.get("read_only") is not True:
+                raise AssertionError("/api/state did not report read_only: %r" % d)
+
+        def export_refused():
+            d = post_expect(opener, base + "/api/export", {}, want=403)
+            if "error" not in d:
+                raise AssertionError("export refusal carried no error: %r" % d)
+            return d["error"]
+
+        def export_file_refused():
+            post_expect(opener, base + "/api/export/file", {}, want=403)
+
+        def export_folder_refused():
+            post_expect(opener, base + "/api/export/folder", {}, want=403)
+
+        def export_manifest_refused():
+            post_expect(opener, base + "/api/export/manifest", {}, want=403)
+
+        def report_write_refused():
+            post_expect(opener, base + "/api/report/write", {}, want=403)
+
+        def reads_still_work():
+            # Examination itself must be unaffected by read-only mode.
+            d = get_json(opener, base + "/api/version")
+            if not d.get("version"):
+                raise AssertionError("version missing under --read-only: %r" % d)
+            return "version %s" % d["version"]
+
+        check("--read-only: /api/state reports read_only", state_reports_read_only)
+        check("--read-only: raw byte-range export refused", export_refused)
+        check("--read-only: file export refused", export_file_refused)
+        check("--read-only: folder export refused", export_folder_refused)
+        check("--read-only: export manifest refused", export_manifest_refused)
+        check("--read-only: report write refused", report_write_refused)
+        check("--read-only: examination reads still work", reads_still_work)
+    finally:
+        stop(proc)
+
+
 def stop(proc):
     if proc.poll() is not None:
         return proc.returncode
@@ -348,6 +429,17 @@ def main():
         print("     %s" % exc)
     finally:
         shutil.rmtree(config_dir, ignore_errors=True)
+
+    ro_config_dir = tempfile.mkdtemp(prefix="strata-ci-readonly-")
+    ro_log_path = os.path.join(ro_config_dir, "server.log")
+    try:
+        run_readonly(ro_config_dir, ro_log_path)
+    except AssertionError as exc:
+        failures.append("read-only server startup")
+        print("FAIL read-only server startup")
+        print("     %s" % exc)
+    finally:
+        shutil.rmtree(ro_config_dir, ignore_errors=True)
 
     print()
     if failures:

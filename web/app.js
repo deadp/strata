@@ -59,6 +59,7 @@ const S = {
   lastSearchPart: null,
   prefs: {},
   markCats: [],
+  readOnly: false,
 };
 
 const fmt = {
@@ -2072,7 +2073,7 @@ async function showEntry(e, part, from = null, stream = null) {
       ${                                                                
                                                                        
                            ''}
-      <button class="ghost" id="btn-export">${txt('ui.show_entry.export')}</button>
+      <button class="ghost" id="btn-export"${S.readOnly ? ' disabled' : ''}>${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-tag">${txt('ui.show_entry.tag')}</button>
       ${stream ? '' : `<button class="ghost" id="btn-hash-one">${
         hb ? 'Rehash' : 'Hash'}</button>`}
@@ -4306,7 +4307,7 @@ document.addEventListener('scroll', closeMenu, true);
 
 function entryMenu(e, part) {
   const dir = !!e.is_dir;
-  return [
+  const items = [
     { label: dir ? 'Open' : txt('ui.show_bytes'), action: () => showEntry(e, part) },
     dir ? null
         : { label: 'Preview',
@@ -4320,17 +4321,18 @@ function entryMenu(e, part) {
     { label: dir ? txt('ui.hash_everything_here') : 'Hash',
       action: () => hashScope(partOffset(part), dir ? 'folder' : 'item', e,
                               e.name || (dir ? 'folder' : 'file')) },
-    dir ? { label: txt('ui.export_folder'), action: () => exportFolder(e, part) }
-        : { label: 'Export', action: () => exportEntry(e, part) },
-    dir ? null : { label: txt('ui.export'), action: () => exportEntryAs(e, part) },
+    dir ? { label: txt('ui.export_folder'), action: () => exportFolder(e, part), exportOnly: true }
+        : { label: 'Export', action: () => exportEntry(e, part), exportOnly: true },
+    dir ? null : { label: txt('ui.export'), action: () => exportEntryAs(e, part), exportOnly: true },
     dir ? { label: txt('ui.export_folder_and_add'),
-            action: () => exportFolder(e, part, { addExhibit: true }) }
+            action: () => exportFolder(e, part, { addExhibit: true }), exportOnly: true }
         : { label: txt('ui.export_and_add'),
-            action: () => exportEntryAs(e, part, '', { addExhibit: true }) },
+            action: () => exportEntryAs(e, part, '', { addExhibit: true }), exportOnly: true },
     { sep: true },
     { label: txt('ui.copy_path'), action: () => copyText(e.path || e.name) },
     { label: txt('ui.copy_name'), action: () => copyText(e.name || '') },
   ];
+  return S.readOnly ? items.filter(it => !it || !it.exportOnly) : items;
 }
 
 async function exportFolder(e, part, { addExhibit = false } = {}) {
@@ -4367,18 +4369,19 @@ async function pickPath({ mode = 'open', title = '', dir = '', file = '',
 function rangeMenu({ offset, length, part = null, label = 'range', ext = '',
                      fragments = null }) {
   const len = Math.max(1, length || 1);
-  return [
+  const items = [
     { label: txt('ui.show_bytes'), action: () => jumpTo(part, offset, len) },
     { sep: true },
     { label: 'Mark…',
       action: () => saveMark(offset + (part || 0), len, label, 'result') },
-    { label: txt('ui.export_bytes'),
+    { label: txt('ui.export_bytes'), exportOnly: true,
       action: () => exportRange({ offset, length: len, part, ext, fragments }) },
-    { label: txt('ui.export_bytes_2'),
+    { label: txt('ui.export_bytes_2'), exportOnly: true,
       action: () => exportRangeAs({ offset, length: len, part, ext, label, fragments }) },
     { sep: true },
     { label: txt('ui.copy_offset'), action: () => copyText('0x' + fmt.hex(offset, 8)) },
   ];
+  return S.readOnly ? items.filter(it => !it || !it.exportOnly) : items;
 }
 
 async function exportRange({ offset, length, part = null, ext = '', dest = null,
@@ -5090,7 +5093,7 @@ function showCarveHit(h, part) {
     ${h.gap ? `<div class="notice">${txt('help.carve.fragmented_notice',
       { bytes: fmt.bytes(h.gap.length) })}</div>` : ''}
     <div class="actions">
-      <button class="ghost" id="btn-carve-export">${txt('ui.show_entry.export')}</button>
+      <button class="ghost" id="btn-carve-export"${S.readOnly ? ' disabled' : ''}>${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-carve-mark">${txt('ui.show_carve_hit.mark')}</button>
     </div>`;
   $('#btn-carve-export').addEventListener('click', async () => {
@@ -7903,6 +7906,14 @@ function bindDocZip(e, part) {
   $('#doc-as-zip')?.addEventListener('click', () => openArchive(e, part));
 }
 
+function applyReadOnly() {
+  // Server-side is authoritative (engine.server refuses these routes
+  // regardless of what the UI shows); this only keeps read-only examiners
+  // from reaching for a control that would just be refused.
+  const btn = $('#btn-tag-export');
+  if (btn) btn.disabled = S.readOnly;
+}
+
 function applyEmptyCase(r) {
   const next = r.case_path || r.case?.path || null;
   enterCase(next);
@@ -7924,7 +7935,7 @@ function applyEmptyCase(r) {
   $('#btn-add').addEventListener('click', () => openDialog({ add: true }));
   $('#btn-case').addEventListener('click', () => caseDialog());
   $('#btn-audit').hidden = false;
-  $('#btn-report').hidden = false;
+  $('#btn-report').hidden = S.readOnly;
   $('#integrity').hidden = true;
   if ($('.view[data-view="cases"]')?.classList.contains('is-on')) {
     renderCases();
@@ -8333,7 +8344,7 @@ function applyOpened(r, { tree = true } = {}) {
   $('#btn-add').addEventListener('click', () => openDialog({ add: true }));
   $('#btn-case').addEventListener('click', () => caseDialog());
   $('#btn-audit').hidden = false;
-  $('#btn-report').hidden = false;
+  $('#btn-report').hidden = S.readOnly;
   $('#integrity').hidden = false;
   $('#integrity').dataset.state = 'unchecked';
   $('#integrity').textContent = txt('ui.hashes_unchecked');
@@ -9655,6 +9666,8 @@ $$('.modules .tab').forEach(tab =>
   hex.resize();
   loadWho();
   const st = await api.get('state');
+  S.readOnly = !!st.read_only;
+  applyReadOnly();
   if (st.open) {
     applyOpened(st);
     if (p.split_hex) toggleSplit(true);
