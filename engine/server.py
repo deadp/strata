@@ -1485,6 +1485,17 @@ class Handler(BaseHTTPRequestHandler):
                     it["exhibit"] = held.label if held else None
             return self._send(200, {"groups": groups})
 
+        if path == "/api/hashes/similar":
+            if not s.case:
+                return self._send(200, {"pairs": []})
+            pairs = s.case.similar_files(
+                threshold=self._q("threshold", 60, int))
+            for p in pairs:
+                for side in ("a", "b"):
+                    held = s.items.get(p[side].get("evidence_id"))
+                    p[side]["exhibit"] = held.label if held else None
+            return self._send(200, {"pairs": pairs})
+
         if path == "/api/recyclebin":
             part = self._q("part", 0, int)
             fs = s.fs(part)
@@ -3419,7 +3430,8 @@ class Handler(BaseHTTPRequestHandler):
                         "truncated": len(rows) > 2000}
 
             t = s.start_task("hash", run, label="Hashing files",
-                              detail="MD5, SHA-1 and SHA-256 in one pass per file.")
+                              detail="MD5, SHA-1, SHA-256 and a fuzzy hash "
+                                      "in one pass per file.")
             s.case.log("hash.run", {"part": part, "scope": scope})
             return self._send(200, t)
 
@@ -3630,6 +3642,12 @@ class Handler(BaseHTTPRequestHandler):
             part = body.get("part", 0)
             off = int(body["offset"]) + int(part or 0)
             length = int(body["length"])
+            fragments = body.get("fragments")
+            if fragments is not None and not (
+                    isinstance(fragments, list) and fragments and all(
+                        isinstance(fr, (list, tuple)) and len(fr) == 2
+                        for fr in fragments)):
+                return self._send(400, {"error": "Invalid fragments."})
             chosen = body.get("dest")
             if chosen:
                 dest = os.path.abspath(os.path.expanduser(chosen))
@@ -3642,16 +3660,28 @@ class Handler(BaseHTTPRequestHandler):
                 dest = os.path.join(out_dir, name)
             os.makedirs(out_dir or ".", exist_ok=True)
             src = s.region(part) if part else s.image
-            written = 0
-            with open(dest, "wb") as f:
-                pos = int(body["offset"]) if part else off
-                while written < length:
-                    chunk = src.read_at(pos, min(1 << 20, length - written))
+
+            def read_range(rel_offset, rel_length, f):
+                pos = int(rel_offset)
+                remaining = int(rel_length)
+                n = 0
+                while remaining > 0:
+                    chunk = src.read_at(pos, min(1 << 20, remaining))
                     if not chunk:
                         break
                     f.write(chunk)
-                    written += len(chunk)
+                    n += len(chunk)
                     pos += len(chunk)
+                    remaining -= len(chunk)
+                return n
+
+            written = 0
+            with open(dest, "wb") as f:
+                if fragments:
+                    for frag_off, frag_len in fragments:
+                        written += read_range(frag_off, frag_len, f)
+                else:
+                    written = read_range(body["offset"], length, f)
             h = hashlib.sha256()
             with open(dest, "rb") as f:
                 for blk in iter(lambda: f.read(1 << 20), b""):

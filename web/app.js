@@ -1912,19 +1912,38 @@ async function showEntry(e, part, from = null, stream = null) {
       read it.</p>` : ''}`;
 
   const xattrList = st.xattrs || [];
+  const xattrDecoded = d => {
+    if (Array.isArray(d)) {
+      return `<ul class="xattr-urls">${d.map(u => `<li class="mono">${esc(u)}</li>`).join('')}</ul>`;
+    }
+    return kv([
+      d.flags != null && [txt('ui.xattr.flags'), esc(d.flags)],
+      d.agent != null && [txt('ui.xattr.agent'), esc(d.agent)],
+      d.downloaded_at != null && [txt('ui.xattr.downloaded_at'), esc(d.downloaded_at)],
+      d.event_id != null && [txt('ui.xattr.event_id'), esc(d.event_id)],
+    ]);
+  };
   const xattrs = !xattrList.length ? '' : `<h3>${txt('ui.extended_attributes')}</h3>
     ${xattrList.map(a => {
-      const bytes = Uint8Array.from(atob(a.value || ''), c => c.charCodeAt(0));
+      const header = `<div class="runbar">
+          <span>${esc(a.name)}${a.truncated ? ' · truncated' : ''}</span>
+          <span class="len">${fmt.bytes(a.size)}</span>
+        </div>`;
+      if (a.value == null) {
+        return `${header}<p class="hint">${txt('ui.xattr.value_not_captured')}</p>`;
+      }
+      const bytes = Uint8Array.from(atob(a.value), c => c.charCodeAt(0));
+      if (a.decoded != null) {
+        return `${header}${a.name === 'com.apple.metadata:kMDItemWhereFroms'
+          ? `<p class="hint">${txt('ui.xattr.origin_urls')}</p>${xattrDecoded(a.decoded)}`
+          : xattrDecoded(a.decoded)}`;
+      }
       const preview = looksTextual(bytes)
         ? esc(decodeText(bytes).slice(0, 200))
         : Array.from(bytes.slice(0, 32))
             .map(b => b.toString(16).padStart(2, '0')).join(' ')
           + (bytes.length > 32 ? '…' : '');
-      return `<div class="runbar">
-          <span>${esc(a.name)}${a.truncated ? ' · truncated' : ''}</span>
-          <span class="len">${fmt.bytes(a.size)}</span>
-        </div>
-        <div class="hint mono">${preview}</div>`;
+      return `${header}<div class="hint mono">${preview}</div>`;
     }).join('')}`;
 
   const ent = st.entropy && st.entropy.entropy !== null ? `<h3>${txt('ui.show_entry.entropy')}</h3>
@@ -4345,24 +4364,27 @@ async function pickPath({ mode = 'open', title = '', dir = '', file = '',
   return r.path || '';
 }
 
-function rangeMenu({ offset, length, part = null, label = 'range', ext = '' }) {
+function rangeMenu({ offset, length, part = null, label = 'range', ext = '',
+                     fragments = null }) {
   const len = Math.max(1, length || 1);
   return [
     { label: txt('ui.show_bytes'), action: () => jumpTo(part, offset, len) },
     { sep: true },
     { label: 'Mark…',
       action: () => saveMark(offset + (part || 0), len, label, 'result') },
-    { label: txt('ui.export_bytes'), action: () => exportRange({ offset, length: len, part, ext }) },
+    { label: txt('ui.export_bytes'),
+      action: () => exportRange({ offset, length: len, part, ext, fragments }) },
     { label: txt('ui.export_bytes_2'),
-      action: () => exportRangeAs({ offset, length: len, part, ext, label }) },
+      action: () => exportRangeAs({ offset, length: len, part, ext, label, fragments }) },
     { sep: true },
     { label: txt('ui.copy_offset'), action: () => copyText('0x' + fmt.hex(offset, 8)) },
   ];
 }
 
-async function exportRange({ offset, length, part = null, ext = '', dest = null }) {
+async function exportRange({ offset, length, part = null, ext = '', dest = null,
+                             fragments = null }) {
   const r = await api.post('export', { part: part ?? undefined, offset, length,
-                                       ext: ext || undefined, dest });
+                                       ext: ext || undefined, dest, fragments });
   if (r.error) return toast(r.error);
   toast(txt('messages.toast.exported_with_digest', { size: fmt.bytes(r.bytes), digest: (r.sha256 || '').slice(0, 16) }), 'action');
 }
@@ -4397,8 +4419,8 @@ async function loadAttack(suggestFor = null) {
   return r;
 }
 
-function fillAttackPicker(suggested) {
-  const sel = $('#tag-attack');
+function fillAttackPicker(suggested, selId = 'tag-attack', noteId = 'tag-attack-note') {
+  const sel = $('#' + selId);
   if (!sel || !attackState.catalogue) return;
   const cat = attackState.catalogue;
   const byTactic = new Map();
@@ -4421,7 +4443,7 @@ function fillAttackPicker(suggested) {
   }
   sel.innerHTML = html;
 
-  const note = $('#tag-attack-note');
+  const note = $('#' + noteId);
   if (note) {
     note.hidden = false;
     note.textContent = cat.complete
@@ -4571,6 +4593,41 @@ async function tagDialog(entry, part) {
   fillAttackPicker(r && r.suggestions);
   $('#dlg-tag').showModal();
 }
+
+async function attackArtefactDialog(kind, index, label, part) {
+  $('#attack-artefact-item').textContent = label || `${kind} #${index}`;
+  const dlg = $('#dlg-attack-artefact');
+  dlg.dataset.kind = kind;
+  dlg.dataset.index = index;
+  dlg.dataset.part = part ?? 0;
+  $('#attack-artefact-technique').value = '';
+  $('#attack-artefact-text').value = '';
+  const r = await loadAttack(kind);
+  fillAttackPicker(r && r.suggestions, 'attack-artefact-technique',
+                   'attack-artefact-note');
+  dlg.showModal();
+}
+
+$('#dlg-attack-artefact').addEventListener('close', async () => {
+  const dlg = $('#dlg-attack-artefact');
+  if (dlg.returnValue !== 'ok') return;
+  const tech = $('#attack-artefact-technique').value;
+  if (!tech) return toast(txt('messages.toast.pick_a_technique'));
+  const t = (attackState.catalogue?.techniques || []).find(x => x.id === tech);
+  const a = await api.post('attack/tag', {
+    part: +dlg.dataset.part,
+    target_kind: 'artefact',
+    target_ref: `${dlg.dataset.kind}:${dlg.dataset.index}`,
+    technique: tech, technique_name: t?.name, tactic: t?.tactic,
+    note: $('#attack-artefact-text').value.trim(), asserted: true,
+    catalogue: attackState.catalogue?.version,
+  });
+  if (a.error) return toast(a.error);
+  attackState.tags = a.tags || [];
+  attackState.summary = a.summary || [];
+  renderAttackTactics();
+  renderAttackList();
+});
 
 async function loadTags() {
   const r = await api.get('tags');
@@ -4995,6 +5052,7 @@ function renderCarve(part) {
         <span class="kind">${esc(h.ext.toUpperCase())}</span>
         <span>${fmt.bytes(h.length)}</span>
         ${h.bounded ? '' : `<span class="flag warn">${txt('ui.carve.estimated')}</span>`}
+        ${h.fragments ? `<span class="flag warn">${txt('ui.carve.fragmented')}</span>` : ''}
         ${h.custom ? `<span class="flag">${txt('ui.carve.custom_flag')}</span>` : ''}
         <span class="off">0x${fmt.hex(h.offset, 8)}</span>
       </div>
@@ -5010,6 +5068,7 @@ function renderCarve(part) {
     const h = S.carveHits[+el.dataset.i];
     return h && rangeMenu({ offset: h.offset, length: h.length,
                             part: carvePart(el), ext: h.ext,
+                            fragments: h.fragments,
                             label: `Carved ${(h.ext || '').toUpperCase()}` });
   });
   core.draw();
@@ -5025,15 +5084,18 @@ function showCarveHit(h, part) {
       [txt('ui.kv.extension'), h.ext],
       [txt('ui.kv.length_from'), carveMethod(h.method)],
       h.entropy != null && [txt('ui.kv.entropy'), h.entropy + ' bits/byte'],
+      h.gap && [txt('ui.kv.gap'), fmt.bytes(h.gap.length)],
     ])}
     ${h.bounded ? '' : `<div class="notice">${txt('help.carve.estimated_notice')}</div>`}
+    ${h.gap ? `<div class="notice">${txt('help.carve.fragmented_notice',
+      { bytes: fmt.bytes(h.gap.length) })}</div>` : ''}
     <div class="actions">
       <button class="ghost" id="btn-carve-export">${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-carve-mark">${txt('ui.show_carve_hit.mark')}</button>
     </div>`;
   $('#btn-carve-export').addEventListener('click', async () => {
     const r = await api.post('export', { part, offset: h.offset,
-      length: h.length, ext: h.ext });
+      length: h.length, ext: h.ext, fragments: h.fragments });
     toast(txt('messages.toast.exported_with_digest', { size: fmt.bytes(r.bytes), digest: r.sha256.slice(0, 16) }), 'action');
   });
   $('#btn-carve-mark').addEventListener('click', () =>
@@ -5713,6 +5775,40 @@ function renderDuplicates(r) {
   tabCount('hash', totalFiles);
 }
 
+async function doSimilar() {
+  const box = $('#hash-results');
+  box.innerHTML = `<p class="empty">${txt('ui.preview_entry.reading')}</p>`;
+  const r = await api.get('hashes/similar');
+  renderSimilar(r);
+}
+
+function renderSimilar(r) {
+  const box = $('#hash-results');
+  const pairs = r.pairs || [];
+  if (!pairs.length) {
+    box.innerHTML = `<p class="empty">${txt('ui.render_similar.none_found')}</p>`;
+    tabCount('hash', 0);
+    return;
+  }
+  const summary = txt('ui.render_similar.summary', { pairs: pairs.length });
+  box.innerHTML = `<div class="results-head">${esc(summary)}</div>` +
+    pairs.map(p => `
+      <div class="result">
+        <div class="top">
+          <span class="kind">${esc(txt('ui.render_similar.score',
+            { score: p.score }))}</span>
+          <span class="off">${fmt.bytes(p.a.size)}</span>
+        </div>
+        <div class="path">${esc(p.a.exhibit || '?')} — ${
+          esc(p.a.path || p.a.name || '')}${p.a.deleted
+            ? ' <span class="mis">deleted</span>' : ''}</div>
+        <div class="path">${esc(p.b.exhibit || '?')} — ${
+          esc(p.b.path || p.b.name || '')}${p.b.deleted
+            ? ' <span class="mis">deleted</span>' : ''}</div>
+      </div>`).join('');
+  tabCount('hash', pairs.length);
+}
+
 async function loadHashSets() {
   const r = await api.get('hashsets');
   S.hashSets = r.sets || [];
@@ -5964,10 +6060,26 @@ function cacheArtefact(mode, part, r) {
   return r;
 }
 
+function confirmRerunArtefact(label) {
+  return new Promise(resolve => {
+    const dlg = $('#dlg-rerun-artefact');
+    $('#rerun-artefact-text').textContent =
+      txt('help.rerun_artefact.replaces_named', { name: label });
+    dlg.returnValue = '';
+    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'),
+                         { once: true });
+    dlg.showModal();
+  });
+}
+
 async function doArtifacts(force = false) {
   const partVal = $('#art-scope').value;
   if (partVal === '') return toast(txt('messages.toast.pick_filesystem'));
   const part = +partVal;
+  if (force && artCache.has(artKey(artMode, part))) {
+    const ok = await confirmRerunArtefact(ART_LABEL[artMode] || artMode);
+    if (!ok) return;
+  }
   const box = $('#art-results');
   $('#triage-results').hidden = true;
   $('#art-results').hidden = false;
@@ -6426,7 +6538,8 @@ function renderAppcompat(r, part) {
   ].filter(Boolean).join(' · ');
 
   const rows = shim.map((e, i) => `
-    <div class="result" data-k="shim" data-i="${i}">
+    <div class="result" data-k="shim" data-i="${i}"
+         data-label="${esc((e.path || '').split('\\').pop())}">
       <div class="top"><span class="kind">shimcache #${e.order}</span>
         <span class="off">${esc(e.control_set || '')}</span></div>
       <div class="name">${esc((e.path || '').split('\\').pop())}</div>
@@ -6446,6 +6559,11 @@ function renderAppcompat(r, part) {
     </div>`)).join('');
 
   box.innerHTML = notes + `<div class="results-head">${esc(head)}</div>` + rows;
+  bindResults(box, () => {}, el => el.dataset.k === 'shim'
+    ? [{ label: txt('ui.attack_artefact.attribute_menu'),
+         action: () => attackArtefactDialog('appcompat', +el.dataset.i,
+                                            el.dataset.label, part) }]
+    : null);
   tabCount('triage', shim.length + files.length);
 }
 
@@ -9417,6 +9535,7 @@ $('#btn-save-search').addEventListener('click', saveCurrentSearch);
 $('#btn-hash').addEventListener('click', doHash);
 $('#btn-duplicates').addEventListener('click', doDuplicates);
 $('#btn-diff').addEventListener('click', runDiff);
+$('#btn-similar').addEventListener('click', doSimilar);
 $('#btn-artifacts').addEventListener('click', () => doArtifacts(true));
 $('#art-scope')?.addEventListener('change', () => { artPick = null; renderArtTree(); });
 

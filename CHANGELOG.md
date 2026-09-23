@@ -21,6 +21,71 @@ records, not how the code changed.
   just because its MFT records moved. Snapshot reads come straight from
   the shadow-copy store, layered over the live volume
   ([#74](https://github.com/switch-nz/strata/issues/74)).
+- **Extended attributes on APFS and HFS+ files are now decoded, not just
+  listed.** APFS already walked a file's extended attributes but discarded
+  their value, and HFS+ located the Attributes fork without ever opening
+  it, so neither surfaced anything beyond an attribute's name and size.
+  Both now read the value when it's stored inline, and decode the two most
+  examination-relevant ones: `com.apple.quarantine` (Gatekeeper's download
+  flag — agent, timestamp, event id) and
+  `com.apple.metadata:kMDItemWhereFroms` (the URL a file was downloaded
+  from, and often the page that linked to it). The file inspector's
+  Extended Attributes section shows the decoded fields alongside the raw
+  value, and notes plainly when a large, fork-based attribute's content
+  wasn't captured.
+- **A ShimCache entry (or any artefact row) can now be attributed to an
+  ATT&CK technique, and that attribution shows in the report.** ATT&CK
+  attribution existed only for tagged files; an artefact row like a
+  ShimCache entry has no filesystem handle to tag, so there was no way
+  to attribute one at all, and the report's ATT&CK section stayed
+  empty for it. Right-clicking a ShimCache entry now offers "Attribute
+  ATT&CK technique…", using the same picker and suggested-techniques
+  catalogue tagging a file already has; the attribution appears in the
+  ATT&CK tab and the report exactly as a file's would
+  ([#63](https://github.com/switch-nz/strata/issues/63), the report
+  half — the on-screen "examined, not run" caveat shipped earlier).
+- **Re-running an artefact collector now asks first if it already has a
+  result for that evidence item.** `save_artefact` replaces the earlier
+  row silently, which is fine on a first pass and wrong once an examiner
+  has worked from the earlier output. Running one again from the Run
+  Artefacts picker now confirms first when a result already exists,
+  and does nothing if declined
+  ([#71](https://github.com/switch-nz/strata/issues/71)).
+- **Carving now recovers a fragmented file split by exactly one gap of
+  other data, for footer-terminated types.** A signature carver reads
+  forward in a straight line, so a deleted file whose two fragments were
+  separated by other data that later filled the space between them
+  either carved with that unrelated data spliced into the middle, or
+  missed the file entirely. When a header and its footer (PNG, JPEG,
+  GIF, PDF, ZIP) are separated by exactly one still-allocated extent,
+  the hit is now split into two fragments around it; exporting or
+  marking it reads and concatenates the real fragments, skipping the
+  gap, with a "fragmented" flag and a note on how many bytes were
+  excluded. Two or more gaps, or a gap too close to the header or
+  footer to leave room for it, are left as before, unsplit
+  ([#66](https://github.com/switch-nz/strata/issues/66), two-fragment
+  gap carving of footer-terminated types only).
+
+## [0.2.0] - 2026-09-19
+
+A feature and correctness release: fuzzy hashing and a Find Similar report,
+LUKS2 Argon2 unlock, split raw sets, and PST attachment content, alongside a
+large batch of parser correctness fixes across ext4, exFAT, FAT, EWF, AD1,
+VMDK and the registry that closes out #19 in full. Upgrade from 0.1.2.
+
+### Added
+
+- **A fuzzy hash is now computed alongside MD5, SHA-1 and SHA-256, and a
+  "Find similar" report groups files that are alike rather than
+  identical.** Only exact-digest matches could ever be found before, so an
+  edited or partially-overwritten copy of a file shared nothing with the
+  original. Every hash run now also produces a ssdeep-compatible
+  context-triggered piecewise hash; "Find similar" on the Hashes tab scores
+  every pair of already-hashed files across evidence items and reports
+  those above a similarity threshold, alongside the existing exact-digest
+  "Find duplicates" ([#65](https://github.com/switch-nz/strata/issues/65),
+  fuzzy hashing only; image similarity remains open — it needs pixel-level
+  image decoding this codebase does not otherwise have a reason to carry).
 - **Gallery thumbnails no longer load the full-size image for every
   picture.** A photo's own embedded EXIF thumbnail — what most camera
   and phone photos already carry, typically a few KB against a
@@ -100,6 +165,15 @@ records, not how the code changed.
   file's already-read content for the rest of the session, the same way
   the hex view already does
   ([#78](https://github.com/switch-nz/strata/issues/78)).
+- **Times recorded with no time zone are no longer shown as UTC.** FAT
+  timestamps, the DOS times inside shellbags, and exFAT timestamps whose
+  entry records no valid UTC offset are local time on a clock whose zone the
+  media does not say. They were marked and displayed as UTC, and converted to
+  the chosen display zone as if they were. They are now shown exactly as
+  recorded, with no zone, no conversion and no label, in the interface and
+  the report. Deciding which zone they belong to is left to the examiner.
+  The timeline still has to place them somewhere to sort them, and orders
+  them as if they were UTC ([#19](https://github.com/switch-nz/strata/issues/19)).
 
 ### Fixed
 - **A ShimCache entry proves a file was examined, not that it ran — but
@@ -237,17 +311,11 @@ records, not how the code changed.
   rather than silently read as if it were complete
   ([#19](https://github.com/switch-nz/strata/issues/19)).
 
-### Changed
+### Known issues
 
-- **Times recorded with no time zone are no longer shown as UTC.** FAT
-  timestamps, the DOS times inside shellbags, and exFAT timestamps whose
-  entry records no valid UTC offset are local time on a clock whose zone the
-  media does not say. They were marked and displayed as UTC, and converted to
-  the chosen display zone as if they were. They are now shown exactly as
-  recorded, with no zone, no conversion and no label, in the interface and
-  the report. Deciding which zone they belong to is left to the examiner.
-  The timeline still has to place them somewhere to sort them, and orders
-  them as if they were UTC ([#19](https://github.com/switch-nz/strata/issues/19)).
+The known issues listed for 0.1.2 are resolved:
+[#19](https://github.com/switch-nz/strata/issues/19) is closed, including
+the two registry crashes on truncated hives it was tracking.
 
 ## [0.1.2] - 2026-09-17
 
@@ -414,7 +482,8 @@ Corroborate results in these areas with another tool before relying on them.
   ([#15](https://github.com/switch-nz/strata/issues/15),
   [#19](https://github.com/switch-nz/strata/issues/19)).
 
-[Unreleased]: https://github.com/switch-nz/strata/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/switch-nz/strata/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/switch-nz/strata/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/switch-nz/strata/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/switch-nz/strata/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/switch-nz/strata/releases/tag/v0.1.0
