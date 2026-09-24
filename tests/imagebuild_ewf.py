@@ -187,3 +187,32 @@ def segment_names(stem, count):
 def split_raw(data, piece):
     """Split raw media into .001/.002/... sized `piece` bytes."""
     return [data[i:i + piece] for i in range(0, len(data), piece)]
+
+
+def split_names(stem, count, style="ftk", width=None, first=None):
+    """Piece names as each acquisition tool writes them.
+
+    ftk       stem.001, stem.002, ...      (FTK Imager, three digits from 1)
+    guymager  stem.0000, stem.0001, ...    (Guymager, width digits from 0)
+    split     stem.aa, stem.ab, ...        (GNU split, default suffixes)
+    splitd    stem.00, stem.01, ...        (GNU split -d)
+    """
+    defaults = {"ftk": (3, 1), "guymager": (4, 0),
+                "split": (2, 0), "splitd": (2, 0)}
+    if style not in defaults:
+        raise ValueError("unknown split style %r" % (style,))
+    dwidth, dfirst = defaults[style]
+    width = dwidth if width is None else width
+    first = dfirst if first is None else first
+    names = []
+    for i in range(count):
+        index = first + i
+        if style == "split":
+            letters = []
+            for _ in range(width):
+                letters.append(chr(97 + index % 26))
+                index //= 26
+            names.append("%s.%s" % (stem, "".join(reversed(letters))))
+        else:
+            names.append("%s.%0*d" % (stem, width, index))
+    return names
