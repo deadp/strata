@@ -59,6 +59,7 @@ const S = {
   lastSearchPart: null,
   prefs: {},
   markCats: [],
+  readOnly: false,
 };
 
 const fmt = {
@@ -348,7 +349,8 @@ class HexView {
                                      entry: S.scope.entry
                                        ? JSON.stringify(S.scope.entry)
                                        : undefined,
-                                     stream: S.scope.stream || undefined });
+                                     stream: S.scope.stream || undefined,
+                                     snap: S.scope.snap ?? undefined });
     if (this.pending !== token) return;
     const bin = atob(r.data || '');
     const arr = new Uint8Array(bin.length);
@@ -1073,20 +1075,22 @@ function spanAt(off) {
 }
 
 const dirCache = new Map();
-const dirKey = (part, node, ev) =>
-  `${ev ?? S.activeId ?? '?'}:${part}:${node ?? 'root'}`;
+const dirKey = (part, node, ev, snap) =>
+  `${ev ?? S.activeId ?? '?'}:${part}:${node ?? 'root'}${snap != null ? `:s${snap}` : ''}`;
 
 const walkCache = new Map();
 const walkKey = (part, node) =>
-  dirKey(partOffset(part), node, part && part.ev_id);
+  dirKey(partOffset(part), node, part && part.ev_id,
+         part && part.snap);
 
-async function fetchDir(part, nodeId, path, ev) {
-  const key = dirKey(part, nodeId, ev);
+async function fetchDir(part, nodeId, path, ev, snap = null) {
+  const key = dirKey(part, nodeId, ev, snap);
   const hit = dirCache.get(key);
   if (hit) return hit;
 
   let r = await api.get('dir', { part, node: nodeId, path, types: 1,
-                                 ev: ev ?? undefined });
+                                 ev: ev ?? undefined,
+                                 snap: snap ?? undefined });
   if (r.building) {
     const done = await awaitTask(r.task, 'Indexing MFT', {
       modal: {
@@ -1096,7 +1100,8 @@ async function fetchDir(part, nodeId, path, ev) {
     });
     if (!done) return { error: txt('messages.indexing_interrupted') };
     r = await api.get('dir', { part, node: nodeId, path, types: 1,
-                               ev: ev ?? undefined });
+                               ev: ev ?? undefined,
+                               snap: snap ?? undefined });
   }
   if (!r.error) dirCache.set(key, r);
   return r;
@@ -1583,7 +1588,7 @@ function clearViewer() {
 
 function setScope(part, size, label, meta) {
   S.scope = { part, size, label, entry: null, stream: null,
-              extents: null, chunks: null, ev: S.activeId };
+              extents: null, chunks: null, ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = profileCache.get(profileKey(part)) || null;
   S.cursor = 0;
@@ -1649,7 +1654,7 @@ async function revealInTree(part, nodeId) {
 function setEmptyScope(label, part) {
   S.scope = { part: partOffset(part), size: 0, label, entry: null,
               stream: null, extents: null, chunks: null, empty: true,
-              ev: S.activeId };
+              ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = null;
   S.cursor = 0;
@@ -1669,7 +1674,7 @@ function setFileScope(entry, part, size, label, stream = null,
                      extents = null, chunks = null) {
   S.scope = { part: partOffset(part), size: size || 0, label,
               entry, stream, file: true, extents: extents || null,
-              chunks: chunks || null, ev: S.activeId };
+              chunks: chunks || null, ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = profileCache.get(profileKey(partOffset(part), S.scope)) || null;
   S.cursor = 0;
@@ -1854,7 +1859,9 @@ async function showEntry(e, part, from = null, stream = null) {
     <div class="subtitle">${txt('ui.show_entry.reading')}</div>`;
   const st = await api.get('stat', { part: partOffset(part),
                                     entry: JSON.stringify(e),
-                                    stream: stream ? stream.name : undefined });
+                                    stream: stream ? stream.name : undefined,
+                                    snap: part && part.snap != null
+                                      ? part.snap : undefined });
 
   if (!st || st.error) {
     i.innerHTML = `<div class="title">${esc(e.name)}</div>
@@ -2072,7 +2079,7 @@ async function showEntry(e, part, from = null, stream = null) {
       ${                                                                
                                                                        
                            ''}
-      <button class="ghost" id="btn-export">${txt('ui.show_entry.export')}</button>
+      <button class="ghost" id="btn-export"${S.readOnly ? ' disabled' : ''}>${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-tag">${txt('ui.show_entry.tag')}</button>
       ${stream ? '' : `<button class="ghost" id="btn-hash-one">${
         hb ? 'Rehash' : 'Hash'}</button>`}
@@ -2128,7 +2135,8 @@ async function exportEntry(e, part, dest = null, stream = '',
     part: partOffset(part), entry: e,
     node: e.mft ?? e.inode ?? e.oid ?? e.start_cluster,
     name: e.name, path: e.path, size: e.size, dest, stream,
-    add_exhibit: addExhibit });
+    add_exhibit: addExhibit,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (r.error) return toast(r.error);
   if (r.exhibit) {
     if (r.exhibit.added) {
@@ -2149,12 +2157,14 @@ async function exportEntry(e, part, dest = null, stream = '',
 const COPY_MAX = 1 << 20;
 
 async function rangeBytes(start, length) {
+  const snap = S.scope.snap;
   const r = S.scope.entry
     ? await api.get('hex', { offset: start, length, part: S.scope.part,
                              entry: JSON.stringify(S.scope.entry),
-                             stream: S.scope.stream || undefined })
+                             stream: S.scope.stream || undefined,
+                             snap: snap ?? undefined })
     : await api.get('hex', { offset: start + (S.scope.part || 0),
-                             length, part: null });
+                             length, part: null, snap: snap ?? undefined });
   if (r.error) throw new Error(r.error);
   return b64ToBytes(r.data);
 }
@@ -2449,11 +2459,13 @@ function typedCard(kind, e, truncated) {
 
 function fileURL(entry, part) {
   const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  if (part.snap != null) q.set('snap', String(part.snap));
   return `/api/file?${q}`;
 }
 
 function thumbnailURL(entry, part) {
   const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  if (part.snap != null) q.set('snap', String(part.snap));
   return `/api/thumbnail?${q}`;
 }
 
@@ -2606,7 +2618,7 @@ function visibleEntries() {
 
 async function previewDir(entries, name, part, id = undefined, self = null,
                           parent = null, scope = null) {
-  await loadHashMap(partOffset(part));
+  if (part && part.snap == null) await loadHashMap(partOffset(part));
   if (scope) {
     dirView.trail = [];
   } else if (!parent) {
@@ -2917,10 +2929,12 @@ async function previewEntry(e, part, from = null, stream = null) {
     pvSet(e.name || txt('ui.preview.preview_title'), '',
           `<p class="empty">${txt('messages.folder_has_a_listing_not_a_preview')}</p>`);
     const nodeId = e.mft ?? e.inode ?? e.oid ?? e.start_cluster;
-    if (!dirCache.has(dirKey(part.offset, nodeId, part.ev_id))) {
+    if (!dirCache.has(dirKey(part.offset, nodeId, part.ev_id,
+                       part.snap))) {
       dirSet(e.name, 'reading…', `<p class="empty">${txt('ui.reading_directory')}</p>`);
     }
-    const r = await fetchDir(part.offset, nodeId, e.path, part.ev_id);
+    const r = await fetchDir(part.offset, nodeId, e.path, part.ev_id,
+                             part.snap);
     if (pvToken !== token) return;
     if (r.error) return dirSet(e.name, 'error', `<p class="empty">${esc(r.error)}</p>`);
     return previewDir(r.entries, e.name, part, nodeId, e, from);
@@ -2939,7 +2953,9 @@ async function previewEntry(e, part, from = null, stream = null) {
   const want = Math.min(size, PV_MAX);
   const r = await api.get('preview', { part: part.offset,
                                        entry: JSON.stringify(e), length: want,
-                                       stream: stream ? stream.name : undefined });
+                                       stream: stream ? stream.name : undefined,
+                                       snap: part && part.snap != null
+                                         ? part.snap : undefined });
   if (pvToken !== token) return;
   if (r.error) return pvSet(label, 'error', `<p class="empty">${esc(r.error)}</p>`);
 
@@ -3471,7 +3487,9 @@ function redrawDates() {
 
 async function openArchive(e, part) {
   const r = await api.get('archive', { part: partOffset(part),
-                                      entry: JSON.stringify(e) });
+                                       entry: JSON.stringify(e),
+                                       snap: part && part.snap != null
+                                         ? part.snap : undefined });
   if (r.error) {
     return pvSet(e.name, 'archive',
       `<p class="empty">${esc(r.error)}</p>` +
@@ -3515,7 +3533,8 @@ async function openArchiveEntry(i) {
   const item = a.info.items.filter(x => !x.is_dir)[i];
   if (!item) return;
   const r = await api.get('archive', {
-    part: a.part, entry: JSON.stringify(a.entry), inner: item.name });
+    part: a.part, entry: JSON.stringify(a.entry), inner: item.name,
+    snap: a.part && a.part.snap != null ? a.part.snap : undefined });
   if (r.error) return toast(r.error);
   const bytes = Uint8Array.from(atob(r.preview || ''), c => c.charCodeAt(0));
   const notes = (r.notes || []).map(n =>
@@ -3575,6 +3594,7 @@ function partIn(evId, offset) {
 function renderURL(e, part, as) {
   const q = new URLSearchParams({ part: String(partOffset(part)),
                                   entry: JSON.stringify(e) });
+  if (part && part.snap != null) q.set('snap', String(part.snap));
   if (as) q.set('as', as);
   return `/api/render?${q}`;
 }
@@ -3593,7 +3613,9 @@ function sanitisedNote(findings, what) {
 
 async function openPdf(e, part) {
   const info = await api.get('render', { part: partOffset(part),
-                                         entry: JSON.stringify(e) });
+                                         entry: JSON.stringify(e),
+                                         snap: part && part.snap != null
+                                           ? part.snap : undefined });
   if (info.error) return pvSet(e.name, 'pdf', `<p class="empty">${esc(info.error)}</p>`);
 
   const meta = [
@@ -3627,10 +3649,11 @@ async function openPdf(e, part) {
       (${info.active_content.length})</summary><ul>${active}</ul></details>` : ''}
     ${body}`);
 }
-
 async function openMarkup(e, part, kind) {
   const info = await api.get('render', { part: partOffset(part),
-                                         entry: JSON.stringify(e) });
+                                         entry: JSON.stringify(e),
+                                         snap: part && part.snap != null
+                                           ? part.snap : undefined });
   if (info.error) return pvSet(e.name, kind, `<p class="empty">${esc(info.error)}</p>`);
   if (!info.renderable) {
     return pvSet(e.name, kind,
@@ -3659,7 +3682,8 @@ async function openRegistry(entry, part, path = '') {
   reg.part = part; reg.entry = entry; reg.path = path;
   pvSet(entry.name, txt('ui.registry_hive'), `<p class="empty">${txt('ui.reading_hive')}</p>`);
   const r = await api.get('registry', {
-    part: part.offset, entry: JSON.stringify(entry), key: path });
+    part: part.offset, entry: JSON.stringify(entry), key: path,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (pvToken !== token) return;
   if (r.error) return pvSet(entry.name, 'registry', `<p class="empty">${esc(r.error)}</p>`);
   renderRegistry(r);
@@ -3779,10 +3803,11 @@ const EVTX_PAGE = 2000;
 async function openEventLog(entry, part, offset = 0) {
   const token = Symbol();
   pvToken = token;
+  const t = await api.post('evtx', {
+    part: part.offset, entry, limit: EVTX_PAGE, offset,
+    snap: part && part.snap != null ? part.snap : undefined });
   pvSet(entry.name, txt('ui.event_log'),
         `<p class="empty">${txt('ui.decoding_records_progress_task_tray')}</p>`);
-  const t = await api.post('evtx', {
-    part: part.offset, entry, limit: EVTX_PAGE, offset });
   const r = await awaitTask(t, txt('ui.decoding_events'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, txt('ui.event_log'),
@@ -3868,9 +3893,9 @@ const sq = { entry: null, part: null, table: null, info: null, tables: [],
 async function openSqlite(entry, part, table = null, recover = false) {
   const token = Symbol();
   pvToken = token;
-  pvSet(entry.name, 'database', `<p class="empty">${txt('ui.reading_pages')}</p>`);
   const t = await api.post('sqlite', {
-    part: part.offset, entry, table, recover, limit: 5000 });
+    part: part.offset, entry, table, recover, limit: 5000,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, txt('ui.reading_database'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'database',
@@ -3970,8 +3995,9 @@ const eseView = { entry: null, part: null, table: null };
 async function openEse(entry, part, table = null) {
   const token = Symbol();
   pvToken = token;
-  pvSet(entry.name, 'database', `<p class="empty">${txt('ui.reading_pages')}</p>`);
-  const t = await api.post('ese', { part: part.offset, entry, table, limit: 2000 });
+  const t = await api.post('ese', {
+    part: part.offset, entry, table, limit: 2000,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, txt('ui.reading_database'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'database',
@@ -4044,7 +4070,9 @@ async function openLevelDb(entry, part) {
   const token = Symbol();
   pvToken = token;
   pvSet(entry.name, 'leveldb', `<p class="empty">${txt('ui.decompressing_blocks')}</p>`);
-  const t = await api.post('leveldb', { part: part.offset, entry });
+  const t = await api.post('leveldb', {
+    part: part.offset, entry,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, 'Reading LevelDB');
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'leveldb', `<p class="empty">${txt('ui.open_sqlite.cancelled')}</p>`);
@@ -4112,18 +4140,25 @@ async function maybeUnlock(part) {
     }).join('');
 
   const canTry = !!enc.recoverable;
-  $('#unlock-field').hidden = !canTry;
+  const wantsSecret = kinds.includes('password') || kinds.includes('recovery');
+  const wantsKeyfile = kinds.includes('keyfile');
+  $('#unlock-field').hidden = !canTry || !wantsSecret;
+  $('#unlock-keyfile-field').hidden = !canTry || !wantsKeyfile;
   $('#unlock-go').hidden = !canTry;
   $('#unlock-label').textContent = kinds.includes('recovery')
     ? (kinds.includes('password') ? txt('ui.unlock.unlock_label') : txt('ui.recovery_key'))
     : 'Password';
   $('#unlock-cancel').textContent = canTry ? 'Not now' : 'Close';
+  // A clear-key protector's own advice (info()'s findings, via _advice())
+  // already says no secret is needed whenever one is present, so there is
+  // no separate client-side case to cover here.
   $('#unlock-note').textContent = (enc.findings || []).join(' ')
     || (canTry ? txt('help.key_held_session_only_never_written_case') : '');
   $('#unlock-error').hidden = true;
   $('#unlock-secret').value = '';
   $('#unlock-secret').type = 'password';
   $('#unlock-show').checked = false;
+  $('#unlock-keyfile').value = '';
 
   previewNone(canTry
     ? txt('help.volume_encrypted_unlock_list_contents')
@@ -4131,15 +4166,15 @@ async function maybeUnlock(part) {
 
   dlg.returnValue = '';
   dlg.showModal();
-  if (canTry) setTimeout(() => $('#unlock-secret').focus(), 30);
+  if (canTry && wantsSecret) setTimeout(() => $('#unlock-secret').focus(), 30);
 
   return await new Promise(resolve => {
     const done = async () => {
       dlg.removeEventListener('close', done);
       if (dlg.returnValue !== 'ok') return resolve(true);
       const secret = $('#unlock-secret').value;
-      if (!secret) return resolve(true);
-      const t = await api.post('unlock', { part: part.offset, secret });
+      const keyfile = $('#unlock-keyfile').value.trim();
+      const t = await api.post('unlock', { part: part.offset, secret, keyfile });
       const r = await awaitTask(t, 'Unlocking', {
         modal: { title: txt('ui.unlocking_volume'),
                  detail: txt('help.deriving_key_entered_format_specifies_about_million') },
@@ -4161,7 +4196,7 @@ async function maybeUnlock(part) {
       $('#unlock-secret').value = '';
       dlg.returnValue = '';
       dlg.showModal();
-      setTimeout(() => $('#unlock-secret').focus(), 30);
+      if (wantsSecret) setTimeout(() => $('#unlock-secret').focus(), 30);
     };
     dlg.addEventListener('close', done);
   });
@@ -4174,12 +4209,12 @@ $('#unlock-show')?.addEventListener('change', e => {
 async function previewRoot(part) {
   const token = Symbol();
   pvToken = token;
-  const label = partName(part);
-  if (!dirCache.has(dirKey(part.offset, null, part.ev_id))) {
+  const label = S.snapLabel || partName(part);
+  if (!dirCache.has(dirKey(part.offset, null, part.ev_id, part.snap))) {
     dirSet(label + ' · /', 'reading…',
            `<p class="empty">${txt('ui.reading_root_directory')}</p>`);
   }
-  const r = await fetchDir(part.offset, null, '/', part.ev_id);
+  const r = await fetchDir(part.offset, null, '/', part.ev_id, part.snap);
   if (pvToken !== token) return;
   if (r.error) {
     return dirSet(label + ' · /', 'error', `<p class="empty">${esc(r.error)}</p>`);
@@ -4306,7 +4341,7 @@ document.addEventListener('scroll', closeMenu, true);
 
 function entryMenu(e, part) {
   const dir = !!e.is_dir;
-  return [
+  const items = [
     { label: dir ? 'Open' : txt('ui.show_bytes'), action: () => showEntry(e, part) },
     dir ? null
         : { label: 'Preview',
@@ -4320,17 +4355,18 @@ function entryMenu(e, part) {
     { label: dir ? txt('ui.hash_everything_here') : 'Hash',
       action: () => hashScope(partOffset(part), dir ? 'folder' : 'item', e,
                               e.name || (dir ? 'folder' : 'file')) },
-    dir ? { label: txt('ui.export_folder'), action: () => exportFolder(e, part) }
-        : { label: 'Export', action: () => exportEntry(e, part) },
-    dir ? null : { label: txt('ui.export'), action: () => exportEntryAs(e, part) },
+    dir ? { label: txt('ui.export_folder'), action: () => exportFolder(e, part), exportOnly: true }
+        : { label: 'Export', action: () => exportEntry(e, part), exportOnly: true },
+    dir ? null : { label: txt('ui.export'), action: () => exportEntryAs(e, part), exportOnly: true },
     dir ? { label: txt('ui.export_folder_and_add'),
-            action: () => exportFolder(e, part, { addExhibit: true }) }
+            action: () => exportFolder(e, part, { addExhibit: true }), exportOnly: true }
         : { label: txt('ui.export_and_add'),
-            action: () => exportEntryAs(e, part, '', { addExhibit: true }) },
+            action: () => exportEntryAs(e, part, '', { addExhibit: true }), exportOnly: true },
     { sep: true },
     { label: txt('ui.copy_path'), action: () => copyText(e.path || e.name) },
     { label: txt('ui.copy_name'), action: () => copyText(e.name || '') },
   ];
+  return S.readOnly ? items.filter(it => !it || !it.exportOnly) : items;
 }
 
 async function exportFolder(e, part, { addExhibit = false } = {}) {
@@ -4339,7 +4375,8 @@ async function exportFolder(e, part, { addExhibit = false } = {}) {
   if (dest === '') return;
   const t = await api.post('export/folder', {
     part: partOffset(part), entry: e, dest: dest || null,
-    add_exhibit: addExhibit });
+    add_exhibit: addExhibit,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (t.error) return toast(t.error);
   const r = await awaitTask(t, 'Exporting ' + (e.name || 'folder'), {
     modal: { title: 'Exporting ' + (e.name || 'folder'),
@@ -4367,18 +4404,19 @@ async function pickPath({ mode = 'open', title = '', dir = '', file = '',
 function rangeMenu({ offset, length, part = null, label = 'range', ext = '',
                      fragments = null }) {
   const len = Math.max(1, length || 1);
-  return [
+  const items = [
     { label: txt('ui.show_bytes'), action: () => jumpTo(part, offset, len) },
     { sep: true },
     { label: 'Mark…',
       action: () => saveMark(offset + (part || 0), len, label, 'result') },
-    { label: txt('ui.export_bytes'),
+    { label: txt('ui.export_bytes'), exportOnly: true,
       action: () => exportRange({ offset, length: len, part, ext, fragments }) },
-    { label: txt('ui.export_bytes_2'),
+    { label: txt('ui.export_bytes_2'), exportOnly: true,
       action: () => exportRangeAs({ offset, length: len, part, ext, label, fragments }) },
     { sep: true },
     { label: txt('ui.copy_offset'), action: () => copyText('0x' + fmt.hex(offset, 8)) },
   ];
+  return S.readOnly ? items.filter(it => !it || !it.exportOnly) : items;
 }
 
 async function exportRange({ offset, length, part = null, ext = '', dest = null,
@@ -5090,7 +5128,7 @@ function showCarveHit(h, part) {
     ${h.gap ? `<div class="notice">${txt('help.carve.fragmented_notice',
       { bytes: fmt.bytes(h.gap.length) })}</div>` : ''}
     <div class="actions">
-      <button class="ghost" id="btn-carve-export">${txt('ui.show_entry.export')}</button>
+      <button class="ghost" id="btn-carve-export"${S.readOnly ? ' disabled' : ''}>${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-carve-mark">${txt('ui.show_carve_hit.mark')}</button>
     </div>`;
   $('#btn-carve-export').addEventListener('click', async () => {
@@ -6478,7 +6516,26 @@ function renderVss(r, part) {
       <div class="path">${esc(s.id || '')}</div>
       ${s.unsupported ? `<div class="meta">${esc(s.unsupported)}</div>` : ''}
     </div>`).join('');
+  [...box.querySelectorAll('.result')].forEach((el, i) => {
+    const s = snaps[i];
+    if (!s || s.unsupported) return;
+    const btn = document.createElement('button');
+    btn.className = 'ghost';
+    btn.textContent = txt('ui.snaps.open');
+    btn.addEventListener('click', () => openSnapshot(part, i, s));
+    el.querySelector('.top').appendChild(btn);
+  });
   tabCount('triage', snaps.length);
+}
+
+async function openSnapshot(part, i, s) {
+  const po = partObj(part);
+  if (!po) return toast(txt('messages.toast.pick_filesystem'));
+  const pseudo = { ...po, offset: po.offset, snap: i, ev_id: S.activeId };
+  S.lastPick = { kind: 'entry', e: null, part: pseudo, from: null, stream: null };
+  S.snapLabel = txt('ui.snaps.snapshot_view',
+                    { created: fmt.time(s.created_at) });
+  await previewRoot(pseudo);
 }
 
 function renderBrowser(r, part) {
@@ -8009,7 +8066,9 @@ async function openDocument(e, part) {
   const token = (pvToken = Symbol());
   pvSet(e.name, 'document', `<p class="empty">${txt('ui.preview_entry.reading')}</p>`);
   const d = await api.get('document', { part: partOffset(part),
-                                       entry: JSON.stringify(e) });
+                                        entry: JSON.stringify(e),
+                                        snap: part && part.snap != null
+                                          ? part.snap : undefined });
   if (pvToken !== token) return;
   if (d.error) return pvSet(e.name, 'document',
     `<div class="notice bad">${esc(d.error)}</div>`);
@@ -8046,6 +8105,14 @@ function bindDocZip(e, part) {
   $('#doc-as-zip')?.addEventListener('click', () => openArchive(e, part));
 }
 
+function applyReadOnly() {
+  // Server-side is authoritative (engine.server refuses these routes
+  // regardless of what the UI shows); this only keeps read-only examiners
+  // from reaching for a control that would just be refused.
+  const btn = $('#btn-tag-export');
+  if (btn) btn.disabled = S.readOnly;
+}
+
 function applyEmptyCase(r) {
   const next = r.case_path || r.case?.path || null;
   enterCase(next);
@@ -8067,7 +8134,7 @@ function applyEmptyCase(r) {
   $('#btn-add').addEventListener('click', () => openDialog({ add: true }));
   $('#btn-case').addEventListener('click', () => caseDialog());
   $('#btn-audit').hidden = false;
-  $('#btn-report').hidden = false;
+  $('#btn-report').hidden = S.readOnly;
   $('#integrity').hidden = true;
   if ($('.view[data-view="cases"]')?.classList.contains('is-on')) {
     renderCases();
@@ -8476,7 +8543,7 @@ function applyOpened(r, { tree = true } = {}) {
   $('#btn-add').addEventListener('click', () => openDialog({ add: true }));
   $('#btn-case').addEventListener('click', () => caseDialog());
   $('#btn-audit').hidden = false;
-  $('#btn-report').hidden = false;
+  $('#btn-report').hidden = S.readOnly;
   $('#integrity').hidden = false;
   $('#integrity').dataset.state = 'unchecked';
   $('#integrity').textContent = txt('ui.hashes_unchecked');
@@ -8878,6 +8945,7 @@ function applyNoCase() {
   S.activeId = null;
   S.evidenceId = null;
   S.scope = null;
+  S.snapLabel = null;
   S.marks = [];
   S.tags = [];
   $('#evidence-bar').innerHTML = `
@@ -8898,6 +8966,7 @@ $('#btn-new-case')?.addEventListener('click', newCaseDialog);
 $('#btn-open-case')?.addEventListener('click', () => caseDialog());
 $('#btn-case-add')?.addEventListener('click', () => openDialog({ add: !!S.casePath }));
 $('#btn-close-case')?.addEventListener('click', closeCaseDialog);
+$('#btn-compact-case')?.addEventListener('click', compactCase);
 $('#newcase-name')?.addEventListener('input', pathHint);
 $('#newcase-path')?.addEventListener('input', pathHint);
 $('#dlg-new-case')?.addEventListener('close', () => {
@@ -9112,9 +9181,29 @@ async function relocateIndex(pending) {
   const t = await api.post('index/relocate', {}).catch(() => null);
   if (!t || t.error || t.nothing_to_do) return;
   const r = await awaitTask(t, txt('ui.index.moving'));
-  if (r && r.moved) {
+  if (r && r.moved && r.converted) {
+    toast(txt('messages.index_converted', {
+      before: fmt.bytes(r.before), after: fmt.bytes(r.after) }), 'task');
+  } else if (r && r.moved) {
     toast(txt('messages.index_moved', { count: r.moved }), 'task');
+  } else if (r && r.deferred) {
+    toast(txt('messages.index_move_deferred', {
+      need: fmt.bytes(r.need), free: fmt.bytes(r.free) }));
+  } else if (r && r.error) {
+    toast(txt('messages.index_move_failed', { error: r.error }));
   }
+}
+
+async function compactCase() {
+  if (!S.casePath) return toast(txt('messages.cases.none_open'));
+  const t = await api.post('case/compact', {}).catch(() => null);
+  if (!t) return;
+  if (t.error) return toast(t.tasks?.length ? `${t.error} ${t.advice}` : t.error);
+  const r = await awaitTask(t, txt('ui.cases.compacting'));
+  if (!r) return;
+  if (!r.compacted) return toast(r.error || txt('messages.cases.compact_failed'));
+  toast(txt('messages.cases.compacted', {
+    before: fmt.bytes(r.before), after: fmt.bytes(r.after) }), 'task');
 }
 
 async function loadVersion() {
@@ -9800,6 +9889,8 @@ $$('.modules .tab').forEach(tab =>
   hex.resize();
   loadWho();
   const st = await api.get('state');
+  S.readOnly = !!st.read_only;
+  applyReadOnly();
   if (st.open) {
     applyOpened(st);
     if (p.split_hex) toggleSplit(true);
