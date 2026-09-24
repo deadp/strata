@@ -504,6 +504,18 @@ class Raw(TempDir):
         self.assertIn("read on its own", after.findings[0])
         self.assertIn("missing split.003", after.findings[0])
 
+    def test_missing_piece_is_reported_when_both_0_and_1_are_absent(self):
+        # Regression: when the earliest present piece index is >= 2, `run`
+        # starts out empty (piece 1 itself is missing), which used to hit an
+        # early return that silently dropped this finding entirely.
+        self.assertGreater(len(MEDIA), 3 * 2000)
+        self.write_split(2000, skip=(1, 2))
+        img = self.open(os.path.join(self.dir, "split.003"))
+        self.assertEqual(img.info()["segments"], ["split.003"])
+        self.assertEqual(len(img.findings), 1)
+        self.assertIn("read on its own", img.findings[0])
+        self.assertIn("missing split.001", img.findings[0])
+
     def test_piece_of_the_wrong_size_is_reported(self):
         self.write_split(3000)
         self.write("split.002", MEDIA[3000:5000])

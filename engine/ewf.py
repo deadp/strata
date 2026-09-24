@@ -550,7 +550,7 @@ def discover_raw_segments(path):
     piece = _split_piece(name)
     if not piece:
         return [path], []
-    prefix, opened, style, _ = piece
+    prefix, opened, style, opened_width = piece
     widths = {}
     for sib in os.listdir(directory):
         s = _split_piece(sib)
@@ -568,9 +568,11 @@ def discover_raw_segments(path):
     run = []
     while first + len(run) in widths:
         run.append(first + len(run))
-    if not run:
-        return [path], []
-    width = widths[first]
+    # first itself can be absent from widths (e.g. numeric style opened at
+    # piece 2 with neither 0 nor 1 present) -- fall back to the opened
+    # piece's own width so the "missing piece" finding below can still name
+    # it, rather than skipping the finding entirely.
+    width = widths.get(first, opened_width)
     findings = []
     if style == "n":
         odd = [n for n in run if widths[n] != width]
