@@ -78,6 +78,25 @@ _BOUND = {"host": "127.0.0.1", "port": 8722}
 
 _LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
+# Set once by serve() from --read-only, before the server starts accepting
+# requests. Session.read_only reads this live rather than capturing it at
+# construction time, because the module-level SESSION singleton below is
+# built at import time -- before serve() has parsed the CLI flag.
+READ_ONLY = False
+
+# Server-side export and report-writing routes refused while READ_ONLY is
+# set. Analysis endpoints that only compute or cache results (registry
+# report, artefact collectors, ...) are not export/report writes and are
+# deliberately left out -- read-only mode narrows to what issue #70 asks
+# for, not every write.
+_READONLY_BLOCKED_PATHS = frozenset({
+    "/api/export", "/api/export/file", "/api/export/folder",
+    "/api/export/manifest", "/api/report/write",
+})
+
+def _blocked_by_readonly(read_only, path):
+    return bool(read_only) and path in _READONLY_BLOCKED_PATHS
+
 def set_bound_address(host, port):
     _BOUND["host"] = host or "127.0.0.1"
     _BOUND["port"] = int(port)
@@ -255,6 +274,10 @@ class Session:
     def current(self):
         return self.items.get(self.active_id)
 
+    @property
+    def read_only(self):
+        return READ_ONLY
+
     def __getattr__(self, name):
         if name in Session._PER_EVIDENCE:
             cur = self.__dict__.get("items", {}).get(
@@ -296,15 +319,42 @@ class Session:
             names = os.listdir(base)
         except OSError:
             return []
-        gone = []
+        return [name for name in sorted(names)
+                if pattern.match(name) and _remove(os.path.join(base, name))]
+
+    def sweep_cache(self):
+        if self.case is None or READ_ONLY:
+            return []
+        base = self.case.cache_dir()
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return []
+        rows = self.case.db.execute("SELECT id, path FROM evidence").fetchall()
+        ids = {int(r["id"]) for r in rows}
+        owners = tuple(treecache_mod.prefix_for(r["path"]) for r in rows)
+        orphans = []
         for name in sorted(names):
-            if not pattern.match(name):
-                continue
+            m = _TIMELINE_FILE.match(name)
+            if m and int(m.group(1)) not in ids:
+                orphans.append(name)
+            elif (name.startswith(treecache_mod.PREFIX)
+                  and not name.startswith(owners)):
+                orphans.append(name)
+        gone, freed = [], 0
+        for name in orphans:
+            p = os.path.join(base, name)
             try:
-                os.remove(os.path.join(base, name))
-                gone.append(name)
+                size = os.path.getsize(p)
             except OSError:
-                pass
+                size = 0
+            if _remove(p):
+                gone.append(name)
+                freed += size
+        if gone:
+            self.case.log("cache.swept", {"removed": gone,
+                                          "freed_bytes": freed})
+            self.case.db.commit()
         return gone
 
     def evidence(self, which=None):
@@ -324,6 +374,10 @@ class Session:
                 pass
         self.case = Case(case_path, name=name, examiner=examiner)
         try:
+            self.sweep_cache()
+        except Exception:
+            pass
+        try:
             recents_mod.note(self.case.examiner, self.case.path,
                              self.case.get("name"))
         except Exception:
@@ -332,6 +386,10 @@ class Session:
 
     def running_tasks(self):
         return [t for t in self.tasks.values() if t.get("state") == "running"]
+
+    def index_updating(self):
+        return any(t.get("name") == "index-relocate"
+                   for t in self.running_tasks())
 
     def new_case(self, case_path, name=None, examiner=None):
         self._use_case(case_path, examiner, name=name)
@@ -418,7 +476,8 @@ class Session:
         cur = self.current
         if cur is None:
             return {"open": False,
-                    "case": self.case.summary() if self.case else None}
+                    "case": self.case.summary() if self.case else None,
+                    "read_only": self.read_only}
         return {
             "open": True, "path": cur.path,
             "image": cur.image.info(),
@@ -430,6 +489,7 @@ class Session:
             "active_id": self.active_id,
             "index_reset": bool(getattr(self.case, "index_reset", False)),
             "index_pending": int(getattr(self.case, "index_pending", 0) or 0),
+            "read_only": self.read_only,
         }
 
     def reader(self, offset, size, slot="?", ev=None):
@@ -935,20 +995,6 @@ class Handler(BaseHTTPRequestHandler):
             out["open"] = True
             return self._send(200, out)
 
-        if path == "/api/index/relocate":
-            if not s.case:
-                return self._send(400, {"error": _t("server.export.case_open")})
-            if not getattr(s.case, "index_pending", 0):
-                return self._send(200, {"moved": 0, "nothing_to_do": True})
-
-            def run(progress):
-                return s.case.relocate_index(progress=progress)
-
-            return self._send(200, s.start_task(
-                "index-relocate", run,
-                label=_t("server.index_relocate.label"),
-                detail=_t("server.index_relocate.detail")))
-
         if path == "/api/version":
             return self._send(200, {"name": version_mod.NAME,
                                     "version": version_mod.__version__,
@@ -1010,6 +1056,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, out)
             except Exception as exc:
                 return self._send(400, {"error": _t("server.case_peek.strata_case_file") % exc})
+
+        # Tasks belong to the session, not to an exhibit: moving the index or
+        # compacting runs with a case open and nothing loaded, and has to be
+        # followable then too.
+        if path == "/api/task":
+            tid = self._q("id")
+            t = s.tasks.get(tid)
+            if not t:
+                return self._send(200, {"error": _t("server.task.such_task")})
+            out = {k: v for k, v in t.items() if k != "partial"}
+            live = t.get("partial")
+            if live is not None:
+                n = len(live)
+                since = min(self._q("since", 0, int), n)
+                out["found"] = n
+                out["new"] = live[since:min(n, since + 2000)]
+            return self._send(200, out)
+
+        if path == "/api/tasks":
+            items = s.task_list()
+            return self._send(200, {
+                "tasks": items,
+                "running": sum(1 for t in items if t["state"] == "running"),
+            })
 
         if not s.image:
             return self._send(409, {"error": _t("server.case_peek.evidence_open")})
@@ -1388,32 +1458,11 @@ class Handler(BaseHTTPRequestHandler):
 
             return self._send(400, {"error": _t("server.render.nothing_here_needs_sanitising")})
 
-        if path == "/api/task":
-            tid = self._q("id")
-            t = s.tasks.get(tid)
-            if not t:
-                return self._send(200, {"error": _t("server.task.such_task")})
-            out = {k: v for k, v in t.items() if k != "partial"}
-            live = t.get("partial")
-            if live is not None:
-                n = len(live)
-                since = min(self._q("since", 0, int), n)
-                out["found"] = n
-                out["new"] = live[since:min(n, since + 2000)]
-            return self._send(200, out)
-
         if path == "/api/artefacts":
             if not s.case or s.evidence_id is None:
                 return self._send(200, {"items": {}, "dropped": [],
                                         "note": _t("server.artefacts.case_file_so_nothing")})
             return self._send(200, s.case.artefacts(s.evidence_id))
-
-        if path == "/api/tasks":
-            items = s.task_list()
-            return self._send(200, {
-                "tasks": items,
-                "running": sum(1 for t in items if t["state"] == "running"),
-            })
 
         if path == "/api/searches":
             return self._send(200, {"searches": s.case.searches()})
@@ -1793,8 +1842,18 @@ class Handler(BaseHTTPRequestHandler):
             return sess.image
         return sess.region(part)
 
+    def _readonly_refusal(self, s, path):
+        if s.case is not None:
+            try:
+                s.case.log("readonly.refused", {"path": path})
+            except Exception:
+                pass
+        return {"error": _t("server.readonly.refused")}
+
     def _api_post(self, path, body):
         s = self._session()
+        if _blocked_by_readonly(s.read_only, path):
+            return self._send(403, self._readonly_refusal(s, path))
         if path == "/api/whoami":
             name = (body.get("name") or "").strip()
             if not name:
@@ -2053,9 +2112,9 @@ class Handler(BaseHTTPRequestHandler):
             gone = s.case.remove_evidence(ev_id)
             if gone is None:
                 return self._send(400, {"error": _t("server.evidence_select.such_evidence_item")})
+            s.close(ev_id)
             gone["timelines"] = s.drop_timelines(
                 ev_id, tagged=bool(gone.get("removed")))
-            s.close(ev_id)
             state = s.state()
             state["removed"] = gone
             return self._send(200, state)
@@ -2095,6 +2154,39 @@ class Handler(BaseHTTPRequestHandler):
             if s.running_tasks():
                 return self._send(409, self._tasks_busy(s, "close the case"))
             return self._send(200, s.close_case())
+
+        # Both of these change the case, so they are POST routes -- and they
+        # sit ahead of the "no evidence open" gate below, because a case can
+        # be opened with nothing loaded yet. The relocation used to be
+        # served only on GET while the interface POSTed to it, so the move
+        # never ran and legacy cases kept the whole index in the record.
+        if path == "/api/index/relocate":
+            if not s.case:
+                return self._send(400, {"error": _t("server.export.case_open")})
+            if not getattr(s.case, "index_pending", 0):
+                return self._send(200, {"moved": 0, "nothing_to_do": True})
+
+            def run(progress):
+                return s.case.relocate_index(progress=progress)
+
+            return self._send(200, s.start_task(
+                "index-relocate", run,
+                label=_t("server.index_relocate.label"),
+                detail=_t("server.index_relocate.detail")))
+
+        if path == "/api/case/compact":
+            if not s.case:
+                return self._send(400, {"error": _t("server.export.case_open")})
+            if s.running_tasks():
+                return self._send(409, self._tasks_busy(s, "compact the case"))
+
+            def run(progress):
+                return s.case.compact(progress=progress)
+
+            return self._send(200, s.start_task(
+                "case-compact", run,
+                label=_t("server.case_compact.label"),
+                detail=_t("server.case_compact.detail")))
 
         if path == "/api/case/forget":
             who = self._who(s, body.get("examiner"))
@@ -3017,6 +3109,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"tasks": s.task_list()})
 
         if path == "/api/search/index":
+            # The index is being rewritten into a new file; anything written
+            # to the old one now would be lost when the new one is swapped in.
+            if s.index_updating():
+                return self._send(409, self._tasks_busy(s, "build the index"))
             full = bool(body.get("full"))
             if "whole_disk" in body:
                 whole = bool(body.get("whole_disk"))
@@ -3129,6 +3225,14 @@ class Handler(BaseHTTPRequestHandler):
                             r["offset"] = off
                             r["evidence"] = ev.evidence_id
                             r["exhibit"] = ev.label
+                            if full and r.get("text_capped"):
+                                findings.append(
+                                    "%s: %d file(s) held more than %s of "
+                                    "text; only the first %s of each is "
+                                    "searchable." % (
+                                        label, r["text_capped"],
+                                        fmt_bytes(r["text_cap"]),
+                                        fmt_bytes(r["text_cap"])))
                             filesystems.append(r)
                             covered += sz
 
@@ -3226,15 +3330,36 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/unlock":
             part = int(body.get("part") or 0)
             secret = body.get("secret") or ""
+            keyfile_path = body.get("keyfile") or ""
             v = s.vault(part)
             if v is None:
                 return self._send(400, {
                     "error": _t("server.unlock.partition_encrypted_volume_tool")})
-            if not secret:
+
+            is_bde = isinstance(v, bitlocker_mod.BitLocker)
+            bek_key = None
+            if keyfile_path:
+                if not is_bde:
+                    return self._send(400, {
+                        "error": _t("server.unlock.startup_key_file_only")})
+                try:
+                    with open(keyfile_path, "rb") as fh:
+                        bek_data = fh.read(4096)
+                except OSError as exc:
+                    return self._send(400, {"error": str(exc)})
+                bek_key = bitlocker_mod.parse_bek_file(bek_data)
+                if bek_key is None:
+                    return self._send(400, {
+                        "error": _t("server.unlock.not_a_valid_bek_file")})
+
+            has_free = is_bde and any(
+                p.usable and p.kind == "none" for p in v.protectors)
+            if not secret and not bek_key and not has_free:
                 return self._send(400, {"error": _t("server.unlock.enter_password_key")})
 
             def run(progress):
-                r = v.unlock(secret, progress=progress)
+                kwargs = {"bek_key": bek_key} if is_bde else {}
+                r = v.unlock(secret, progress=progress, **kwargs)
                 if r.get("unlocked"):
                     s.unlocked[part] = v
                     s.fs_cache.pop(part, None)
@@ -3317,6 +3442,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"locked": True, "part": part})
 
         if path == "/api/index/clear":
+            if s.index_updating():
+                return self._send(409, self._tasks_busy(s, "clear the index"))
             part = body.get("part")
             ev_id = None if part is None else s.evidence_id
             textindex_mod.clear(s.case, part, ev_id)
@@ -3622,6 +3749,24 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": _t("server.report.unknown_route")})
 
 _TIMELINE_KEY = re.compile(r"^(tagged|ev[0-9]+-p[0-9]+)$")
+_TIMELINE_FILE = re.compile(
+    r"^timeline-ev([0-9]+)-p[0-9]+\.sqlite(-wal|-shm|-journal)?$")
+
+def _remove(path, tries=30):
+    # Windows refuses to delete a file anything still has open, and that is
+    # usually momentary -- a request finishing, a scanner letting go.
+    for i in range(tries):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return False
+        except PermissionError:
+            if i == tries - 1:
+                return False
+            time.sleep(0.1)
+        except OSError:
+            return False
 
 MAX_HIVE = 512 << 20
 
@@ -4147,7 +4292,10 @@ class _Server(ThreadingHTTPServer):
         self.server_name = host
         self.server_port = port
 
-def serve(host="127.0.0.1", port=8722, image=None, examiner=None):
+def serve(host="127.0.0.1", port=8722, image=None, examiner=None,
+          read_only=False):
+    global READ_ONLY
+    READ_ONLY = bool(read_only)
     if image:
         SESSION.open(image, examiner=examiner)
     set_bound_address(host, port)

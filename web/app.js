@@ -59,6 +59,7 @@ const S = {
   lastSearchPart: null,
   prefs: {},
   markCats: [],
+  readOnly: false,
 };
 
 const fmt = {
@@ -2072,7 +2073,7 @@ async function showEntry(e, part, from = null, stream = null) {
       ${                                                                
                                                                        
                            ''}
-      <button class="ghost" id="btn-export">${txt('ui.show_entry.export')}</button>
+      <button class="ghost" id="btn-export"${S.readOnly ? ' disabled' : ''}>${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-tag">${txt('ui.show_entry.tag')}</button>
       ${stream ? '' : `<button class="ghost" id="btn-hash-one">${
         hb ? 'Rehash' : 'Hash'}</button>`}
@@ -4112,18 +4113,25 @@ async function maybeUnlock(part) {
     }).join('');
 
   const canTry = !!enc.recoverable;
-  $('#unlock-field').hidden = !canTry;
+  const wantsSecret = kinds.includes('password') || kinds.includes('recovery');
+  const wantsKeyfile = kinds.includes('keyfile');
+  $('#unlock-field').hidden = !canTry || !wantsSecret;
+  $('#unlock-keyfile-field').hidden = !canTry || !wantsKeyfile;
   $('#unlock-go').hidden = !canTry;
   $('#unlock-label').textContent = kinds.includes('recovery')
     ? (kinds.includes('password') ? txt('ui.unlock.unlock_label') : txt('ui.recovery_key'))
     : 'Password';
   $('#unlock-cancel').textContent = canTry ? 'Not now' : 'Close';
+  // A clear-key protector's own advice (info()'s findings, via _advice())
+  // already says no secret is needed whenever one is present, so there is
+  // no separate client-side case to cover here.
   $('#unlock-note').textContent = (enc.findings || []).join(' ')
     || (canTry ? txt('help.key_held_session_only_never_written_case') : '');
   $('#unlock-error').hidden = true;
   $('#unlock-secret').value = '';
   $('#unlock-secret').type = 'password';
   $('#unlock-show').checked = false;
+  $('#unlock-keyfile').value = '';
 
   previewNone(canTry
     ? txt('help.volume_encrypted_unlock_list_contents')
@@ -4131,15 +4139,15 @@ async function maybeUnlock(part) {
 
   dlg.returnValue = '';
   dlg.showModal();
-  if (canTry) setTimeout(() => $('#unlock-secret').focus(), 30);
+  if (canTry && wantsSecret) setTimeout(() => $('#unlock-secret').focus(), 30);
 
   return await new Promise(resolve => {
     const done = async () => {
       dlg.removeEventListener('close', done);
       if (dlg.returnValue !== 'ok') return resolve(true);
       const secret = $('#unlock-secret').value;
-      if (!secret) return resolve(true);
-      const t = await api.post('unlock', { part: part.offset, secret });
+      const keyfile = $('#unlock-keyfile').value.trim();
+      const t = await api.post('unlock', { part: part.offset, secret, keyfile });
       const r = await awaitTask(t, 'Unlocking', {
         modal: { title: txt('ui.unlocking_volume'),
                  detail: txt('help.deriving_key_entered_format_specifies_about_million') },
@@ -4161,7 +4169,7 @@ async function maybeUnlock(part) {
       $('#unlock-secret').value = '';
       dlg.returnValue = '';
       dlg.showModal();
-      setTimeout(() => $('#unlock-secret').focus(), 30);
+      if (wantsSecret) setTimeout(() => $('#unlock-secret').focus(), 30);
     };
     dlg.addEventListener('close', done);
   });
@@ -4306,7 +4314,7 @@ document.addEventListener('scroll', closeMenu, true);
 
 function entryMenu(e, part) {
   const dir = !!e.is_dir;
-  return [
+  const items = [
     { label: dir ? 'Open' : txt('ui.show_bytes'), action: () => showEntry(e, part) },
     dir ? null
         : { label: 'Preview',
@@ -4320,17 +4328,18 @@ function entryMenu(e, part) {
     { label: dir ? txt('ui.hash_everything_here') : 'Hash',
       action: () => hashScope(partOffset(part), dir ? 'folder' : 'item', e,
                               e.name || (dir ? 'folder' : 'file')) },
-    dir ? { label: txt('ui.export_folder'), action: () => exportFolder(e, part) }
-        : { label: 'Export', action: () => exportEntry(e, part) },
-    dir ? null : { label: txt('ui.export'), action: () => exportEntryAs(e, part) },
+    dir ? { label: txt('ui.export_folder'), action: () => exportFolder(e, part), exportOnly: true }
+        : { label: 'Export', action: () => exportEntry(e, part), exportOnly: true },
+    dir ? null : { label: txt('ui.export'), action: () => exportEntryAs(e, part), exportOnly: true },
     dir ? { label: txt('ui.export_folder_and_add'),
-            action: () => exportFolder(e, part, { addExhibit: true }) }
+            action: () => exportFolder(e, part, { addExhibit: true }), exportOnly: true }
         : { label: txt('ui.export_and_add'),
-            action: () => exportEntryAs(e, part, '', { addExhibit: true }) },
+            action: () => exportEntryAs(e, part, '', { addExhibit: true }), exportOnly: true },
     { sep: true },
     { label: txt('ui.copy_path'), action: () => copyText(e.path || e.name) },
     { label: txt('ui.copy_name'), action: () => copyText(e.name || '') },
   ];
+  return S.readOnly ? items.filter(it => !it || !it.exportOnly) : items;
 }
 
 async function exportFolder(e, part, { addExhibit = false } = {}) {
@@ -4367,18 +4376,19 @@ async function pickPath({ mode = 'open', title = '', dir = '', file = '',
 function rangeMenu({ offset, length, part = null, label = 'range', ext = '',
                      fragments = null }) {
   const len = Math.max(1, length || 1);
-  return [
+  const items = [
     { label: txt('ui.show_bytes'), action: () => jumpTo(part, offset, len) },
     { sep: true },
     { label: 'Mark…',
       action: () => saveMark(offset + (part || 0), len, label, 'result') },
-    { label: txt('ui.export_bytes'),
+    { label: txt('ui.export_bytes'), exportOnly: true,
       action: () => exportRange({ offset, length: len, part, ext, fragments }) },
-    { label: txt('ui.export_bytes_2'),
+    { label: txt('ui.export_bytes_2'), exportOnly: true,
       action: () => exportRangeAs({ offset, length: len, part, ext, label, fragments }) },
     { sep: true },
     { label: txt('ui.copy_offset'), action: () => copyText('0x' + fmt.hex(offset, 8)) },
   ];
+  return S.readOnly ? items.filter(it => !it || !it.exportOnly) : items;
 }
 
 async function exportRange({ offset, length, part = null, ext = '', dest = null,
@@ -5090,7 +5100,7 @@ function showCarveHit(h, part) {
     ${h.gap ? `<div class="notice">${txt('help.carve.fragmented_notice',
       { bytes: fmt.bytes(h.gap.length) })}</div>` : ''}
     <div class="actions">
-      <button class="ghost" id="btn-carve-export">${txt('ui.show_entry.export')}</button>
+      <button class="ghost" id="btn-carve-export"${S.readOnly ? ' disabled' : ''}>${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-carve-mark">${txt('ui.show_carve_hit.mark')}</button>
     </div>`;
   $('#btn-carve-export').addEventListener('click', async () => {
@@ -7903,6 +7913,14 @@ function bindDocZip(e, part) {
   $('#doc-as-zip')?.addEventListener('click', () => openArchive(e, part));
 }
 
+function applyReadOnly() {
+  // Server-side is authoritative (engine.server refuses these routes
+  // regardless of what the UI shows); this only keeps read-only examiners
+  // from reaching for a control that would just be refused.
+  const btn = $('#btn-tag-export');
+  if (btn) btn.disabled = S.readOnly;
+}
+
 function applyEmptyCase(r) {
   const next = r.case_path || r.case?.path || null;
   enterCase(next);
@@ -7924,7 +7942,7 @@ function applyEmptyCase(r) {
   $('#btn-add').addEventListener('click', () => openDialog({ add: true }));
   $('#btn-case').addEventListener('click', () => caseDialog());
   $('#btn-audit').hidden = false;
-  $('#btn-report').hidden = false;
+  $('#btn-report').hidden = S.readOnly;
   $('#integrity').hidden = true;
   if ($('.view[data-view="cases"]')?.classList.contains('is-on')) {
     renderCases();
@@ -8333,7 +8351,7 @@ function applyOpened(r, { tree = true } = {}) {
   $('#btn-add').addEventListener('click', () => openDialog({ add: true }));
   $('#btn-case').addEventListener('click', () => caseDialog());
   $('#btn-audit').hidden = false;
-  $('#btn-report').hidden = false;
+  $('#btn-report').hidden = S.readOnly;
   $('#integrity').hidden = false;
   $('#integrity').dataset.state = 'unchecked';
   $('#integrity').textContent = txt('ui.hashes_unchecked');
@@ -8755,6 +8773,7 @@ $('#btn-new-case')?.addEventListener('click', newCaseDialog);
 $('#btn-open-case')?.addEventListener('click', () => caseDialog());
 $('#btn-case-add')?.addEventListener('click', () => openDialog({ add: !!S.casePath }));
 $('#btn-close-case')?.addEventListener('click', closeCaseDialog);
+$('#btn-compact-case')?.addEventListener('click', compactCase);
 $('#newcase-name')?.addEventListener('input', pathHint);
 $('#newcase-path')?.addEventListener('input', pathHint);
 $('#dlg-new-case')?.addEventListener('close', () => {
@@ -8969,9 +8988,29 @@ async function relocateIndex(pending) {
   const t = await api.post('index/relocate', {}).catch(() => null);
   if (!t || t.error || t.nothing_to_do) return;
   const r = await awaitTask(t, txt('ui.index.moving'));
-  if (r && r.moved) {
+  if (r && r.moved && r.converted) {
+    toast(txt('messages.index_converted', {
+      before: fmt.bytes(r.before), after: fmt.bytes(r.after) }), 'task');
+  } else if (r && r.moved) {
     toast(txt('messages.index_moved', { count: r.moved }), 'task');
+  } else if (r && r.deferred) {
+    toast(txt('messages.index_move_deferred', {
+      need: fmt.bytes(r.need), free: fmt.bytes(r.free) }));
+  } else if (r && r.error) {
+    toast(txt('messages.index_move_failed', { error: r.error }));
   }
+}
+
+async function compactCase() {
+  if (!S.casePath) return toast(txt('messages.cases.none_open'));
+  const t = await api.post('case/compact', {}).catch(() => null);
+  if (!t) return;
+  if (t.error) return toast(t.tasks?.length ? `${t.error} ${t.advice}` : t.error);
+  const r = await awaitTask(t, txt('ui.cases.compacting'));
+  if (!r) return;
+  if (!r.compacted) return toast(r.error || txt('messages.cases.compact_failed'));
+  toast(txt('messages.cases.compacted', {
+    before: fmt.bytes(r.before), after: fmt.bytes(r.after) }), 'task');
 }
 
 async function loadVersion() {
@@ -9655,6 +9694,8 @@ $$('.modules .tab').forEach(tab =>
   hex.resize();
   loadWho();
   const st = await api.get('state');
+  S.readOnly = !!st.read_only;
+  applyReadOnly();
   if (st.open) {
     applyOpened(st);
     if (p.split_hex) toggleSplit(true);
