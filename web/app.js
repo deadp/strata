@@ -7944,6 +7944,7 @@ async function openMark(d) {
   const entry = { name: '', path: '' };
   const fsName = (p.detected || '').toUpperCase();
   const n = node === '' ? null : Number(node);
+  Object.assign(entry, nodeEntry(fsName, n));
   const st = await api.get('stat', { part: partOffset(p),
                                      entry: JSON.stringify(entry),
                                      stream: d.stream || undefined,
