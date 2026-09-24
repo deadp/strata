@@ -508,41 +508,96 @@ class EwfImage:
             "findings": list(self.findings),
         }
 
+# Split raw sets are named by the acquisition tool, and every tool names them
+# differently: FTK Imager writes .001, Guymager .000 with as many digits as the
+# disk needs, and `split` writes .aa or, with -d, .00.  Matching only three
+# digits meant a wider set opened as its first piece alone, silently.
+SPLIT_NUMERIC = re.compile(r"^(.+)\.([0-9]{2,5})$")
+SPLIT_ALPHA = re.compile(r"^(.+)\.([a-z]{2,4})$")
+
+
+def _split_piece(name):
+    """(prefix, index, style, width) for a split-raw piece name, or None.
+    style is "n" for numeric pieces and "a" for `split`'s alphabetic ones."""
+    m = SPLIT_NUMERIC.match(name)
+    if m:
+        return m.group(1), int(m.group(2)), "n", len(m.group(2))
+    m = SPLIT_ALPHA.match(name)
+    if m:
+        index = 0
+        for ch in m.group(2):
+            index = index * 26 + (ord(ch) - 97)
+        return m.group(1), index, "a", len(m.group(2))
+    return None
+
+
+def _piece_name(prefix, index, style, width):
+    """The name a piece would carry in this set's own numbering."""
+    if style == "n":
+        return "%s.%0*d" % (prefix, width, index)
+    letters = []
+    for _ in range(width):
+        letters.append(chr(97 + index % 26))
+        index //= 26
+    return "%s.%s" % (prefix, "".join(reversed(letters)))
+
+
 def discover_raw_segments(path):
-    """The pieces of a split raw set (name.001, name.002, ...) that `path`
-    belongs to, in order, and findings about the set. A lone file, or one
-    without a three-digit extension, is its own set."""
+    """The pieces of a split raw set (name.001, name.0000, name.aa, ...) that
+    `path` belongs to, in order, and findings about the set. A lone file, or
+    one without a piece-shaped extension, is its own set."""
     directory, name = os.path.split(os.path.abspath(path))
-    m = re.match(r"^(.+)\.([0-9]{3})$", name)
-    if not m:
+    piece = _split_piece(name)
+    if not piece:
         return [path], []
-    prefix, opened = m.group(1), int(m.group(2))
-    numbers = set()
+    prefix, opened, style, opened_width = piece
+    widths = {}
     for sib in os.listdir(directory):
-        s = re.match(r"^(.+)\.([0-9]{3})$", sib)
-        if s and s.group(1) == prefix and \
+        s = _split_piece(sib)
+        if s and s[0] == prefix and s[2] == style and \
                 os.path.isfile(os.path.join(directory, sib)):
-            numbers.add(int(s.group(2)))
-    first = 0 if 0 in numbers else 1
+            widths[s[1]] = s[3]
+    if style == "a":
+        # `split`'s default suffixes always begin at aa; without that rule any
+        # two files differing in their extension would look like one disk.
+        if 0 not in widths:
+            return [path], []
+        first = 0
+    else:
+        first = 0 if 0 in widths else 1
     run = []
-    while first + len(run) in numbers:
+    while first + len(run) in widths:
         run.append(first + len(run))
+    # first itself can be absent from widths (e.g. numeric style opened at
+    # piece 2 with neither 0 nor 1 present) -- fall back to the opened
+    # piece's own width so the "missing piece" finding below can still name
+    # it, rather than skipping the finding entirely.
+    width = widths.get(first, opened_width)
     findings = []
-    beyond = sorted(n for n in numbers if n > first + len(run))
+    if style == "n":
+        odd = [n for n in run if widths[n] != width]
+        if odd:
+            findings.append(
+                "Split raw set mixes %d- and %d-digit numbering (%s and %s); "
+                "the pieces were joined in numeric order."
+                % (width, widths[odd[0]],
+                   _piece_name(prefix, first, style, width),
+                   _piece_name(prefix, odd[0], style, widths[odd[0]])))
+    missing = _piece_name(prefix, first + len(run), style, width)
+    beyond = sorted(n for n in widths if n > first + len(run))
     if opened not in run:
         return [path], [
-            "%s is read on its own: its split raw set is missing %s.%03d, so "
-            "this piece starts partway through the disk."
-            % (name, prefix, first + len(run))]
+            "%s is read on its own: its split raw set is missing %s, so "
+            "this piece starts partway through the disk." % (name, missing)]
     if beyond:
         findings.append(
-            "Split raw set is missing %s.%03d; %s after it %s not read."
-            % (prefix, first + len(run), ", ".join(
-                "%s.%03d" % (prefix, n) for n in beyond),
+            "Split raw set is missing %s; %s after it %s not read."
+            % (missing, ", ".join(
+                _piece_name(prefix, n, style, widths[n]) for n in beyond),
                "is" if len(beyond) == 1 else "are"))
     if len(run) == 1:
         return [path], findings
-    return [os.path.join(directory, "%s.%03d" % (prefix, n))
+    return [os.path.join(directory, _piece_name(prefix, n, style, widths[n]))
             for n in run], findings
 
 

@@ -13,6 +13,17 @@ records, not how the code changed.
 
 ### Added
 
+- **Split raw sets written by FTK Imager, Guymager and `dd` with `split`
+  now open as one exhibit.** Only three-digit `.001`/`.002` naming was
+  joined before, so a set numbered any other way opened as its first piece
+  alone — a whole disk presented as a few gigabytes of it, with nothing on
+  screen to say so. Guymager's `.0000` numbering (which widens for a disk
+  needing more than 999 pieces), `split`'s default `.aa`/`.ab` suffixes and
+  its `-d` numeric ones are now recognised alongside FTK Imager's `.001`,
+  and a missing, wrongly sized or mixed-width piece raises a finding that
+  names the piece the way that set numbers it. An image summary or info
+  file sitting beside the pieces is not mistaken for one
+  ([#45](https://github.com/switch-nz/strata/issues/45)).
 - **A BitLocker volume with a clear-key or startup-key (.BEK) protector can
   now be unlocked.** Both protector types were already recognised but
   unusable: a clear-key protector — the volume left effectively
