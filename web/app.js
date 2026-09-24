@@ -3535,6 +3535,7 @@ async function openArchiveEntry(i) {
   const r = await api.get('archive', {
     part: a.part, entry: JSON.stringify(a.entry), inner: item.name,
     snap: a.part && a.part.snap != null ? a.part.snap : undefined });
+  if (r.error) return toast(r.error);
   const bytes = Uint8Array.from(atob(r.preview || ''), c => c.charCodeAt(0));
   const notes = (r.notes || []).map(n =>
     `<p class="hint warn">${esc(n)}</p>`).join('');
@@ -3582,6 +3583,13 @@ const sameVolume = (a, b) =>
   partOffset(a) === partOffset(b) &&
   (a && a.ev_id) === (b && b.ev_id);
 
+function partIn(evId, offset) {
+  const id = evId == null || evId === '' ? null : Number(evId);
+  const ev = Number.isFinite(id)
+    ? S.exhibits.find(x => x.evidence_id === id) : null;
+  const parts = ev ? partsOf(ev) : (S.volumes?.partitions || []);
+  return parts.find(x => x.offset === offset) || null;
+}
 
 function renderURL(e, part, as) {
   const q = new URLSearchParams({ part: String(partOffset(part)),
@@ -3678,6 +3686,7 @@ async function openRegistry(entry, part, path = '') {
     snap: part && part.snap != null ? part.snap : undefined });
   if (pvToken !== token) return;
   if (r.error) return pvSet(entry.name, 'registry', `<p class="empty">${esc(r.error)}</p>`);
+  renderRegistry(r);
 }
 
 function renderRegistry(r) {
@@ -3793,6 +3802,7 @@ const EVTX_PAGE = 2000;
 
 async function openEventLog(entry, part, offset = 0) {
   const token = Symbol();
+  pvToken = token;
   const t = await api.post('evtx', {
     part: part.offset, entry, limit: EVTX_PAGE, offset,
     snap: part && part.snap != null ? part.snap : undefined });
