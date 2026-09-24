@@ -349,7 +349,8 @@ class HexView {
                                      entry: S.scope.entry
                                        ? JSON.stringify(S.scope.entry)
                                        : undefined,
-                                     stream: S.scope.stream || undefined });
+                                     stream: S.scope.stream || undefined,
+                                     snap: S.scope.snap ?? undefined });
     if (this.pending !== token) return;
     const bin = atob(r.data || '');
     const arr = new Uint8Array(bin.length);
@@ -1074,20 +1075,22 @@ function spanAt(off) {
 }
 
 const dirCache = new Map();
-const dirKey = (part, node, ev) =>
-  `${ev ?? S.activeId ?? '?'}:${part}:${node ?? 'root'}`;
+const dirKey = (part, node, ev, snap) =>
+  `${ev ?? S.activeId ?? '?'}:${part}:${node ?? 'root'}${snap != null ? `:s${snap}` : ''}`;
 
 const walkCache = new Map();
 const walkKey = (part, node) =>
-  dirKey(partOffset(part), node, part && part.ev_id);
+  dirKey(partOffset(part), node, part && part.ev_id,
+         part && part.snap);
 
-async function fetchDir(part, nodeId, path, ev) {
-  const key = dirKey(part, nodeId, ev);
+async function fetchDir(part, nodeId, path, ev, snap = null) {
+  const key = dirKey(part, nodeId, ev, snap);
   const hit = dirCache.get(key);
   if (hit) return hit;
 
   let r = await api.get('dir', { part, node: nodeId, path, types: 1,
-                                 ev: ev ?? undefined });
+                                 ev: ev ?? undefined,
+                                 snap: snap ?? undefined });
   if (r.building) {
     const done = await awaitTask(r.task, 'Indexing MFT', {
       modal: {
@@ -1097,7 +1100,8 @@ async function fetchDir(part, nodeId, path, ev) {
     });
     if (!done) return { error: txt('messages.indexing_interrupted') };
     r = await api.get('dir', { part, node: nodeId, path, types: 1,
-                               ev: ev ?? undefined });
+                               ev: ev ?? undefined,
+                               snap: snap ?? undefined });
   }
   if (!r.error) dirCache.set(key, r);
   return r;
@@ -1584,7 +1588,7 @@ function clearViewer() {
 
 function setScope(part, size, label, meta) {
   S.scope = { part, size, label, entry: null, stream: null,
-              extents: null, chunks: null, ev: S.activeId };
+              extents: null, chunks: null, ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = profileCache.get(profileKey(part)) || null;
   S.cursor = 0;
@@ -1650,7 +1654,7 @@ async function revealInTree(part, nodeId) {
 function setEmptyScope(label, part) {
   S.scope = { part: partOffset(part), size: 0, label, entry: null,
               stream: null, extents: null, chunks: null, empty: true,
-              ev: S.activeId };
+              ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = null;
   S.cursor = 0;
@@ -1670,7 +1674,7 @@ function setFileScope(entry, part, size, label, stream = null,
                      extents = null, chunks = null) {
   S.scope = { part: partOffset(part), size: size || 0, label,
               entry, stream, file: true, extents: extents || null,
-              chunks: chunks || null, ev: S.activeId };
+              chunks: chunks || null, ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = profileCache.get(profileKey(partOffset(part), S.scope)) || null;
   S.cursor = 0;
@@ -1855,7 +1859,9 @@ async function showEntry(e, part, from = null, stream = null) {
     <div class="subtitle">${txt('ui.show_entry.reading')}</div>`;
   const st = await api.get('stat', { part: partOffset(part),
                                     entry: JSON.stringify(e),
-                                    stream: stream ? stream.name : undefined });
+                                    stream: stream ? stream.name : undefined,
+                                    snap: part && part.snap != null
+                                      ? part.snap : undefined });
 
   if (!st || st.error) {
     i.innerHTML = `<div class="title">${esc(e.name)}</div>
@@ -2129,7 +2135,8 @@ async function exportEntry(e, part, dest = null, stream = '',
     part: partOffset(part), entry: e,
     node: e.mft ?? e.inode ?? e.oid ?? e.start_cluster,
     name: e.name, path: e.path, size: e.size, dest, stream,
-    add_exhibit: addExhibit });
+    add_exhibit: addExhibit,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (r.error) return toast(r.error);
   if (r.exhibit) {
     if (r.exhibit.added) {
@@ -2150,12 +2157,14 @@ async function exportEntry(e, part, dest = null, stream = '',
 const COPY_MAX = 1 << 20;
 
 async function rangeBytes(start, length) {
+  const snap = S.scope.snap;
   const r = S.scope.entry
     ? await api.get('hex', { offset: start, length, part: S.scope.part,
                              entry: JSON.stringify(S.scope.entry),
-                             stream: S.scope.stream || undefined })
+                             stream: S.scope.stream || undefined,
+                             snap: snap ?? undefined })
     : await api.get('hex', { offset: start + (S.scope.part || 0),
-                             length, part: null });
+                             length, part: null, snap: snap ?? undefined });
   if (r.error) throw new Error(r.error);
   return b64ToBytes(r.data);
 }
@@ -2450,11 +2459,13 @@ function typedCard(kind, e, truncated) {
 
 function fileURL(entry, part) {
   const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  if (part.snap != null) q.set('snap', String(part.snap));
   return `/api/file?${q}`;
 }
 
 function thumbnailURL(entry, part) {
   const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  if (part.snap != null) q.set('snap', String(part.snap));
   return `/api/thumbnail?${q}`;
 }
 
@@ -2607,7 +2618,7 @@ function visibleEntries() {
 
 async function previewDir(entries, name, part, id = undefined, self = null,
                           parent = null, scope = null) {
-  await loadHashMap(partOffset(part));
+  if (part && part.snap == null) await loadHashMap(partOffset(part));
   if (scope) {
     dirView.trail = [];
   } else if (!parent) {
@@ -2918,10 +2929,12 @@ async function previewEntry(e, part, from = null, stream = null) {
     pvSet(e.name || txt('ui.preview.preview_title'), '',
           `<p class="empty">${txt('messages.folder_has_a_listing_not_a_preview')}</p>`);
     const nodeId = e.mft ?? e.inode ?? e.oid ?? e.start_cluster;
-    if (!dirCache.has(dirKey(part.offset, nodeId, part.ev_id))) {
+    if (!dirCache.has(dirKey(part.offset, nodeId, part.ev_id,
+                       part.snap))) {
       dirSet(e.name, 'reading…', `<p class="empty">${txt('ui.reading_directory')}</p>`);
     }
-    const r = await fetchDir(part.offset, nodeId, e.path, part.ev_id);
+    const r = await fetchDir(part.offset, nodeId, e.path, part.ev_id,
+                             part.snap);
     if (pvToken !== token) return;
     if (r.error) return dirSet(e.name, 'error', `<p class="empty">${esc(r.error)}</p>`);
     return previewDir(r.entries, e.name, part, nodeId, e, from);
@@ -2940,7 +2953,9 @@ async function previewEntry(e, part, from = null, stream = null) {
   const want = Math.min(size, PV_MAX);
   const r = await api.get('preview', { part: part.offset,
                                        entry: JSON.stringify(e), length: want,
-                                       stream: stream ? stream.name : undefined });
+                                       stream: stream ? stream.name : undefined,
+                                       snap: part && part.snap != null
+                                         ? part.snap : undefined });
   if (pvToken !== token) return;
   if (r.error) return pvSet(label, 'error', `<p class="empty">${esc(r.error)}</p>`);
 
@@ -3472,7 +3487,9 @@ function redrawDates() {
 
 async function openArchive(e, part) {
   const r = await api.get('archive', { part: partOffset(part),
-                                      entry: JSON.stringify(e) });
+                                       entry: JSON.stringify(e),
+                                       snap: part && part.snap != null
+                                         ? part.snap : undefined });
   if (r.error) {
     return pvSet(e.name, 'archive',
       `<p class="empty">${esc(r.error)}</p>` +
@@ -3516,7 +3533,8 @@ async function openArchiveEntry(i) {
   const item = a.info.items.filter(x => !x.is_dir)[i];
   if (!item) return;
   const r = await api.get('archive', {
-    part: a.part, entry: JSON.stringify(a.entry), inner: item.name });
+    part: a.part, entry: JSON.stringify(a.entry), inner: item.name,
+    snap: a.part && a.part.snap != null ? a.part.snap : undefined });
   if (r.error) return toast(r.error);
   const bytes = Uint8Array.from(atob(r.preview || ''), c => c.charCodeAt(0));
   const notes = (r.notes || []).map(n =>
@@ -3576,6 +3594,7 @@ function partIn(evId, offset) {
 function renderURL(e, part, as) {
   const q = new URLSearchParams({ part: String(partOffset(part)),
                                   entry: JSON.stringify(e) });
+  if (part && part.snap != null) q.set('snap', String(part.snap));
   if (as) q.set('as', as);
   return `/api/render?${q}`;
 }
@@ -3594,7 +3613,9 @@ function sanitisedNote(findings, what) {
 
 async function openPdf(e, part) {
   const info = await api.get('render', { part: partOffset(part),
-                                         entry: JSON.stringify(e) });
+                                         entry: JSON.stringify(e),
+                                         snap: part && part.snap != null
+                                           ? part.snap : undefined });
   if (info.error) return pvSet(e.name, 'pdf', `<p class="empty">${esc(info.error)}</p>`);
 
   const meta = [
@@ -3628,10 +3649,11 @@ async function openPdf(e, part) {
       (${info.active_content.length})</summary><ul>${active}</ul></details>` : ''}
     ${body}`);
 }
-
 async function openMarkup(e, part, kind) {
   const info = await api.get('render', { part: partOffset(part),
-                                         entry: JSON.stringify(e) });
+                                         entry: JSON.stringify(e),
+                                         snap: part && part.snap != null
+                                           ? part.snap : undefined });
   if (info.error) return pvSet(e.name, kind, `<p class="empty">${esc(info.error)}</p>`);
   if (!info.renderable) {
     return pvSet(e.name, kind,
@@ -3660,7 +3682,8 @@ async function openRegistry(entry, part, path = '') {
   reg.part = part; reg.entry = entry; reg.path = path;
   pvSet(entry.name, txt('ui.registry_hive'), `<p class="empty">${txt('ui.reading_hive')}</p>`);
   const r = await api.get('registry', {
-    part: part.offset, entry: JSON.stringify(entry), key: path });
+    part: part.offset, entry: JSON.stringify(entry), key: path,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (pvToken !== token) return;
   if (r.error) return pvSet(entry.name, 'registry', `<p class="empty">${esc(r.error)}</p>`);
   renderRegistry(r);
@@ -3780,10 +3803,11 @@ const EVTX_PAGE = 2000;
 async function openEventLog(entry, part, offset = 0) {
   const token = Symbol();
   pvToken = token;
+  const t = await api.post('evtx', {
+    part: part.offset, entry, limit: EVTX_PAGE, offset,
+    snap: part && part.snap != null ? part.snap : undefined });
   pvSet(entry.name, txt('ui.event_log'),
         `<p class="empty">${txt('ui.decoding_records_progress_task_tray')}</p>`);
-  const t = await api.post('evtx', {
-    part: part.offset, entry, limit: EVTX_PAGE, offset });
   const r = await awaitTask(t, txt('ui.decoding_events'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, txt('ui.event_log'),
@@ -3869,9 +3893,9 @@ const sq = { entry: null, part: null, table: null, info: null, tables: [],
 async function openSqlite(entry, part, table = null, recover = false) {
   const token = Symbol();
   pvToken = token;
-  pvSet(entry.name, 'database', `<p class="empty">${txt('ui.reading_pages')}</p>`);
   const t = await api.post('sqlite', {
-    part: part.offset, entry, table, recover, limit: 5000 });
+    part: part.offset, entry, table, recover, limit: 5000,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, txt('ui.reading_database'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'database',
@@ -3971,8 +3995,9 @@ const eseView = { entry: null, part: null, table: null };
 async function openEse(entry, part, table = null) {
   const token = Symbol();
   pvToken = token;
-  pvSet(entry.name, 'database', `<p class="empty">${txt('ui.reading_pages')}</p>`);
-  const t = await api.post('ese', { part: part.offset, entry, table, limit: 2000 });
+  const t = await api.post('ese', {
+    part: part.offset, entry, table, limit: 2000,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, txt('ui.reading_database'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'database',
@@ -4045,7 +4070,9 @@ async function openLevelDb(entry, part) {
   const token = Symbol();
   pvToken = token;
   pvSet(entry.name, 'leveldb', `<p class="empty">${txt('ui.decompressing_blocks')}</p>`);
-  const t = await api.post('leveldb', { part: part.offset, entry });
+  const t = await api.post('leveldb', {
+    part: part.offset, entry,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, 'Reading LevelDB');
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'leveldb', `<p class="empty">${txt('ui.open_sqlite.cancelled')}</p>`);
@@ -4182,12 +4209,12 @@ $('#unlock-show')?.addEventListener('change', e => {
 async function previewRoot(part) {
   const token = Symbol();
   pvToken = token;
-  const label = partName(part);
-  if (!dirCache.has(dirKey(part.offset, null, part.ev_id))) {
+  const label = S.snapLabel || partName(part);
+  if (!dirCache.has(dirKey(part.offset, null, part.ev_id, part.snap))) {
     dirSet(label + ' · /', 'reading…',
            `<p class="empty">${txt('ui.reading_root_directory')}</p>`);
   }
-  const r = await fetchDir(part.offset, null, '/', part.ev_id);
+  const r = await fetchDir(part.offset, null, '/', part.ev_id, part.snap);
   if (pvToken !== token) return;
   if (r.error) {
     return dirSet(label + ' · /', 'error', `<p class="empty">${esc(r.error)}</p>`);
@@ -4348,7 +4375,8 @@ async function exportFolder(e, part, { addExhibit = false } = {}) {
   if (dest === '') return;
   const t = await api.post('export/folder', {
     part: partOffset(part), entry: e, dest: dest || null,
-    add_exhibit: addExhibit });
+    add_exhibit: addExhibit,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (t.error) return toast(t.error);
   const r = await awaitTask(t, 'Exporting ' + (e.name || 'folder'), {
     modal: { title: 'Exporting ' + (e.name || 'folder'),
@@ -6345,7 +6373,26 @@ function renderVss(r, part) {
       <div class="path">${esc(s.id || '')}</div>
       ${s.unsupported ? `<div class="meta">${esc(s.unsupported)}</div>` : ''}
     </div>`).join('');
+  [...box.querySelectorAll('.result')].forEach((el, i) => {
+    const s = snaps[i];
+    if (!s || s.unsupported) return;
+    const btn = document.createElement('button');
+    btn.className = 'ghost';
+    btn.textContent = txt('ui.snaps.open');
+    btn.addEventListener('click', () => openSnapshot(part, i, s));
+    el.querySelector('.top').appendChild(btn);
+  });
   tabCount('triage', snaps.length);
+}
+
+async function openSnapshot(part, i, s) {
+  const po = partObj(part);
+  if (!po) return toast(txt('messages.toast.pick_filesystem'));
+  const pseudo = { ...po, offset: po.offset, snap: i, ev_id: S.activeId };
+  S.lastPick = { kind: 'entry', e: null, part: pseudo, from: null, stream: null };
+  S.snapLabel = txt('ui.snaps.snapshot_view',
+                    { created: fmt.time(s.created_at) });
+  await previewRoot(pseudo);
 }
 
 function renderBrowser(r, part) {
@@ -7876,7 +7923,9 @@ async function openDocument(e, part) {
   const token = (pvToken = Symbol());
   pvSet(e.name, 'document', `<p class="empty">${txt('ui.preview_entry.reading')}</p>`);
   const d = await api.get('document', { part: partOffset(part),
-                                       entry: JSON.stringify(e) });
+                                        entry: JSON.stringify(e),
+                                        snap: part && part.snap != null
+                                          ? part.snap : undefined });
   if (pvToken !== token) return;
   if (d.error) return pvSet(e.name, 'document',
     `<div class="notice bad">${esc(d.error)}</div>`);
@@ -8753,6 +8802,7 @@ function applyNoCase() {
   S.activeId = null;
   S.evidenceId = null;
   S.scope = null;
+  S.snapLabel = null;
   S.marks = [];
   S.tags = [];
   $('#evidence-bar').innerHTML = `

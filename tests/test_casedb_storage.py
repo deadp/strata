@@ -165,6 +165,41 @@ class Compact(unittest.TestCase):
         self.assertEqual(self.case.index_pending, 20)
 
 
+class TreeCachePaths(unittest.TestCase):
+    """path_for/stamp: a snapshot's cache file must never collide with a
+    real partition's, whatever offset either happens to land on."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cache = self.tmp
+        self.image = os.path.join(self.tmp, "img.E01")
+        with open(self.image, "wb") as fh:
+            fh.write(b"\0" * 10)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_snapshot_path_never_collides_with_a_real_partition_offset(self):
+        # A partition at 1 MiB used to produce a pseudo-offset of exactly
+        # 1 GiB (1 MiB * 1024 + snapshot 0) for its own first snapshot --
+        # a perfectly ordinary offset for a genuine second partition.
+        real = treecache.path_for(self.cache, self.image, 1024 * 1024 * 1024)
+        snap = treecache.path_for(self.cache, self.image, 1024 * 1024, snap=0)
+        self.assertNotEqual(real, snap)
+
+    def test_snapshot_path_is_stable_and_distinct_per_index(self):
+        snap0 = treecache.path_for(self.cache, self.image, 0x100000, snap=0)
+        snap1 = treecache.path_for(self.cache, self.image, 0x100000, snap=1)
+        again = treecache.path_for(self.cache, self.image, 0x100000, snap=0)
+        self.assertNotEqual(snap0, snap1)
+        self.assertEqual(snap0, again)
+
+    def test_snapshot_stamp_differs_from_the_live_volumes_stamp(self):
+        live = treecache.stamp(self.image, 0x100000)
+        snap = treecache.stamp(self.image, 0x100000, snap=0)
+        self.assertNotEqual(live, snap)
+
+
 class Sweep(unittest.TestCase):
 
     def setUp(self):
