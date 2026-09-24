@@ -57,6 +57,8 @@ from . import recyclebin as recyclebin_mod
 from . import registry as registry_mod
 from . import reglog as reglog_mod
 from . import vss as vss_mod
+from . import listingdiff as listingdiff_mod
+from . import vssstore as vssstore_mod
 from . import structure as structure_mod
 from . import volume as volume_mod
 from . import logical as logical_mod
@@ -742,11 +744,12 @@ class Session:
             "encryption": info.get("encryption") or info.get("method"),
             "note": _t("server.unlock.inherited")})
 
-    def keep_artefact(self, kind, part, payload):
-        if not self.case or self.evidence_id is None or not payload:
+    def keep_artefact(self, kind, part, payload, ev=None):
+        evidence_id = ev.evidence_id if ev is not None else self.evidence_id
+        if not self.case or evidence_id is None or not payload:
             return None
         try:
-            return self.case.save_artefact(self.evidence_id, part, kind, payload)
+            return self.case.save_artefact(evidence_id, part, kind, payload)
         except Exception:
             return None
 
@@ -1742,12 +1745,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/vss":
             part = self._q("part", 0, int)
-            region = s.region(part)
+            ev = s.evidence(self._q("ev")) or s.current
+            region = s.region(part, ev=ev)
             r = vss_mod.snapshots(region)
             if not r.get("present"):
                 r["note"] = ("No shadow copy store on this volume — the VSS "
                              "volume header at 0x1E00 is absent or empty.")
-            s.keep_artefact("vss", part, r)
+            s.keep_artefact("vss", part, r, ev=ev)
             return self._send(200, r)
 
         if path in ("/api/timeline/summary", "/api/timeline/page",
@@ -2209,6 +2213,80 @@ class Handler(BaseHTTPRequestHandler):
                 label=_t("server.recurse.label")
                       % (body.get("name") or start),
                 detail=_t("server.recurse.detail")))
+
+        if path == "/api/diff":
+            # body: {"a": {"ev": <evidence_id?>, "part": <int>,
+            #              "snap": <int?>},
+            #         "b": {...}} -- ev omitted = current exhibit; snap
+            # omitted = live volume. fold is optional (server decides).
+            fold = bool(body.get("fold"))
+
+            def side(spec):
+                ev = s.evidence((spec or {}).get("ev")) or s.current
+                part = int((spec or {}).get("part") or 0)
+                snap = (spec or {}).get("snap")
+                region = s.region(part, ev=ev)
+                if snap in (None, ""):
+                    return s.fs(part, ev=ev), ev, part, None
+                snap = int(snap)
+                snaps = vss_mod.snapshots(region)["snapshots"]
+                if snap < 0 or snap >= len(snaps) \
+                        or not snaps[snap].get("block_list_offset"):
+                    raise _DiffSideError(_t("server.diff.no_snapshot"))
+                chain = [x["block_list_offset"] for x in snaps[:snap + 1]
+                         if x.get("block_list_offset")]
+                # Not s.fs(): Session.fs caches by int offset only and a
+                # snapshot fs instance would poison that cache; the
+                # snapshot fs stays local to the task.
+                fs = ntfs_mod.open_fs(vssstore_mod.SnapshotReader(region,
+                                                                  chain))
+                return fs, ev, part, snap
+
+            try:
+                fa, ev_a, part_a, snap_a = side(body.get("a"))
+                fb, ev_b, part_b, snap_b = side(body.get("b"))
+            except _DiffSideError as exc:
+                return self._send(400, {"error": str(exc)})
+            except ntfs_mod.EncryptedVolume as exc:
+                return self._send(200, {"encrypted": True, "kind": exc.kind,
+                                        "error": str(exc)})
+
+            # NTFS is case-preserving/case-insensitive; exFAT/FAT store
+            # upcased names so folding is a no-op there; ext4/APFS stay
+            # case-sensitive. The client may force folding with "fold".
+            # Each side folds on its OWN filesystem type: an ext4-vs-NTFS
+            # diff must not fold the ext4 side too, or two ext4 entries
+            # differing only in case collapse into one and the other is
+            # silently dropped from the whole diff.
+            ignore_case_a = fold or getattr(fa, "name", "") == "NTFS"
+            ignore_case_b = fold or getattr(fb, "name", "") == "NTFS"
+
+            def run_diff(progress):
+                state_a, state_b = {}, {}
+                ea = filesearch_mod.collect(
+                    fa, _root_node(fa), state=state_a,
+                    progress=lambda n: progress(0.0, count=n))
+                progress(0.5)
+                eb = filesearch_mod.collect(
+                    fb, _root_node(fb), state=state_b,
+                    progress=lambda n: progress(0.5, count=n))
+                progress(1.0)
+                d = listingdiff_mod.compare(ea, eb,
+                                            ignore_case_a=ignore_case_a,
+                                            ignore_case_b=ignore_case_b)
+                return {
+                    "diff": d,
+                    "a": {"ev": getattr(ev_a, "evidence_id", None),
+                          "part": part_a, "snap": snap_a,
+                          "truncated": bool(state_a.get("truncated"))},
+                    "b": {"ev": getattr(ev_b, "evidence_id", None),
+                          "part": part_b, "snap": snap_b,
+                          "truncated": bool(state_b.get("truncated"))},
+                }
+
+            return self._send(200, s.start_task(
+                "diff", run_diff, label=_t("server.diff.label"),
+                detail=_t("server.diff.detail")))
 
         if path == "/api/evidence/select":
             ev = s.evidence(body.get("evidence_id"))
@@ -4280,6 +4358,12 @@ _CARVE_ERRORS = {
 def _carve_error(exc):
     say = _CARVE_ERRORS.get(exc.key, _CARVE_ERRORS["not_a_signature"])
     return say(*exc.args_)
+
+class _DiffSideError(ValueError):
+    """A /api/diff side cannot be resolved (no such snapshot)."""
+
+
+
 
 def _root_node(fs):
     root = getattr(fs, "root_node", None)
