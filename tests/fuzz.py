@@ -101,6 +101,30 @@ def run_fs(data):
         read += 1
 
 
+def run_vss(data):
+    from engine import filesearch, vss
+    from engine.ewf import OffsetReader
+    from engine.fs import ntfs
+    img = OffsetReader(BytesImage(data), 0, len(data))
+    report = vss.snapshots(img)
+    for snap in report["snapshots"]:
+        if snap.get("unsupported"):
+            continue
+        ov = vss.VssOverlay(img, snap, [])
+        try:
+            fs = ntfs.open_fs(ov)
+        except ValueError:
+            continue
+        entries = filesearch.collect(fs, _root_handle(fs), budget=500,
+                                     max_depth=8)
+        read = 0
+        for e in entries:
+            if e.get("is_dir") or read >= 10:
+                continue
+            fs.read_file(e, 1 << 14)
+            read += 1
+
+
 def run_volume(data):
     from engine import volume
     volume.scan(BytesImage(data))
@@ -204,6 +228,13 @@ def targets():
     out["vmdk-sparse"] = (imagebuild_vmdk.build_sparse, run_vmdk)
     out["vmdk-stream"] = (lambda: imagebuild_vmdk.build_stream_optimized()[0],
                           run_vmdk)
+    # A VSS carrier is an NTFS-volume-like input: the store parser reads the
+    # whole image, and an overlay feeds the NTFS parser like run_fs does.
+    try:
+        import imagebuild_vss
+        out["vss"] = (imagebuild_vss.build_vss_disk, run_vss)
+    except ImportError:
+        pass
     # An AD1 opens through the filesystem dispatcher, like a volume.
     out["ad1"] = (lambda: imagebuild_ad1.build_ad1()[0], run_fs)
     return out

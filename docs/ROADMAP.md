@@ -30,10 +30,15 @@ recognised and refused by name today; these entries are about *reading* it.
 - [ ] **Ex01 / Lx01** (EWF v2) — detected and refused. Same lineage as the
       E01 already read, with a different header and compression framing.
       Cheapest real win of the set.
-- [~] **Split raw sets** (`.001`, `.002`, …) — joined into one exhibit, with
-      a finding for a missing or wrongly sized piece. Tested only on
-      synthetic sets so far; check against sets written by FTK Imager, `dd`
-      with `split`, and Guymager.
+- [~] **Split raw sets** (`.001`, `.0000`, `.aa`, …) — the set shapes real
+      acquisition tools write are joined into one exhibit: FTK Imager's
+      three-digit `.001`, Guymager's zero-based numbering at whatever width
+      the disk needs, and `dd` with `split`, both its default alphabetic
+      suffixes and `-d` numeric ones. A missing, wrongly sized or mixed-width
+      piece raises a finding naming the piece in the set's own numbering.
+      Verified against genuine `split` and `dd` output; FTK Imager and
+      Guymager naming was reconstructed from their documentation and source,
+      so sets written by those tools themselves still need checking.
 - [ ] **VHD** (the older `conectix` format, not VHDX) — a fixed VHD is raw
       with a footer appended and nearly free; dynamic and differencing disks
       need their own block allocation table.
@@ -45,10 +50,10 @@ recognised and refused by name today; these entries are about *reading* it.
 
 ### Shadow copies
 
-- [ ] **Read a Volume Shadow Copy.** Snapshots are found and listed today, but
-      none can be opened. Reading one means a block-redirect overlay over the
-      volume, then browsing its tree as a filesystem in its own right, plus
-      the differential-area store types.
+- [~] **Read a Volume Shadow Copy.** Snapshots are found and listed, and a
+      snapshot can now be opened: a block-redirect overlay over the volume plus
+      the differential-area store types let Strata browse a snapshot's tree as a
+      filesystem in its own right. Tested on synthetic images only so far.
 
 ### Filesystems
 
@@ -59,9 +64,12 @@ recognised and refused by name today; these entries are about *reading* it.
 
 ### Encryption
 
-- [ ] **BitLocker startup keys (`.BEK`) and clear-key volumes.** Both protector
-      types are recognised, but unlocking only accepts a password or a
-      recovery key, so neither can be used yet.
+- [ ] **BitLocker startup keys (`.BEK`) and clear-key volumes** — implemented
+      and verified against synthetic FVE volumes built to the published
+      format spec (including cross-checking the protector-type values
+      against an independent tool); a real `.BEK` file and a real
+      clear-key volume from actual Windows-run BitLocker still need to be
+      confirmed before this can be called done.
 - [ ] **BitLocker with the Elephant diffuser** — Vista and Windows 7 volumes
       are identified and refused rather than decrypted wrongly.
 - [ ] **LUKS2 with Argon2 against real cryptsetup images** — implemented and
