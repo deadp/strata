@@ -72,6 +72,7 @@ from . import treecache as treecache_mod
 from . import version as version_mod
 from .fs import ntfs as ntfs_mod
 from .fs import streams as streams_mod
+from .fs import apfs as apfs_mod
 
 WEB_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "web")
@@ -598,10 +599,21 @@ class Session:
             ev._structures = structure_mod.map_image(ev.image, ev.volumes)
         return ev._structures
 
-    def fs(self, offset, ev=None):
+    def fs(self, offset, ev=None, snap=None):
         ev = ev or self.current
         if ev is None:
             raise ValueError(_t("server.evidence_open"))
+        if snap:
+            base = ev.fs_cache.get(("snap", offset, snap))
+            if base is not None:
+                return base
+            live = self.fs(offset, ev=ev)
+            if not isinstance(live, apfs_mod.ApfsVolume):
+                raise ValueError("Snapshots are only available on APFS "
+                                 "volumes.")
+            sv = live.snapshot_volume(snap)
+            ev.fs_cache[("snap", offset, snap)] = sv
+            return sv
         made = getattr(ev.image, "filesystem", None)
         if made is not None:
             ev.fs_cache[offset] = made
@@ -669,6 +681,19 @@ class Session:
             ev.snapshot_cache[key] = fs
             return fs
 
+    def fs_at(self, offset, snap=None, ev=None):
+        """The base filesystem, or a snapshot of it -- VSS snapshots are
+        addressed by their numeric index (snapshot_fs), APFS snapshots by
+        their name (fs's own snap=); both features share the same `snap`
+        query param, so a value that parses as an integer is a VSS index
+        and anything else is taken as an APFS snapshot name."""
+        if snap in (None, ""):
+            return self.fs(offset, ev=ev)
+        try:
+            snap_index = int(snap)
+        except (TypeError, ValueError):
+            return self.fs(offset, ev=ev, snap=snap)
+        return self.snapshot_fs(offset, snap_index, ev=ev)
 
     def _attach_tree_cache(self, fs, ev, offset, snap=None):
         if not hasattr(fs, "tree_store"):
@@ -1152,10 +1177,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dir":
             off = self._q("part", 0, int)
             ev = s.evidence(self._q("ev", None)) or s.current
-            snap = self._q("snap", None, int)
+            snap = self._q("snap", "") or None
             try:
-                fs = s.fs(off, ev=ev) if snap is None \
-                    else s.snapshot_fs(off, snap, ev=ev)
+                fs = s.fs_at(off, snap=snap, ev=ev)
             except ntfs_mod.EncryptedVolume as exc:
                 return self._send(200, {"entries": [], "encrypted": True,
                                         "kind": exc.kind, "part": off,
@@ -1202,9 +1226,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/stat":
             off = self._q("part", 0, int)
-            snap = self._q("snap", None, int)
+            snap = self._q("snap", "") or None
             try:
-                fs = s.fs(off) if snap is None else s.snapshot_fs(off, snap)
+                fs = s.fs_at(off, snap=snap)
             except ValueError as exc:
                 return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
@@ -1259,9 +1283,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/preview":
             off = self._q("part", 0, int)
-            snap = self._q("snap", None, int)
+            snap = self._q("snap", "") or None
             try:
-                fs = s.fs(off) if snap is None else s.snapshot_fs(off, snap)
+                fs = s.fs_at(off, snap=snap)
             except ValueError as exc:
                 return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
@@ -1400,9 +1424,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/file":
             off = self._q("part", 0, int)
-            snap = self._q("snap", None, int)
+            snap = self._q("snap", "") or None
             try:
-                fs = s.fs(off) if snap is None else s.snapshot_fs(off, snap)
+                fs = s.fs_at(off, snap=snap)
             except ValueError as exc:
                 return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
@@ -1436,7 +1460,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/document":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             size = int(entry.get("size") or 0)
             if size > MAX_ARCHIVE:
@@ -1453,7 +1481,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/archive":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             inner = self._q("inner", None)
             size = int(entry.get("size") or 0)
@@ -1487,12 +1519,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/render":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             size = int(entry.get("size") or 0)
             data = fs.read_file(entry, min(size or MAX_STREAM, MAX_STREAM))
             want = self._q("as", "")
-
             if pdfdoc_mod.looks_like_pdf(data[:5]):
                 doc = pdfdoc_mod.Pdf(data)
                 if want == "bytes":
@@ -1701,7 +1736,22 @@ class Handler(BaseHTTPRequestHandler):
             out = {"items": found, "jumplists": jumps, "stat": stat,
                    "scanned": stat["seen"] + stat["jumplists"]}
             s.keep_artefact("lnk", part, out)
-            return self._send(200, out)
+
+        if path == "/api/snapshots":
+            part = self._q("part", 0, int)
+            fs = s.fs(part)
+            if isinstance(fs, apfs_mod.ApfsVolume):
+                snaps = fs.snapshots()
+                r = {"present": bool(snaps), "snapshots": snaps,
+                     "findings": list(fs.findings)}
+                if not snaps:
+                    r["note"] = "No snapshots on this volume."
+            else:
+                r = {"present": False, "snapshots": [],
+                     "findings": [], "note": "Snapshots are an APFS feature "
+                     "— this partition is not APFS."}
+            s.keep_artefact("snapshots", part, r)
+            return self._send(200, r)
 
         if path == "/api/vss":
             part = self._q("part", 0, int)

@@ -59,6 +59,7 @@ const S = {
   lastSearchPart: null,
   prefs: {},
   markCats: [],
+  snap: null,
   readOnly: false,
 };
 
@@ -1084,6 +1085,10 @@ const walkKey = (part, node) =>
          part && part.snap);
 
 async function fetchDir(part, nodeId, path, ev, snap = null) {
+  // A VSS snapshot index is threaded through explicitly (part.snap); an
+  // APFS snapshot name comes from the global S.snap instead, so a caller
+  // that doesn't pass one falls back to whichever one is active.
+  snap = snap ?? snapParam(part);
   const key = dirKey(part, nodeId, ev, snap);
   const hit = dirCache.get(key);
   if (hit) return hit;
@@ -1106,6 +1111,17 @@ async function fetchDir(part, nodeId, path, ev, snap = null) {
   if (!r.error) dirCache.set(key, r);
   return r;
 }
+
+const snapParam = part => {
+  // VSS snapshots are threaded on the part object itself (part.snap, a
+  // numeric index); APFS snapshots go through the global S.snap instead
+  // (a name, keyed to whichever part it was opened on), since only one
+  // of the two kinds of snapshot is ever open at a time.
+  if (part && part.snap != null) return part.snap;
+  const off = typeof part === 'object' && part !== null
+    ? partOffset(part) : part;
+  return S.snap && S.snap.part === off ? S.snap.name : undefined;
+};
 
 let selectedRow = null;
 function selectRow(el) {
@@ -1860,8 +1876,7 @@ async function showEntry(e, part, from = null, stream = null) {
   const st = await api.get('stat', { part: partOffset(part),
                                     entry: JSON.stringify(e),
                                     stream: stream ? stream.name : undefined,
-                                    snap: part && part.snap != null
-                                      ? part.snap : undefined });
+                                    snap: snapParam(part) });
 
   if (!st || st.error) {
     i.innerHTML = `<div class="title">${esc(e.name)}</div>
@@ -2459,7 +2474,8 @@ function typedCard(kind, e, truncated) {
 
 function fileURL(entry, part) {
   const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
-  if (part.snap != null) q.set('snap', String(part.snap));
+  const snap = snapParam(part);
+  if (snap != null) q.set('snap', String(snap));
   return `/api/file?${q}`;
 }
 
@@ -2470,9 +2486,20 @@ function thumbnailURL(entry, part) {
 }
 
 function dirSet(name, meta, html) {
+  const snapBanner = S.snap
+    ? `<div class="notice snap-banner">${esc(
+        txt('ui.snaps.viewing', { name: S.snap.name }))}
+        <button class="ghost btn-snap-close">${esc(txt('ui.snaps.close'))}</button></div>`
+    : '';
   $('#dir-name').textContent = name;
   $('#dir-meta').textContent = meta || '';
+  const list = $('#dirlist');
+  const prev = list.previousElementSibling;
+  if (prev && prev.classList.contains('snap-banner')) prev.remove();
+  if (snapBanner) list.insertAdjacentHTML('beforebegin', snapBanner);
   $('#dirlist').innerHTML = html;
+  const btn = $('.btn-snap-close');
+  if (btn) btn.addEventListener('click', exitSnapshot);
 }
 
 function pvSet(title, kind, html) {
@@ -2954,8 +2981,7 @@ async function previewEntry(e, part, from = null, stream = null) {
   const r = await api.get('preview', { part: part.offset,
                                        entry: JSON.stringify(e), length: want,
                                        stream: stream ? stream.name : undefined,
-                                       snap: part && part.snap != null
-                                         ? part.snap : undefined });
+                                       snap: snapParam(part) });
   if (pvToken !== token) return;
   if (r.error) return pvSet(label, 'error', `<p class="empty">${esc(r.error)}</p>`);
 
@@ -3488,8 +3514,7 @@ function redrawDates() {
 async function openArchive(e, part) {
   const r = await api.get('archive', { part: partOffset(part),
                                        entry: JSON.stringify(e),
-                                       snap: part && part.snap != null
-                                         ? part.snap : undefined });
+                                       snap: snapParam(part) });
   if (r.error) {
     return pvSet(e.name, 'archive',
       `<p class="empty">${esc(r.error)}</p>` +
@@ -3596,6 +3621,8 @@ function renderURL(e, part, as) {
                                   entry: JSON.stringify(e) });
   if (part && part.snap != null) q.set('snap', String(part.snap));
   if (as) q.set('as', as);
+  const snap = snapParam(part);
+  if (snap) q.set('snap', snap);
   return `/api/render?${q}`;
 }
 
@@ -3614,8 +3641,7 @@ function sanitisedNote(findings, what) {
 async function openPdf(e, part) {
   const info = await api.get('render', { part: partOffset(part),
                                          entry: JSON.stringify(e),
-                                         snap: part && part.snap != null
-                                           ? part.snap : undefined });
+                                         snap: snapParam(part) });
   if (info.error) return pvSet(e.name, 'pdf', `<p class="empty">${esc(info.error)}</p>`);
 
   const meta = [
@@ -3652,8 +3678,7 @@ async function openPdf(e, part) {
 async function openMarkup(e, part, kind) {
   const info = await api.get('render', { part: partOffset(part),
                                          entry: JSON.stringify(e),
-                                         snap: part && part.snap != null
-                                           ? part.snap : undefined });
+                                         snap: snapParam(part) });
   if (info.error) return pvSet(e.name, kind, `<p class="empty">${esc(info.error)}</p>`);
   if (!info.renderable) {
     return pvSet(e.name, kind,
@@ -5875,15 +5900,18 @@ const ART_RENDER = {
   prefetch: renderPrefetch, shellbags: renderShellbags, mail: renderMail,
   leveldb: renderLevelDbSweep, lnk: renderLnk, recyclebin: renderRecycleBin,
   wallets: renderWallets,
+  snapshots: renderSnapshots,
 };
 
 const ART_ORDER = ['recyclebin', 'lnk', 'browser', 'appcompat', 'prefetch',
-                   'usn', 'shellbags', 'mail', 'leveldb', 'vss', 'wallets'];
+                   'usn', 'shellbags', 'mail', 'leveldb', 'vss', 'snapshots',
+                   'wallets'];
 const ART_LABEL = {
   recyclebin: 'Recycle Bin', lnk: 'Shortcuts', browser: 'Browsing',
   appcompat: 'Programs', prefetch: 'Execution', usn: txt('ui.change_journal'),
   shellbags: 'Folders', mail: 'Mail', leveldb: 'LevelDB',
-  vss: txt('ui.tree.shadow_copies'), wallets: 'Crypto',
+  vss: txt('ui.tree.shadow_copies'), snapshots: txt('ui.tree.apfs_snapshots'),
+  wallets: 'Crypto',
 };
 
 let artPick = null;
@@ -6125,6 +6153,10 @@ async function doArtifacts(force = false) {
   box.innerHTML = `<p class="empty">${txt('ui.preview_entry.reading')}</p>`;
   if (artMode === 'vss') {
     return renderVss(cacheArtefact('vss', part, await api.get('vss', { part })), part);
+  }
+  if (artMode === 'snapshots') {
+    return renderSnapshots(cacheArtefact('snapshots', part,
+      await api.get('snapshots', { part })), part);
   }
   if (artMode === 'browser') {
     const t = await api.post('browser', { part, recover: true });
@@ -6526,6 +6558,58 @@ function renderVss(r, part) {
     el.querySelector('.top').appendChild(btn);
   });
   tabCount('triage', snaps.length);
+}
+
+function renderSnapshots(r, part) {
+  const box = $('#art-results');
+  if (r.error) return box.innerHTML = `<p class="empty">${esc(r.error)}</p>`;
+  const snaps = r.snapshots || [];
+  const notes = (r.findings || []).map(f =>
+    `<div class="notice">${esc(f)}</div>`).join('');
+  if (!snaps.length) {
+    box.innerHTML = notes + `<p class="empty">${esc(r.note
+      || txt('ui.snaps.none'))}</p>`;
+    tabCount('triage', 0);
+    return;
+  }
+  box.innerHTML = notes + `<div class="results-head">${
+    txt('ui.snaps.apfs_newest_first', { snaps: snaps.length })}</div>` +
+    snaps.map((s, i) => `
+    <div class="result" data-i="${i}">
+      <div class="top">
+        <span class="kind">snapshot</span>
+        <span class="off">${s.snapshot_xid ? 'xid ' + s.snapshot_xid : ''}</span>
+      </div>
+      <div class="name">${esc(s.name || '')}</div>
+      <div class="meta">${s.created_at ? fmt.time(s.created_at) : ''}${
+        s.inum ? ' · inode ' + s.inum : ''}</div>
+      ${s.dataless ? `<div class="meta">${esc(txt('ui.snaps.dataless'))}</div>` : ''}
+      <div class="path">${esc(txt('ui.snaps.browse'))} →</div>
+    </div>`).join('');
+  bindResults(box, el => {
+    const s = snaps[+el.dataset.i];
+    if (s) enterSnapshot(part, s.name);
+  });
+  tabCount('triage', snaps.length);
+}
+
+async function enterSnapshot(part, name) {
+  S.snap = { part: partOffset(part), name };
+  dirCache.clear();
+  toast(txt('ui.snaps.viewing', { name }));
+  const p = (S.volumes?.partitions || [])
+    .find(x => x.offset === partOffset(part)) || part;
+  await previewRoot(p);
+}
+
+function exitSnapshot() {
+  const was = S.snap;
+  S.snap = null;
+  dirCache.clear();
+  if (!was) return;
+  const p = (S.volumes?.partitions || [])
+    .find(x => x.offset === was.part) || null;
+  if (p) previewRoot(p);
 }
 
 async function openSnapshot(part, i, s) {
@@ -7864,7 +7948,8 @@ async function showEventBytes(e) {
                   ...nodeEntry(part.detected, n) };
   const st = n == null ? null
     : await api.get('stat', { part: partOffset(part),
-                              entry: JSON.stringify(entry) }).catch(() => null);
+                              entry: JSON.stringify(entry),
+                              snap: snapParam(part) }).catch(() => null);
   if (seq !== eventBytesSeq) return;
   if (!scopedTo(part)) {
     setScope(partOffset(part), part.size ?? S.image.size, scopeLabel(part), null);
@@ -8005,7 +8090,8 @@ async function openMark(d) {
   Object.assign(entry, nodeEntry(fsName, n));
   const st = await api.get('stat', { part: partOffset(p),
                                      entry: JSON.stringify(entry),
-                                     stream: d.stream || undefined });
+                                     stream: d.stream || undefined,
+                                     snap: snapParam(p) });
   if (!st || st.error) return toast(txt('messages.mark_file_not_readable'));
   const bytes = st.size != null ? st.size : null;
   if (!bytes) return toast(txt('messages.mark_file_not_readable'));
@@ -8066,9 +8152,8 @@ async function openDocument(e, part) {
   const token = (pvToken = Symbol());
   pvSet(e.name, 'document', `<p class="empty">${txt('ui.preview_entry.reading')}</p>`);
   const d = await api.get('document', { part: partOffset(part),
-                                        entry: JSON.stringify(e),
-                                        snap: part && part.snap != null
-                                          ? part.snap : undefined });
+                                       entry: JSON.stringify(e),
+                                       snap: snapParam(part) });
   if (pvToken !== token) return;
   if (d.error) return pvSet(e.name, 'document',
     `<div class="notice bad">${esc(d.error)}</div>`);

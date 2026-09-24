@@ -13,6 +13,14 @@ records, not how the code changed.
 
 ### Added
 
+- **APFS snapshots can be listed and opened read-only.** On an APFS volume
+  that has snapshots, a Snapshots list now shows each snapshot's name,
+  creation time and transaction identifier, and a snapshot can be opened as a
+  read-only view of the volume as it was at that point — files as they were,
+  including ones later deleted or overwritten. A snapshot whose file contents
+  were removed when the snapshot was made is reported as dataless and cannot
+  be opened
+  ([#51](https://github.com/switch-nz/strata/issues/51)).
 - **Tags follow a volume when it is re-acquired into another image.** Tags
   are keyed to the filesystem handle of the file they name, which is stable
   only within one image, so the same volume imaged again arrived with its
