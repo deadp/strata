@@ -151,6 +151,22 @@ class OverlayRedirect(unittest.TestCase):
         got = self.ov.read_at(past, 16)
         self.assertEqual(got, self.disk[past:past + 16])
 
+    def test_read_spanning_an_allocated_and_unallocated_chunk_is_not_misattributed(self):
+        # Regression: chunk 17 (redirected, within the descriptor's two-chunk
+        # bitmap) ends 412 bytes after this offset; chunk 18 (not in the
+        # bitmap) falls through to the base volume. A read spanning both
+        # used to be served entirely from the store when it wasn't
+        # chunk-aligned, since `take` wasn't capped to what was left in the
+        # *current* chunk -- so the base-volume tail came back as leftover
+        # store bytes instead.
+        start = build.REDIRECT_VOLUME_OFFSET + 512 + 100  # 100 B into chunk 17
+        got = self.ov.read_at(start, 500)
+        want_redirected = build.pattern(build.DIFF_SIZE,
+                                        build.DIFF_SEED)[612:1024]
+        base_start = build.REDIRECT_VOLUME_OFFSET + build.DIFF_SIZE
+        want_base = self.disk[base_start:base_start + 88]
+        self.assertEqual(got, want_redirected + want_base)
+
     def test_outside_descriptor_is_transparent(self):
         self.assertEqual(self.ov.read_at(0, 64), self.disk[0:64])
         self.assertEqual(self.ov.read_at(0x1E00, 128),

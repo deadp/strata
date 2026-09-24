@@ -402,12 +402,18 @@ class VssOverlay:
                 alloc = e["allocation_bitmap"]
                 chunk = (pos - block) // STORE_CHUNK
                 while pos < end and chunk < 32:
-                    take = min(end - pos, STORE_CHUNK)
+                    chunk_start = block + chunk * STORE_CHUNK
+                    # Cap `take` to what's left in *this* 512 B chunk, not
+                    # the whole chunk size -- pos can already be partway
+                    # into it, and yielding a full STORE_CHUNK from there
+                    # would run past the chunk boundary into bytes that
+                    # belong to the next chunk (which may have a different
+                    # allocation-bitmap bit).
+                    take = min(end - pos, STORE_CHUNK - (pos - chunk_start))
                     if alloc & (1 << chunk):
                         # The chunk's copy lives at store_data_offset +
                         # chunk*512; advance by the intra-chunk delta so
                         # the read lands on ``pos`` exactly.
-                        chunk_start = block + chunk * STORE_CHUNK
                         store = (e["store_data_offset"]
                                  + chunk * STORE_CHUNK
                                  + (pos - chunk_start))
