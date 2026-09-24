@@ -106,19 +106,27 @@ def read_catalog(source, catalog_offset, limit_blocks=64):
     return entries
 
 def _string16(block, pos):
-    """A <H size-prefixed UTF-16LE string, or None when empty/out of range."""
+    """(value, next_pos) for a <H size-prefixed UTF-16LE string at pos.
+    value is None when the string is empty or can't be decoded; next_pos
+    is advanced past the prefix and string whenever the length prefix
+    itself was readable and its claimed length fit -- including for a
+    genuinely empty (zero-length) string, which is still 2 real bytes on
+    disk. Only left at `pos` when the prefix or the claimed length don't
+    fit at all, since there's nothing to advance past in that case.
+    Callers must use next_pos for whatever they read next, or an empty
+    string here desyncs it from the following field."""
     if pos + 2 > len(block):
-        return None
+        return None, pos
     (n,) = struct.unpack_from("<H", block, pos)
-    if not n:
-        return None
-    raw = block[pos + 2:pos + 2 + n * 2]
+    end = pos + 2 + n * 2
+    raw = block[pos + 2:end]
     if len(raw) < n * 2:
-        return None
+        return None, pos
     try:
-        return raw.decode("utf-16-le").rstrip("\x00") or None
+        value = raw.decode("utf-16-le").rstrip("\x00") or None
     except UnicodeDecodeError:
-        return None
+        value = None
+    return value, end
 
 def snapshots(source):
     info = detect(source)
@@ -236,10 +244,8 @@ def read_store_header(source, header_offset, findings=None):
         "attribute_flags": flags,
     })
     pos += STORE_HEADER_SIZE
-    info["originating_machine"] = _string16(block, pos)
-    if info["originating_machine"] is not None:
-        pos += 2 + 2 * struct.unpack_from("<H", block, pos)[0]
-    info["service_machine"] = _string16(block, pos)
+    info["originating_machine"], pos = _string16(block, pos)
+    info["service_machine"], _ = _string16(block, pos)
     return info
 
 def read_block_list(source, block_list_offset, findings=None):

@@ -17,6 +17,7 @@ sys.path.insert(0, HERE)
 
 import imagebuild_vss as build                                    # noqa: E402
 from test_fs_fat import BytesImage                                # noqa: E402
+from engine import server                                         # noqa: E402
 from engine import vss                                            # noqa: E402
 from engine.fs import ntfs                                        # noqa: E402
 
@@ -64,6 +65,28 @@ class StoreParsing(unittest.TestCase):
         # the descriptor's bitmap, everything behind it is zero padding.
         self.assertEqual(words[0], 0b11 << 16)
         self.assertEqual(set(words[1:]), {0})
+
+    def test_empty_originating_machine_does_not_desync_service_machine(self):
+        # Regression: _string16 returned None both for a genuinely-empty
+        # string and for one that didn't fit, and the caller only advanced
+        # past it in the non-None case -- so a real empty originating_machine
+        # (still 2 real bytes on disk: a zero length prefix) left the next
+        # read starting 2 bytes early, corrupting service_machine.
+        import uuid as uuid_mod
+        block = bytearray(vss.BLOCK_HEADER_SIZE + vss.STORE_HEADER_SIZE + 64)
+        block[0:16] = uuid_mod.UUID(vss.VSS_GUID).bytes_le
+        struct.pack_into("<II", block, 16, 1, vss.BLOCK_HEADER)
+        pos = vss.BLOCK_HEADER_SIZE + vss.STORE_HEADER_SIZE
+        struct.pack_into("<H", block, pos, 0)          # originating_machine: empty
+        svc = "SNAPSRV".encode("utf-16-le") + b"\x00\x00"
+        svc_at = pos + 2
+        struct.pack_into("<H", block, svc_at, len(svc) // 2)
+        block[svc_at + 2:svc_at + 2 + len(svc)] = svc
+
+        info = vss.read_store_header(BytesImage(bytes(block)), 0)
+        self.assertIsNotNone(info)
+        self.assertIsNone(info["originating_machine"])
+        self.assertEqual(info["service_machine"], "SNAPSRV")
 
     def test_truncated_store_header_flagged(self):
         findings = []
@@ -272,6 +295,60 @@ class SnapshotFsIntegration(unittest.TestCase):
             self.assertIn("No shadow copies", str(ctx.exception))
         finally:
             shutil.rmtree(dirpath, ignore_errors=True)
+
+
+class _ExportFakeHandler:
+    """Just enough of engine.server.Handler to drive _api_post directly: a
+    real Session (not a mock -- the whole point is exercising the real
+    snapshot_fs() ValueError path) and a _send() that records what was
+    sent instead of writing to a socket."""
+
+    def __init__(self, session):
+        self._sess = session
+        self.sent = None
+
+    def _session(self):
+        return self._sess
+
+    def _send(self, code, body, ctype="application/json"):
+        self.sent = (code, body)
+        return None
+
+
+class ExportEndpointsSnapshotErrors(unittest.TestCase):
+    """Regression: /api/export/file and /api/export/folder called
+    snapshot_fs() unguarded, unlike every other snapshot-aware endpoint
+    (/api/dir, /api/stat, /api/preview), so a bad snapshot index fell
+    through to the generic top-level exception handler -- a 500 with a
+    server-side traceback -- instead of the same clean 400 the rest of
+    the feature gives."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        from engine.server import Session
+        self.dirpath = tempfile.mkdtemp(prefix="strata-vss-export-test-")
+        self.addCleanup(shutil.rmtree, self.dirpath, ignore_errors=True)
+        path = os.path.join(self.dirpath, "vss.img")
+        with open(path, "wb") as fh:
+            fh.write(build.build_vss_disk())
+        self.sess = Session()
+        self.sess.open(path)
+
+    def test_export_file_with_a_bad_snapshot_index_is_a_clean_400(self):
+        fh = _ExportFakeHandler(self.sess)
+        server.Handler._api_post(fh, "/api/export/file",
+                                 {"part": 0, "snap": 5, "entry": {}})
+        self.assertEqual(fh.sent[0], 400)
+        self.assertIn("No such shadow copy", fh.sent[1]["error"])
+
+    def test_export_folder_with_a_bad_snapshot_index_is_a_clean_400(self):
+        fh = _ExportFakeHandler(self.sess)
+        server.Handler._api_post(
+            fh, "/api/export/folder",
+            {"part": 0, "snap": 5, "entry": {"is_dir": True, "path": "/x"}})
+        self.assertEqual(fh.sent[0], 400)
+        self.assertIn("No such shadow copy", fh.sent[1]["error"])
 
 
 class FuzzLoop(unittest.TestCase):

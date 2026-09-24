@@ -649,15 +649,16 @@ class Session:
                                                        or []))
             fs = ntfs_mod.open_fs(overlay)
             # Snapshot trees must not reuse the base volume's persisted tree
-            # cache: key it with a pseudo-offset far above any real offset
-            # (real offsets are 0x200-aligned; offset*1024 + snap_index keeps
-            # one distinct slot per snapshot). path_for/stamp need an int.
-            self._attach_tree_cache(fs, ev, offset * 1024 + snap_index)
+            # cache: pass snap_index through as its own filename component
+            # (path_for/stamp), not folded into the offset arithmetically --
+            # a pseudo-offset computed from a real one can still collide
+            # with a genuine partition offset elsewhere on the same image.
+            self._attach_tree_cache(fs, ev, offset, snap=snap_index)
             ev.snapshot_cache[key] = fs
             return fs
 
 
-    def _attach_tree_cache(self, fs, ev, offset):
+    def _attach_tree_cache(self, fs, ev, offset, snap=None):
         if not hasattr(fs, "tree_store"):
             return
         if fs.tree_store is not None or self.case is None:
@@ -665,8 +666,8 @@ class Session:
         cache = self.case.cache_dir(create=True)
         if not cache:
             return
-        path = treecache_mod.path_for(cache, ev.path, offset)
-        want = treecache_mod.stamp(ev.path, offset)
+        path = treecache_mod.path_for(cache, ev.path, offset, snap=snap)
+        want = treecache_mod.stamp(ev.path, offset, snap=snap)
         fs.tree_store = (lambda: treecache_mod.load(path, want),
                          lambda tree: treecache_mod.save(path, tree, want))
 
@@ -3692,7 +3693,10 @@ class Handler(BaseHTTPRequestHandler):
             part = int(body.get("part") or 0)
             snap = body.get("snap")
             snap = int(snap) if snap is not None else None
-            fs = s.fs(part) if snap is None else s.snapshot_fs(part, snap)
+            try:
+                fs = s.fs(part) if snap is None else s.snapshot_fs(part, snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = body.get("entry") or _entry_from_body(fs, body)
             out_dir = body.get("dir") or os.path.join(
                 os.path.dirname(s.path), "strata-export")
@@ -3700,7 +3704,7 @@ class Handler(BaseHTTPRequestHandler):
                 rec, safe, n = _export_one(
                     fs, entry, out_dir, s, dest=body.get("dest"),
                     manifest=body.get("manifest", True),
-                    stream=body.get("stream") or "")
+                    stream=body.get("stream") or "", snap=snap)
             except _STREAM_ERRORS as exc:
                 return self._send(400,
                                   _stream_error(exc, body.get("stream") or ""))
@@ -3711,7 +3715,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     out["exhibit"] = _add_derived(
                         s, safe, s.current, entry.get("path"), rec["sha256"],
-                        body.get("add_as") or "auto")
+                        body.get("add_as") or "auto", snap=snap)
                 except Exception as exc:
                     out["exhibit"] = {"added": False, "error": str(exc)}
             return self._send(200, out)
@@ -3720,7 +3724,10 @@ class Handler(BaseHTTPRequestHandler):
             part = int(body.get("part") or 0)
             snap = body.get("snap")
             snap = int(snap) if snap is not None else None
-            fs = s.fs(part) if snap is None else s.snapshot_fs(part, snap)
+            try:
+                fs = s.fs(part) if snap is None else s.snapshot_fs(part, snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = body.get("entry")
             if not entry or not entry.get("is_dir"):
                 return self._send(400, {"error": _t("server.export_folder.folder")})
@@ -3740,7 +3747,8 @@ class Handler(BaseHTTPRequestHandler):
                     p = t.get("path") or t.get("name") or "item"
                     rel = p[len(base):] if base and p.startswith(base) else p
                     try:
-                        rec, _, n = _export_one(fs, t, out_dir, s, rel=rel)
+                        rec, _, n = _export_one(fs, t, out_dir, s, rel=rel,
+                                                snap=snap)
                         written += n
                         done += 1
                     except TaskCancelled:
@@ -3749,14 +3757,14 @@ class Handler(BaseHTTPRequestHandler):
                         failed += 1
                 s.case.log("export.folder", {"path": entry.get("path"),
                                              "dest": out_dir, "files": done,
-                                             "failed": failed})
+                                             "failed": failed, "snap": snap})
                 out = {"dir": out_dir, "files": done, "failed": failed,
                        "bytes": written, "considered": len(targets)}
                 if body.get("add_exhibit") and s.case and done:
                     try:
                         out["exhibit"] = _add_derived(
                             s, out_dir, ev_at_start, entry.get("path"), None,
-                            "logical")
+                            "logical", snap=snap)
                     except Exception as exc:
                         out["exhibit"] = {"added": False, "error": str(exc)}
                 return out
@@ -3877,7 +3885,7 @@ _FTYP_MIME = {
 }
 
 MANIFEST_COLS = ["source", "exported_to", "bytes", "md5", "sha1", "sha256",
-                 "deleted", "modified", "exported_at", "examiner"]
+                 "deleted", "modified", "exported_at", "examiner", "snapshot"]
 
 def _safe_stream_name(stream):
     out = "".join(c if (c.isalnum() or c in "-_.") else "_"
@@ -3934,7 +3942,7 @@ def _exhibit_kind(path, asked="auto"):
             except Exception:
                 pass
 
-def _add_derived(s, path, parent, source_path, digest, asked="auto"):
+def _add_derived(s, path, parent, source_path, digest, asked="auto", snap=None):
     kind = _exhibit_kind(path, asked)
     s.case.log("exhibit.derived", {
         "dest": path,
@@ -3944,6 +3952,7 @@ def _add_derived(s, path, parent, source_path, digest, asked="auto"):
         "from_image": getattr(parent, "path", None),
         "source_path": source_path,
         "sha256": digest,
+        "snap": snap,
     })
     state = s.open(path, add=True, logical=(kind == "logical"))
     return {"added": True, "as": kind, "path": path, "state": state}
@@ -4014,7 +4023,7 @@ def _entry_from_body(fs, body):
     return entry
 
 def _export_one(fs, entry, out_dir, session, rel=None, dest=None,
-                manifest=True, stream=""):
+                manifest=True, stream="", snap=None):
     if dest:
         safe = os.path.abspath(os.path.expanduser(dest))
         out_dir = os.path.dirname(safe)
@@ -4050,7 +4059,7 @@ def _export_one(fs, entry, out_dir, session, rel=None, dest=None,
     session.case.log("export.item", {"path": entry.get("path"),
                                      "stream": stream or None,
                                      "dest": safe, "bytes": written,
-                                     "sha256": digest})
+                                     "sha256": digest, "snap": snap})
     rec = {"source": (entry.get("path") or entry.get("name"))
            + (":" + stream if stream else ""),
            "exported_to": os.path.relpath(safe, out_dir),
@@ -4061,7 +4070,8 @@ def _export_one(fs, entry, out_dir, session, rel=None, dest=None,
            "deleted": bool(entry.get("deleted")),
            "modified": entry.get("modified"),
            "exported_at": casedb_mod.utcnow(),
-           "examiner": session.case.examiner}
+           "examiner": session.case.examiner,
+           "snapshot": snap if snap is not None else ""}
     if manifest:
         _append_manifest(out_dir, rec, session)
     return rec, safe, written
