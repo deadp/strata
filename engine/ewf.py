@@ -6,6 +6,7 @@ import struct
 import threading
 
 from . import vhdx as vhdx_mod
+from . import vhd as vhd_mod
 from . import ad1 as ad1_mod
 from . import vmdk as vmdk_mod
 from .inflate import DAMAGED, STOPPED, inflate_capped, inflate_ended
@@ -717,6 +718,12 @@ def open_image(path):
             return vhdx_mod.VhdxImage(path)
         except vhdx_mod.VhdxError as exc:
             raise UnsupportedContainer(_t("ewf.hyper_v_vhdx") % exc.message,
+                                       exc.advice)
+    if vhd_mod.looks_like_vhd(path):
+        try:
+            return vhd_mod.VhdImage(path)
+        except vhd_mod.VhdError as exc:
+            raise UnsupportedContainer(_t("ewf.virtual_pc_vhd") % exc.message,
                                        exc.advice)
     known = identify_unsupported(head)
     if known:
