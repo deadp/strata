@@ -78,6 +78,29 @@ class Compare(unittest.TestCase):
         self.assertEqual(len(d["added"]), 1)
         self.assertEqual(len(d["removed"]), 1)
 
+    def test_per_side_folding_does_not_drop_case_sensitive_side_entries(self):
+        # Regression: a single ignore_case flag shared by both sides (set
+        # whenever EITHER side is NTFS) folded the case-SENSITIVE side too,
+        # so two genuinely distinct ext4 paths differing only in case
+        # collapsed into one dict entry and the other vanished from the
+        # diff entirely -- not reported as added, removed, or changed.
+        # ignore_case_a=False (ext4-like) must keep both; ignore_case_b=True
+        # (NTFS-like) still folds its own side as before.
+        a = [entry("/Foo.txt", size=1), entry("/foo.txt", size=2)]
+        b = [entry("/foo.txt", size=1)]
+        d = listingdiff.compare(a, b, ignore_case_a=False, ignore_case_b=True)
+        self.assertEqual(d["compared"], 2)
+        seen = {r["path"] for r in d["added"] + d["removed"] + d["changed"]}
+        self.assertEqual(seen, {"/Foo.txt", "/foo.txt"})
+
+    def test_ignore_case_a_b_override_the_shared_ignore_case_flag(self):
+        a = [entry("/X.txt", size=1)]
+        b = [entry("/x.txt", size=1)]
+        d = listingdiff.compare(a, b, ignore_case=True,
+                                ignore_case_a=False, ignore_case_b=False)
+        self.assertEqual(len(d["added"]), 1)
+        self.assertEqual(len(d["removed"]), 1)
+
     def test_empty_sides(self):
         self.assertEqual(listingdiff.compare([], [])["compared"], 0)
         d = listingdiff.compare([entry("/x")], [])

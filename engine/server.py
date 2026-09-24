@@ -719,11 +719,12 @@ class Session:
             "encryption": info.get("encryption") or info.get("method"),
             "note": _t("server.unlock.inherited")})
 
-    def keep_artefact(self, kind, part, payload):
-        if not self.case or self.evidence_id is None or not payload:
+    def keep_artefact(self, kind, part, payload, ev=None):
+        evidence_id = ev.evidence_id if ev is not None else self.evidence_id
+        if not self.case or evidence_id is None or not payload:
             return None
         try:
-            return self.case.save_artefact(self.evidence_id, part, kind, payload)
+            return self.case.save_artefact(evidence_id, part, kind, payload)
         except Exception:
             return None
 
@@ -1694,13 +1695,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/vss":
             part = self._q("part", 0, int)
-            region = s.region(part, ev=s.evidence(self._q("ev"))
-                              or s.current)
+            ev = s.evidence(self._q("ev")) or s.current
+            region = s.region(part, ev=ev)
             r = vss_mod.snapshots(region)
             if not r.get("present"):
                 r["note"] = ("No shadow copy store on this volume — the VSS "
                              "volume header at 0x1E00 is absent or empty.")
-            s.keep_artefact("vss", part, r)
+            s.keep_artefact("vss", part, r, ev=ev)
             return self._send(200, r)
 
         if path in ("/api/timeline/summary", "/api/timeline/page",
@@ -2203,8 +2204,12 @@ class Handler(BaseHTTPRequestHandler):
             # NTFS is case-preserving/case-insensitive; exFAT/FAT store
             # upcased names so folding is a no-op there; ext4/APFS stay
             # case-sensitive. The client may force folding with "fold".
-            ignore_case = fold or any(
-                getattr(f, "name", "") == "NTFS" for f in (fa, fb))
+            # Each side folds on its OWN filesystem type: an ext4-vs-NTFS
+            # diff must not fold the ext4 side too, or two ext4 entries
+            # differing only in case collapse into one and the other is
+            # silently dropped from the whole diff.
+            ignore_case_a = fold or getattr(fa, "name", "") == "NTFS"
+            ignore_case_b = fold or getattr(fb, "name", "") == "NTFS"
 
             def run_diff(progress):
                 state_a, state_b = {}, {}
@@ -2217,7 +2222,8 @@ class Handler(BaseHTTPRequestHandler):
                     progress=lambda n: progress(0.5, count=n))
                 progress(1.0)
                 d = listingdiff_mod.compare(ea, eb,
-                                            ignore_case=ignore_case)
+                                            ignore_case_a=ignore_case_a,
+                                            ignore_case_b=ignore_case_b)
                 return {
                     "diff": d,
                     "a": {"ev": getattr(ev_a, "evidence_id", None),

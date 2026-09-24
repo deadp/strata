@@ -273,5 +273,52 @@ class Sweep(unittest.TestCase):
         self.assertEqual(gone, ["timeline-ev1-p0.sqlite"])
 
 
+class KeepArtefact(unittest.TestCase):
+    """Regression: /api/vss resolves `ev` from the query string (so it can
+    read a non-active exhibit's own region), but used to hand keep_artefact
+    no `ev` at all, which fell back to self.evidence_id -- the *active*
+    exhibit, not the one actually queried. Two exhibits open at once, VSS
+    checked on the one that ISN'T current, must file its artefact under its
+    own id."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.folder = os.path.join(self.tmp, "c.strata")
+        self.case = Case(self.folder, name="c")
+        self.case.db.executemany(
+            "INSERT INTO evidence (id, path, added_at) VALUES (?, ?, 'now')",
+            [(1, os.path.join(self.tmp, "Disk One.E01")),
+             (2, os.path.join(self.tmp, "Disk Two.E01"))])
+        self.case.db.commit()
+        self.session = server.Session()
+        self.session.case = self.case
+        # Evidence #1 is the active exhibit; VSS is queried on #2.
+        self.session.evidence_id = 1
+
+    def tearDown(self):
+        self.case.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def saved_for(self, evidence_id):
+        return self.case.db.execute(
+            "SELECT payload FROM artefacts WHERE evidence_id=? AND kind='vss'",
+            (evidence_id,)).fetchone()
+
+    def test_files_the_artefact_under_the_queried_exhibit_not_the_active_one(self):
+        other = mock.Mock(evidence_id=2)
+        self.session.keep_artefact("vss", 0, {"present": True}, ev=other)
+        self.assertIsNone(self.saved_for(1))
+        row = self.saved_for(2)
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row["payload"]), {"present": True})
+
+    def test_omitting_ev_still_falls_back_to_the_active_exhibit(self):
+        self.session.keep_artefact("vss", 0, {"present": False})
+        self.assertIsNone(self.saved_for(2))
+        row = self.saved_for(1)
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row["payload"]), {"present": False})
+
+
 if __name__ == "__main__":
     unittest.main()

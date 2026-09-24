@@ -30,12 +30,20 @@ def _differs(a, b):
     return False
 
 
-def compare(entries_a, entries_b, ignore_case=False):
+def compare(entries_a, entries_b, ignore_case=False, ignore_case_a=None,
+            ignore_case_b=None):
     """Compare two filesearch listings per path.
 
     entries_*: lists of entry dicts as produced by filesearch.collect()
     (fields used: path, name, size, modified, created, accessed, deleted;
     is_dir rows are compared on presence + times like files).
+
+    ignore_case applies to both sides when ignore_case_a/ignore_case_b are
+    not given. Pass those two separately when the sides come from different
+    filesystems (e.g. ext4 vs NTFS): each side's own listing is only ever
+    folded by its OWN flag, so a case-sensitive side keeps two paths that
+    differ only in case as two distinct entries instead of one flag from
+    the other side silently collapsing (and dropping) one of them.
 
     Returns:
       {"added":    [row...],   # only in b;  row = {"path", "b": fields}
@@ -49,14 +57,16 @@ def compare(entries_a, entries_b, ignore_case=False):
     field differs; node-only differences are ignored by design. Missing
     timestamps (None) compare as equal to None, different from a value.
     """
+    fold_a = ignore_case if ignore_case_a is None else ignore_case_a
+    fold_b = ignore_case if ignore_case_b is None else ignore_case_b
     a = {}
     b = {}
     for e in entries_a:
-        k = _key(e, ignore_case)
+        k = _key(e, fold_a)
         if k not in a:
             a[k] = e
     for e in entries_b:
-        k = _key(e, ignore_case)
+        k = _key(e, fold_b)
         if k not in b:
             b[k] = e
 

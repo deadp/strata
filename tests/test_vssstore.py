@@ -97,6 +97,26 @@ class DescriptorPath(unittest.TestCase):
         r = vssstore.SnapshotReader(self.vol, [store])
         self.assertEqual(r.read_at(0, BLOCK), self.vol.data[0:BLOCK])
 
+    def test_read_at_non_block_aligned_multi_block_read(self):
+        # Regression: `n = min(BLOCK, end - pos)` in read_at() ignored how
+        # far `pos` already was into its block, so a read starting even
+        # one byte off a block boundary came back short by that many bytes
+        # (Python's slicing silently clamps _read_block()'s always-BLOCK-
+        # length return, rather than raising) -- and `pos` still advanced
+        # by the too-large `n`, ending the whole read early. MFT records
+        # and cluster runs are essentially never 0x4000-aligned, so this
+        # is the common case, not an edge case.
+        store = 0x10000
+        sdb0, sdb1 = 0x20000, 0x30000
+        build_store(self.vol, store, [(0, 0, sdb0, 0, 0),
+                                      (BLOCK, 0, sdb1, 0, 0)])
+        r = vssstore.SnapshotReader(self.vol, [store])
+        got = r.read_at(1, BLOCK)
+        want = (bytes([sdb0 % 251]) * (BLOCK - 1)
+               + bytes([sdb1 % 251]) * 1)
+        self.assertEqual(len(got), BLOCK)
+        self.assertEqual(got, want)
+
     def test_two_store_chain_newest_wins(self):
         old, new = 0x10000, 0x18000
         sdb_old, sdb_new = 0x20000, 0x28000
@@ -127,6 +147,27 @@ class DescriptorPath(unittest.TestCase):
         self.assertEqual(got[SUB:2 * SUB],
                          self.vol.data[SUB:2 * SUB])
 
+    def test_overlay_falls_through_past_more_than_one_layer(self):
+        # Regression: _read_overlay only ever consulted exactly one layer
+        # below the one that asked, and read that layer's OVERLAY sdb
+        # unconditionally -- without checking *its own* bitmap bit for the
+        # sub-block in question. Three layers here, with the top two both
+        # missing the same sub-block from their own overlay, so the only
+        # way to reach the real answer is walking the full remaining chain
+        # (matching what _read_block already does for a whole block) and
+        # respecting each layer's own bitmap along the way.
+        s0, s1, s2 = 0x10000, 0x18000, 0x30000
+        sdb0, sdb1, sdb2 = 0x20000, 0x28000, 0x40000
+        build_store(self.vol, s0, [(0, 0, sdb0, OVR, 0b01)], next_off=0)
+        build_store(self.vol, s1, [(0, 0, sdb1, OVR, 0b01)], next_off=0)
+        build_store(self.vol, s2, [(0, 0, sdb2, 0, 0)], next_off=0)
+
+        r = vssstore.SnapshotReader(self.vol, [s0, s1, s2])
+        got = r.read_at(0, BLOCK)
+        self.assertEqual(got[0:SUB], bytes([(s0 + sdb0) % 251]) * SUB)
+        self.assertEqual(got[SUB:2 * SUB], bytes([sdb2 % 251]) * SUB)
+        self.assertEqual(r.findings, [])
+
     def test_ignored_descriptor_is_skipped(self):
         store = 0x10000
         sdb = 0x20000
@@ -142,16 +183,30 @@ class DescriptorPath(unittest.TestCase):
         self.assertTrue(any("block list" in f for f in r.findings))
 
     def test_forwarder_reads_through_next_store(self):
+        # Regression: forwarder rows were keyed by `rel` instead of `orig`,
+        # but every lookup is table.get(block_off) with block_off always
+        # in `orig`-space -- so a forwarder could never be found in its
+        # own layer at all, and the branch that chases it in _read_block
+        # was dead code. `elsewhere` (the older store's own key for this
+        # data, != the block being forwarded) makes sure the two stores'
+        # tables can't coincidentally agree by themselves: the only way to
+        # reach sdb_old's bytes is the forwarder chase actually running.
         old, new = 0x10000, 0x18000
-        sdb_old, sdb_new = 0x20000, 0x28000
-        # Old store: block 0 lives at sdb_old.
-        build_store(self.vol, old, [(0, 0, sdb_old, 0, 0)])
-        # New store: block 0 is forwarded; rel = old store's block 0 entry.
-        build_store(self.vol, new, [(rel := 0, old, 0, FWD, 0)],
-                    next_off=old)
+        sdb_old = 0x20000
+        target, elsewhere = BLOCK, 0x2710
+        # Old store: the data lives under its own key `elsewhere`, not
+        # under `target` -- so a buggy fall-through that skips the
+        # forwarder and just rescans by `target` finds nothing here either.
+        build_store(self.vol, old, [(elsewhere, 0, sdb_old, 0, 0)],
+                    next_off=0)
+        # New store: block `target` is forwarded; rel names `elsewhere`,
+        # the original offset this data is filed under in the older store.
+        build_store(self.vol, new, [(target, elsewhere, 0, FWD, 0)],
+                    next_off=0)
         r = vssstore.SnapshotReader(self.vol, [new, old])
-        self.assertEqual(r.read_at(0, BLOCK),
+        self.assertEqual(r.read_at(target, BLOCK),
                          (sdb_old % 251).to_bytes(1, "little") * BLOCK)
+        self.assertEqual(r.findings, [])
 
     def test_size_passthrough(self):
         r = vssstore.SnapshotReader(self.vol, [])
