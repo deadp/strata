@@ -43,6 +43,7 @@
   <button class="tab" data-view="tags" role="tab" data-i18n="ui.marks.tagged"></button>
   <button class="tab" data-view="hash" role="tab" data-i18n="ui.tags.hashes"></button>
   <button class="tab" data-view="attack" data-no-viewer role="tab" data-i18n="ui.hash.attack"></button>
+  <button class="tab" data-view="diff" data-no-viewer role="tab" data-i18n="ui.app.diff"></button>
 </nav>
 
 <main class="workspace" id="workspace">
@@ -54,6 +55,7 @@
         <button class="solid" id="btn-new-case" data-i18n="ui.cases.new"></button>
         <button class="ghost" id="btn-open-case" data-i18n="ui.cases.open"></button>
         <button class="ghost" id="btn-case-add" data-i18n="ui.cases.add_evidence"></button>
+        <button class="ghost" id="btn-compact-case" data-i18n="ui.cases.compact"></button>
         <button class="ghost" id="btn-close-case" data-i18n="ui.cases.close"></button>
       </div>
       <div class="view-main">
@@ -89,6 +91,7 @@
           <button class="dv-mode" data-art="mail" data-i18n="ui.tree.mail"></button>
           <button class="dv-mode" data-art="leveldb" data-i18n="ui.tree.leveldb"></button>
           <button class="dv-mode" data-art="vss" data-i18n="ui.tree.shadow_copies"></button>
+          <button class="dv-mode" data-art="snapshots" data-i18n="ui.tree.apfs_snapshots"></button>
           <button class="dv-mode" data-art="wallets" data-i18n="ui.tree.crypto"></button>
         </div>
         <button class="solid" id="btn-artifacts" data-i18n="ui.tree.artifacts"></button>
@@ -311,6 +314,27 @@
         <div id="attack-results" class="results"></div>
       </div>
     </div>
+
+    <div class="view" data-view="diff">
+      <div class="controls">
+        <label class="row"><span data-i18n="ui.diff.side_a"></span>
+          <select id="diff-a"></select>
+          <span data-i18n="ui.diff.snapshot"></span>
+          <select id="diff-a-snap"></select>
+        </label>
+        <label class="row"><span data-i18n="ui.diff.side_b"></span>
+          <select id="diff-b"></select>
+          <span data-i18n="ui.diff.snapshot"></span>
+          <select id="diff-b-snap"></select>
+        </label>
+        <button class="solid" id="btn-diff" data-i18n="ui.diff.run"></button>
+        <p class="hint" data-i18n="help.diff.walks_both_trees"></p>
+      </div>
+      <div class="view-main">
+        <div id="diff-results" class="results"></div>
+      </div>
+    </div>
+
 
     <div class="view" data-view="hash">
       <div class="controls">
@@ -621,6 +645,22 @@
   </form>
 </dialog>
 
+<dialog id="dlg-attack-artefact">
+  <form method="dialog" class="dlg">
+    <h2 data-i18n="ui.attack_artefact.title"></h2>
+    <p class="hint" id="attack-artefact-item"></p>
+    <label class="field"><span data-i18n="ui.tag.technique"></span>
+      <select id="attack-artefact-technique"><option value="" data-i18n="ui.tag.none"></option></select></label>
+    <p class="hint" id="attack-artefact-note" hidden></p>
+    <label class="field"><span data-i18n="ui.tag.note"></span>
+      <textarea id="attack-artefact-text" rows="3"></textarea></label>
+    <menu>
+      <button value="cancel" class="ghost" data-i18n="ui.tag.cancel"></button>
+      <button value="ok" class="solid" data-i18n="ui.attack_artefact.attribute"></button>
+    </menu>
+  </form>
+</dialog>
+
 <dialog id="dlg-busy" class="busy">
   <button type="button" class="dlg-x" id="busy-min" data-i18n-aria="tooltips.mark.minimise_task_tray" data-i18n="ui.busy.busy_min"></button>
   <h2 id="busy-title" data-i18n="ui.busy.busy_title"></h2>
@@ -661,6 +701,11 @@
     </label>
     <label class="check"><input type="checkbox" id="unlock-show">
       <span data-i18n="ui.unlock.show_what_i_typed"></span></label>
+    <label class="field" id="unlock-keyfile-field">
+      <span data-i18n="ui.unlock.startup_key_path"></span>
+      <input type="text" id="unlock-keyfile" autocomplete="off" spellcheck="false"
+             data-i18n-placeholder="tooltips.unlock.bek_path">
+    </label>
     <p class="hint" id="unlock-note"></p>
     <p class="hint err" id="unlock-error" hidden></p>
     <menu>

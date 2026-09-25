@@ -13,6 +13,201 @@ records, not how the code changed.
 
 ### Added
 
+- **APFS snapshots can be listed and opened read-only.** On an APFS volume
+  that has snapshots, a Snapshots list now shows each snapshot's name,
+  creation time and transaction identifier, and a snapshot can be opened as a
+  read-only view of the volume as it was at that point — files as they were,
+  including ones later deleted or overwritten. A snapshot whose file contents
+  were removed when the snapshot was made is reported as dataless and cannot
+  be opened
+  ([#51](https://github.com/switch-nz/strata/issues/51)).
+- **Tags follow a volume when it is re-acquired into another image.** Tags
+  are keyed to the filesystem handle of the file they name, which is stable
+  only within one image, so the same volume imaged again arrived with its
+  tags left behind on the old exhibit. Each detected volume now records its
+  filesystem's own identifier — an NTFS or exFAT serial, an ext4 or APFS
+  UUID — and when a volume the case has seen before is acquired, its tags
+  move to the new exhibit. A volume whose identifier matches several the
+  case already holds is reported rather than guessed
+  ([#82](https://github.com/switch-nz/strata/issues/82)).
+- **Two volumes can be diffed, per path.** A new Diff tab picks any two
+  loaded exhibits (or a volume and one of its own shadow-copy snapshots)
+  and lists what was added, removed and changed between them — compared
+  by path, with size and timestamps per side. Node numbers are ignored:
+  the same volume acquired twice does not report every file as changed
+  just because its MFT records moved. Snapshot reads come straight from
+  the shadow-copy store, layered over the live volume
+  ([#74](https://github.com/switch-nz/strata/issues/74)).
+
+## [0.4.0] - 2026-09-24
+
+A feature release: split raw sets from FTK Imager, Guymager and `split`
+open as one exhibit; BitLocker volumes with a clear-key or startup-key
+protector unlock; and case folders are much smaller and indexed search much
+faster, with a compressed content index, timelines that store each path
+once, and a text extractor that finds UTF-16 text in any script without
+indexing binary as text. Upgrade from 0.3.0. An existing content index is
+converted when its case is opened, after which earlier versions cannot use
+it; rebuild the index and timeline to get the new extractor and the smaller
+timeline.
+
+### Added
+
+- **Volume Shadow Copies can now be opened, not just listed.** Where an
+  exhibit holds shadow copies, Strata shows each snapshot in the Shadow
+  Copies pane with an Open button; opening one browses that snapshot's
+  files and folders as a filesystem in its own right, reading through the
+  block-redirect overlay to the differential store where a changed block
+  was copied and falling through to the base volume where it was not.
+  Hex, preview, export and folder export all read snapshot content, and
+  the snapshot context is labelled throughout so results are never
+  confused with the live volume
+  ([#49](https://github.com/switch-nz/strata/issues/49)).
+- **Split raw sets written by FTK Imager, Guymager and `dd` with `split`
+  now open as one exhibit.** Only three-digit `.001`/`.002` naming was
+  joined before, so a set numbered any other way opened as its first piece
+  alone — a whole disk presented as a few gigabytes of it, with nothing on
+  screen to say so. Guymager's `.0000` numbering (which widens for a disk
+  needing more than 999 pieces), `split`'s default `.aa`/`.ab` suffixes and
+  its `-d` numeric ones are now recognised alongside FTK Imager's `.001`,
+  and a missing, wrongly sized or mixed-width piece raises a finding that
+  names the piece the way that set numbers it. An image summary or info
+  file sitting beside the pieces is not mistaken for one
+  ([#45](https://github.com/switch-nz/strata/issues/45)).
+- **A BitLocker volume with a clear-key or startup-key (.BEK) protector can
+  now be unlocked.** Both protector types were already recognised but
+  unusable: a clear-key protector — the volume left effectively
+  unprotected, usually mid-encryption or with protection suspended — could
+  never be tried because the unlock request always demanded a non-empty
+  secret first, and a startup key was matched against the wrong on-disk
+  protector-type value (`0x0002` instead of the real `0x0200`, confirmed
+  against the published BitLocker format specification and cross-checked
+  independently), so a real `.BEK`-protected volume never matched at all.
+  A clear-key volume now unlocks with one click and no secret; a
+  startup-key volume unlocks by pointing at its `.BEK` file
+  ([#53](https://github.com/switch-nz/strata/issues/53)).
+- **Compact** in the Cases view gives back disk space left by deleted and
+  replaced work: it merges the content index and rewrites the case databases.
+  Nothing recorded changes, and the audit log records the size before and
+  after. It refuses, and changes nothing, when the disk has no room for the
+  rewrite.
+
+### Changed
+
+- **The content index keeps its text compressed, and indexed search is much
+  faster.** Each document's text is now stored once, zlib-compressed, instead
+  of as a second uncompressed copy inside the search index, which typically
+  makes the index about a third smaller. Searches find exactly the same hits
+  in the same order. They are faster because a snippet is now cut from each
+  hit's text only as far as the first place a term occurs, where before the
+  whole of every matching document was re-read — a search whose hits include
+  large files goes from tens of seconds to a few — and because counting what
+  is indexed no longer reads every document (seconds, twice before every
+  search, now instant). A snippet shows the passage around the first
+  occurrence of a term; before, it could be a later passage FTS5 scored
+  higher. An existing
+  index is converted when its case is opened, and stays searchable until it
+  is. Once converted, an earlier version of Strata cannot use the index: it
+  reports that there is no index, and building one fails with "no such
+  function: inflate". Nothing is damaged by trying. To go back to an earlier
+  version, delete `cache/content-index.sqlite` in the case folder and build
+  the index again there — it is derived entirely from the evidence.
+- **Timelines take much less disk space.** A timeline stored every file's
+  full path and name again on each of its events, and once more in its sort
+  index; each is now stored once per file. The timeline shows the same
+  events in the same order, and pages and filters at least as quickly. A
+  timeline built by an earlier version is still read as it is, and takes
+  the smaller form when it is next rebuilt.
+- **Indexed text in scripts other than Latin is found more reliably, and
+  binary noise no longer fills the index.** Text stored as UTF-16 is now
+  found wherever it starts — before, a string beginning on an odd byte was
+  missed entirely — in any script, including Chinese, Japanese, Korean,
+  Cyrillic, Greek, Arabic, Hebrew, Devanagari and Thai. At the same time the
+  extractor no longer keeps the plausible-looking characters that binary
+  data, and text read one byte out of step, decode to: most of the non-Latin
+  text in an index built before this was of that kind. ASCII text is found
+  exactly as before. What is not caught is a random run of Chinese
+  characters or Hangul, which cannot be told from real text without knowing
+  which characters are common. Extracting text from a file takes a little
+  longer, since it is read at both byte alignments, but with far less text
+  to index, building an index is faster overall and the index is smaller.
+  An index built before this keeps its text until it is rebuilt.
+- **A full index keeps at most 8 MB of text from any one file.** Every byte is
+  still read, but program binaries, browser cache blocks and `$MFT` produced
+  tens of megabytes of text each, and the index over that text roughly
+  doubled its size again. Files that reach the limit are counted and named
+  as a finding, so what is not searchable is stated.
+
+### Fixed
+
+- **The content index now moves out of older case records.** Cases indexed
+  before the index lived in the cache folder were meant to move it there when
+  opened, but the request never reached the engine, so the whole index
+  stayed inside `case.sqlite` and every rebuild added to it, taking the case
+  record to many gigabytes. When the disk has no room for the move it is now
+  deferred and recorded in the audit log, and a move that fails part way is
+  recorded rather than dropped.
+- **Removing an exhibit no longer leaves its timeline behind.** On Windows a
+  timeline that was briefly open could not be deleted and was silently kept;
+  deletion now retries, and opening a case removes derived files (timelines,
+  directory caches) belonging to exhibits no longer in it, recorded in the
+  audit log as `cache.swept`.
+- Background tasks can be followed with a case open and no evidence loaded.
+
+## [0.3.0] - 2026-09-23
+
+A feature release: a read-only mode for exports and reports, fixed VHD
+image support, Apple extended-attribute decoding on APFS and HFS+, ATT&CK
+technique attribution for artefact rows, a confirmation before re-running
+an artefact collector, and fragmented-file carving across a single gap.
+Upgrade from 0.2.0.
+
+### Added
+
+- **A `--read-only` startup flag refuses export and report writing for the
+  whole session.** With it set, every export route (single file, a whole
+  folder, a raw byte range, the export manifest) and writing the HTML
+  examination report are refused server-side with a clear error, whether
+  the request comes from the interface or straight at the API — a denied
+  attempt is recorded in the case's audit log the same as any other
+  action. The matching interface controls (Export, Export and add,
+  Export bytes, the Report button, the tagged-items export button) are
+  hidden or disabled rather than left to fail silently. Nothing else
+  changes: opening evidence, examining it, and writing to the case
+  itself (tags, bookmarks, notes) are unaffected, and the flag defaults
+  off ([#70](https://github.com/switch-nz/strata/issues/70)).
+- **A fixed VHD (Virtual PC / Hyper-V, the Conectix footer format) now opens
+  directly.** Its 512-byte footer is read from the end of the file and
+  excluded from the exposed disk, so what is shown, hashed and carved is the
+  virtual disk only, not the footer appended after it. A dynamic or
+  differencing VHD is recognised from the same footer and refused by name,
+  as before; a footer that fails its own checksum, or names a disk type
+  this reader does not know, is refused rather than guessed at
+  ([#46](https://github.com/switch-nz/strata/issues/46), fixed VHD only —
+  dynamic and differencing VHD, and VHDX, remain out of scope here).
+- **Extended attributes on APFS and HFS+ files are now decoded, not just
+  listed.** APFS already walked a file's extended attributes but discarded
+  their value, and HFS+ located the Attributes fork without ever opening
+  it, so neither surfaced anything beyond an attribute's name and size.
+  Both now read the value when it's stored inline, and decode the two most
+  examination-relevant ones: `com.apple.quarantine` (Gatekeeper's download
+  flag — agent, timestamp, event id) and
+  `com.apple.metadata:kMDItemWhereFroms` (the URL a file was downloaded
+  from, and often the page that linked to it). The file inspector's
+  Extended Attributes section shows the decoded fields alongside the raw
+  value, and notes plainly when a large, fork-based attribute's content
+  wasn't captured.
+- **A ShimCache entry (or any artefact row) can now be attributed to an
+  ATT&CK technique, and that attribution shows in the report.** ATT&CK
+  attribution existed only for tagged files; an artefact row like a
+  ShimCache entry has no filesystem handle to tag, so there was no way
+  to attribute one at all, and the report's ATT&CK section stayed
+  empty for it. Right-clicking a ShimCache entry now offers "Attribute
+  ATT&CK technique…", using the same picker and suggested-techniques
+  catalogue tagging a file already has; the attribution appears in the
+  ATT&CK tab and the report exactly as a file's would
+  ([#63](https://github.com/switch-nz/strata/issues/63), the report
+  half — the on-screen "examined, not run" caveat shipped earlier).
 - **Re-running an artefact collector now asks first if it already has a
   result for that evidence item.** `save_artefact` replaces the earlier
   row silently, which is fine on a first pass and wrong once an examiner
@@ -483,7 +678,9 @@ Corroborate results in these areas with another tool before relying on them.
   ([#15](https://github.com/switch-nz/strata/issues/15),
   [#19](https://github.com/switch-nz/strata/issues/19)).
 
-[Unreleased]: https://github.com/switch-nz/strata/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/switch-nz/strata/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/switch-nz/strata/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/switch-nz/strata/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/switch-nz/strata/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/switch-nz/strata/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/switch-nz/strata/compare/v0.1.0...v0.1.1
