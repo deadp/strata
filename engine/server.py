@@ -25,7 +25,7 @@ from . import filesearch as filesearch_mod
 from . import hashing as hashing_mod
 from . import textindex as textindex_mod
 from . import appcompat as appcompat_mod
-from . import browser as browser_mod
+from . import browsercache as browsercache_mod
 from . import shellbags as shellbags_mod
 from . import evtx as evtx_mod
 from . import leveldb as leveldb_mod
@@ -57,6 +57,8 @@ from . import recyclebin as recyclebin_mod
 from . import registry as registry_mod
 from . import reglog as reglog_mod
 from . import vss as vss_mod
+from . import listingdiff as listingdiff_mod
+from . import vssstore as vssstore_mod
 from . import structure as structure_mod
 from . import volume as volume_mod
 from . import logical as logical_mod
@@ -70,6 +72,7 @@ from . import treecache as treecache_mod
 from . import version as version_mod
 from .fs import ntfs as ntfs_mod
 from .fs import streams as streams_mod
+from .fs import apfs as apfs_mod
 
 WEB_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "web")
@@ -77,6 +80,25 @@ WEB_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 _BOUND = {"host": "127.0.0.1", "port": 8722}
 
 _LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+# Set once by serve() from --read-only, before the server starts accepting
+# requests. Session.read_only reads this live rather than capturing it at
+# construction time, because the module-level SESSION singleton below is
+# built at import time -- before serve() has parsed the CLI flag.
+READ_ONLY = False
+
+# Server-side export and report-writing routes refused while READ_ONLY is
+# set. Analysis endpoints that only compute or cache results (registry
+# report, artefact collectors, ...) are not export/report writes and are
+# deliberately left out -- read-only mode narrows to what issue #70 asks
+# for, not every write.
+_READONLY_BLOCKED_PATHS = frozenset({
+    "/api/export", "/api/export/file", "/api/export/folder",
+    "/api/export/manifest", "/api/report/write",
+})
+
+def _blocked_by_readonly(read_only, path):
+    return bool(read_only) and path in _READONLY_BLOCKED_PATHS
 
 def set_bound_address(host, port):
     _BOUND["host"] = host or "127.0.0.1"
@@ -210,6 +232,7 @@ class Evidence:
         self.volumes = volume_mod.scan(self.image)
         self.label = os.path.basename(path)
         self.fs_cache = {}
+        self.snapshot_cache = {}
         self._structures = None
         self.index_tasks = {}
         self.hive_cache = {}
@@ -237,7 +260,8 @@ REGISTRY = None
 class Session:
 
     _PER_EVIDENCE = (
-        "image", "path", "volumes", "fs_cache", "index_tasks", "hive_cache",
+        "image", "path", "volumes", "fs_cache", "snapshot_cache",
+        "index_tasks", "hive_cache",
         "unlocked", "vault_cache", "reader_cache", "tz_candidates",
         "tz_scanned", "evidence_id", "_structures", "usn", "file_bytes",
     )
@@ -255,12 +279,16 @@ class Session:
     def current(self):
         return self.items.get(self.active_id)
 
+    @property
+    def read_only(self):
+        return READ_ONLY
+
     def __getattr__(self, name):
         if name in Session._PER_EVIDENCE:
             cur = self.__dict__.get("items", {}).get(
                 self.__dict__.get("active_id"))
             if cur is None:
-                return None if name != "fs_cache" else {}
+                return {} if name in ("fs_cache", "snapshot_cache") else None
             return getattr(cur, name)
         raise AttributeError(name)
 
@@ -296,15 +324,42 @@ class Session:
             names = os.listdir(base)
         except OSError:
             return []
-        gone = []
+        return [name for name in sorted(names)
+                if pattern.match(name) and _remove(os.path.join(base, name))]
+
+    def sweep_cache(self):
+        if self.case is None or READ_ONLY:
+            return []
+        base = self.case.cache_dir()
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return []
+        rows = self.case.db.execute("SELECT id, path FROM evidence").fetchall()
+        ids = {int(r["id"]) for r in rows}
+        owners = tuple(treecache_mod.prefix_for(r["path"]) for r in rows)
+        orphans = []
         for name in sorted(names):
-            if not pattern.match(name):
-                continue
+            m = _TIMELINE_FILE.match(name)
+            if m and int(m.group(1)) not in ids:
+                orphans.append(name)
+            elif (name.startswith(treecache_mod.PREFIX)
+                  and not name.startswith(owners)):
+                orphans.append(name)
+        gone, freed = [], 0
+        for name in orphans:
+            p = os.path.join(base, name)
             try:
-                os.remove(os.path.join(base, name))
-                gone.append(name)
+                size = os.path.getsize(p)
             except OSError:
-                pass
+                size = 0
+            if _remove(p):
+                gone.append(name)
+                freed += size
+        if gone:
+            self.case.log("cache.swept", {"removed": gone,
+                                          "freed_bytes": freed})
+            self.case.db.commit()
         return gone
 
     def evidence(self, which=None):
@@ -324,6 +379,10 @@ class Session:
                 pass
         self.case = Case(case_path, name=name, examiner=examiner)
         try:
+            self.sweep_cache()
+        except Exception:
+            pass
+        try:
             recents_mod.note(self.case.examiner, self.case.path,
                              self.case.get("name"))
         except Exception:
@@ -332,6 +391,10 @@ class Session:
 
     def running_tasks(self):
         return [t for t in self.tasks.values() if t.get("state") == "running"]
+
+    def index_updating(self):
+        return any(t.get("name") == "index-relocate"
+                   for t in self.running_tasks())
 
     def new_case(self, case_path, name=None, examiner=None):
         self._use_case(case_path, examiner, name=name)
@@ -393,6 +456,16 @@ class Session:
         self.case.log("evidence.open", {"path": path, "evidence_id": ev_id,
                                         "alongside": len(self.items) - 1,
                                         "tool": version_mod.label()})
+        if self.case is not None:
+            try:
+                found = volume_mod.identities(img, item.volumes)
+                self.case.register_volumes(ev_id, found)
+                self.case.reassociate_tags(ev_id, found)
+            except Exception as exc:
+                # Identity extraction or remap errors must never turn an
+                # open into a failure; the audit chain records the miss.
+                self.case.log("tags.reassociation_failed",
+                              {"evidence_id": ev_id, "error": str(exc)})
         return self.state()
 
     def open_case(self, case_path, examiner=None):
@@ -418,7 +491,8 @@ class Session:
         cur = self.current
         if cur is None:
             return {"open": False,
-                    "case": self.case.summary() if self.case else None}
+                    "case": self.case.summary() if self.case else None,
+                    "read_only": self.read_only}
         return {
             "open": True, "path": cur.path,
             "image": cur.image.info(),
@@ -430,6 +504,7 @@ class Session:
             "active_id": self.active_id,
             "index_reset": bool(getattr(self.case, "index_reset", False)),
             "index_pending": int(getattr(self.case, "index_pending", 0) or 0),
+            "read_only": self.read_only,
         }
 
     def reader(self, offset, size, slot="?", ev=None):
@@ -524,10 +599,21 @@ class Session:
             ev._structures = structure_mod.map_image(ev.image, ev.volumes)
         return ev._structures
 
-    def fs(self, offset, ev=None):
+    def fs(self, offset, ev=None, snap=None):
         ev = ev or self.current
         if ev is None:
             raise ValueError(_t("server.evidence_open"))
+        if snap:
+            base = ev.fs_cache.get(("snap", offset, snap))
+            if base is not None:
+                return base
+            live = self.fs(offset, ev=ev)
+            if not isinstance(live, apfs_mod.ApfsVolume):
+                raise ValueError("Snapshots are only available on APFS "
+                                 "volumes.")
+            sv = live.snapshot_volume(snap)
+            ev.fs_cache[("snap", offset, snap)] = sv
+            return sv
         made = getattr(ev.image, "filesystem", None)
         if made is not None:
             ev.fs_cache[offset] = made
@@ -558,7 +644,58 @@ class Session:
             ev.fs_cache[offset] = fs
             return fs
 
-    def _attach_tree_cache(self, fs, ev, offset):
+    def snapshot_fs(self, offset, snap_index, ev=None):
+        """Filesystem over a shadow copy: an NtfsFS reading a VssOverlay
+        wrapped around the base region. Cached per (offset, snap_index)."""
+        ev = ev or self.current
+        if ev is None:
+            raise ValueError(_t("server.evidence_open"))
+        key = (offset, snap_index)
+        hit = ev.snapshot_cache.get(key)
+        if hit is not None:
+            return hit
+        with self.fs_lock:
+            hit = ev.snapshot_cache.get(key)
+            if hit is not None:
+                return hit
+            region = self.region(offset, ev=ev)
+            report = vss_mod.snapshots(region)
+            if not report.get("present"):
+                raise ValueError("No shadow copies on this volume.")
+            snaps = report.get("snapshots") or []
+            if snap_index < 0 or snap_index >= len(snaps):
+                raise ValueError("No such shadow copy (index %d)." % snap_index)
+            snap = snaps[snap_index]
+            if snap.get("unsupported"):
+                raise ValueError(snap["unsupported"])
+            overlay = vss_mod.VssOverlay(region, snap,
+                                         findings=list(report.get("findings")
+                                                       or []))
+            fs = ntfs_mod.open_fs(overlay)
+            # Snapshot trees must not reuse the base volume's persisted tree
+            # cache: pass snap_index through as its own filename component
+            # (path_for/stamp), not folded into the offset arithmetically --
+            # a pseudo-offset computed from a real one can still collide
+            # with a genuine partition offset elsewhere on the same image.
+            self._attach_tree_cache(fs, ev, offset, snap=snap_index)
+            ev.snapshot_cache[key] = fs
+            return fs
+
+    def fs_at(self, offset, snap=None, ev=None):
+        """The base filesystem, or a snapshot of it -- VSS snapshots are
+        addressed by their numeric index (snapshot_fs), APFS snapshots by
+        their name (fs's own snap=); both features share the same `snap`
+        query param, so a value that parses as an integer is a VSS index
+        and anything else is taken as an APFS snapshot name."""
+        if snap in (None, ""):
+            return self.fs(offset, ev=ev)
+        try:
+            snap_index = int(snap)
+        except (TypeError, ValueError):
+            return self.fs(offset, ev=ev, snap=snap)
+        return self.snapshot_fs(offset, snap_index, ev=ev)
+
+    def _attach_tree_cache(self, fs, ev, offset, snap=None):
         if not hasattr(fs, "tree_store"):
             return
         if fs.tree_store is not None or self.case is None:
@@ -566,8 +703,8 @@ class Session:
         cache = self.case.cache_dir(create=True)
         if not cache:
             return
-        path = treecache_mod.path_for(cache, ev.path, offset)
-        want = treecache_mod.stamp(ev.path, offset)
+        path = treecache_mod.path_for(cache, ev.path, offset, snap=snap)
+        want = treecache_mod.stamp(ev.path, offset, snap=snap)
         fs.tree_store = (lambda: treecache_mod.load(path, want),
                          lambda tree: treecache_mod.save(path, tree, want))
 
@@ -617,11 +754,12 @@ class Session:
             "encryption": info.get("encryption") or info.get("method"),
             "note": _t("server.unlock.inherited")})
 
-    def keep_artefact(self, kind, part, payload):
-        if not self.case or self.evidence_id is None or not payload:
+    def keep_artefact(self, kind, part, payload, ev=None):
+        evidence_id = ev.evidence_id if ev is not None else self.evidence_id
+        if not self.case or evidence_id is None or not payload:
             return None
         try:
-            return self.case.save_artefact(self.evidence_id, part, kind, payload)
+            return self.case.save_artefact(evidence_id, part, kind, payload)
         except Exception:
             return None
 
@@ -935,20 +1073,6 @@ class Handler(BaseHTTPRequestHandler):
             out["open"] = True
             return self._send(200, out)
 
-        if path == "/api/index/relocate":
-            if not s.case:
-                return self._send(400, {"error": _t("server.export.case_open")})
-            if not getattr(s.case, "index_pending", 0):
-                return self._send(200, {"moved": 0, "nothing_to_do": True})
-
-            def run(progress):
-                return s.case.relocate_index(progress=progress)
-
-            return self._send(200, s.start_task(
-                "index-relocate", run,
-                label=_t("server.index_relocate.label"),
-                detail=_t("server.index_relocate.detail")))
-
         if path == "/api/version":
             return self._send(200, {"name": version_mod.NAME,
                                     "version": version_mod.__version__,
@@ -1011,13 +1135,40 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send(400, {"error": _t("server.case_peek.strata_case_file") % exc})
 
+        # Tasks belong to the session, not to an exhibit: moving the index or
+        # compacting runs with a case open and nothing loaded, and has to be
+        # followable then too.
+        if path == "/api/task":
+            tid = self._q("id")
+            t = s.tasks.get(tid)
+            if not t:
+                return self._send(200, {"error": _t("server.task.such_task")})
+            out = {k: v for k, v in t.items() if k != "partial"}
+            live = t.get("partial")
+            if live is not None:
+                n = len(live)
+                since = min(self._q("since", 0, int), n)
+                out["found"] = n
+                out["new"] = live[since:min(n, since + 2000)]
+            return self._send(200, out)
+
+        if path == "/api/tasks":
+            items = s.task_list()
+            return self._send(200, {
+                "tasks": items,
+                "running": sum(1 for t in items if t["state"] == "running"),
+            })
+
         if not s.image:
             return self._send(409, {"error": _t("server.case_peek.evidence_open")})
 
         if path == "/api/hex":
             off = self._q("offset", 0, int)
             length = min(self._q("length", 4096, int), 1 << 20)
-            src = self._region_from_query()
+            try:
+                src = self._region_from_query()
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             data = src.read_at(off, length)
             return self._send(200, {"offset": off, "length": len(data),
                                     "data": base64.b64encode(data).decode(),
@@ -1026,12 +1177,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dir":
             off = self._q("part", 0, int)
             ev = s.evidence(self._q("ev", None)) or s.current
+            snap = self._q("snap", "") or None
             try:
-                fs = s.fs(off, ev=ev)
+                fs = s.fs_at(off, snap=snap, ev=ev)
             except ntfs_mod.EncryptedVolume as exc:
                 return self._send(200, {"entries": [], "encrypted": True,
                                         "kind": exc.kind, "part": off,
                                         "error": str(exc)})
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             node = self._q("node", None)
             root = getattr(fs, "root_node", None)
             if root is None:
@@ -1039,8 +1193,12 @@ class Handler(BaseHTTPRequestHandler):
                         "APFS": 2}.get(fs.name, 0)
             handle = int(node) if node not in (None, "") else root
             if getattr(fs, "index_pending", None) and fs.index_pending():
+                # Snapshot trees key their index like their tree cache:
+                # off*1024+snap keeps one slot per snapshot, never clashing
+                # with the base volume's index at the same offset.
+                ikey = off if snap is None else off * 1024 + snap
                 return self._send(200, {"building": True,
-                                        "task": s.ensure_index(off, fs,
+                                        "task": s.ensure_index(ikey, fs,
                                                                ev=ev)})
             entries = fs.listdir(handle, self._q("path", "/"))
             typed = capped = 0
@@ -1068,7 +1226,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/stat":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             stream = self._q("stream", "")
             try:
@@ -1121,7 +1283,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/preview":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             n = min(self._q("length", 65536, int), 1 << 20)
             stream = self._q("stream", "")
@@ -1258,7 +1424,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/file":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             try:
                 info = fs.stat(entry)
@@ -1274,9 +1444,27 @@ class Handler(BaseHTTPRequestHandler):
             ctype = _sniff_mime(region.read_at(0, 64))
             return self._send_range_region(region, size, ctype)
 
-        if path == "/api/document":
+        if path == "/api/thumbnail":
             off = self._q("part", 0, int)
             fs = s.fs(off)
+            entry = json.loads(self._q("entry", "{}"))
+            try:
+                sample = fs.read_file(entry, 1 << 20)
+            except Exception:
+                sample = None
+            thumb = exif_mod.thumbnail(sample) if sample else None
+            if not thumb:
+                return self._send(404,
+                                  {"error": _t("server.thumbnail.no_thumbnail")})
+            return self._send_range(thumb, _sniff_mime(thumb))
+
+        if path == "/api/document":
+            off = self._q("part", 0, int)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             size = int(entry.get("size") or 0)
             if size > MAX_ARCHIVE:
@@ -1293,7 +1481,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/archive":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             inner = self._q("inner", None)
             size = int(entry.get("size") or 0)
@@ -1327,12 +1519,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/render":
             off = self._q("part", 0, int)
-            fs = s.fs(off)
+            snap = self._q("snap", "") or None
+            try:
+                fs = s.fs_at(off, snap=snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = json.loads(self._q("entry", "{}"))
             size = int(entry.get("size") or 0)
             data = fs.read_file(entry, min(size or MAX_STREAM, MAX_STREAM))
             want = self._q("as", "")
-
             if pdfdoc_mod.looks_like_pdf(data[:5]):
                 doc = pdfdoc_mod.Pdf(data)
                 if want == "bytes":
@@ -1374,32 +1569,11 @@ class Handler(BaseHTTPRequestHandler):
 
             return self._send(400, {"error": _t("server.render.nothing_here_needs_sanitising")})
 
-        if path == "/api/task":
-            tid = self._q("id")
-            t = s.tasks.get(tid)
-            if not t:
-                return self._send(200, {"error": _t("server.task.such_task")})
-            out = {k: v for k, v in t.items() if k != "partial"}
-            live = t.get("partial")
-            if live is not None:
-                n = len(live)
-                since = min(self._q("since", 0, int), n)
-                out["found"] = n
-                out["new"] = live[since:min(n, since + 2000)]
-            return self._send(200, out)
-
         if path == "/api/artefacts":
             if not s.case or s.evidence_id is None:
                 return self._send(200, {"items": {}, "dropped": [],
                                         "note": _t("server.artefacts.case_file_so_nothing")})
             return self._send(200, s.case.artefacts(s.evidence_id))
-
-        if path == "/api/tasks":
-            items = s.task_list()
-            return self._send(200, {
-                "tasks": items,
-                "running": sum(1 for t in items if t["state"] == "running"),
-            })
 
         if path == "/api/searches":
             return self._send(200, {"searches": s.case.searches()})
@@ -1468,6 +1642,17 @@ class Handler(BaseHTTPRequestHandler):
                     held = s.items.get(it.get("evidence_id"))
                     it["exhibit"] = held.label if held else None
             return self._send(200, {"groups": groups})
+
+        if path == "/api/hashes/similar":
+            if not s.case:
+                return self._send(200, {"pairs": []})
+            pairs = s.case.similar_files(
+                threshold=self._q("threshold", 60, int))
+            for p in pairs:
+                for side in ("a", "b"):
+                    held = s.items.get(p[side].get("evidence_id"))
+                    p[side]["exhibit"] = held.label if held else None
+            return self._send(200, {"pairs": pairs})
 
         if path == "/api/recyclebin":
             part = self._q("part", 0, int)
@@ -1551,16 +1736,32 @@ class Handler(BaseHTTPRequestHandler):
             out = {"items": found, "jumplists": jumps, "stat": stat,
                    "scanned": stat["seen"] + stat["jumplists"]}
             s.keep_artefact("lnk", part, out)
-            return self._send(200, out)
+
+        if path == "/api/snapshots":
+            part = self._q("part", 0, int)
+            fs = s.fs(part)
+            if isinstance(fs, apfs_mod.ApfsVolume):
+                snaps = fs.snapshots()
+                r = {"present": bool(snaps), "snapshots": snaps,
+                     "findings": list(fs.findings)}
+                if not snaps:
+                    r["note"] = "No snapshots on this volume."
+            else:
+                r = {"present": False, "snapshots": [],
+                     "findings": [], "note": "Snapshots are an APFS feature "
+                     "— this partition is not APFS."}
+            s.keep_artefact("snapshots", part, r)
+            return self._send(200, r)
 
         if path == "/api/vss":
             part = self._q("part", 0, int)
-            region = s.region(part)
+            ev = s.evidence(self._q("ev")) or s.current
+            region = s.region(part, ev=ev)
             r = vss_mod.snapshots(region)
             if not r.get("present"):
                 r["note"] = ("No shadow copy store on this volume — the VSS "
                              "volume header at 0x1E00 is absent or empty.")
-            s.keep_artefact("vss", part, r)
+            s.keep_artefact("vss", part, r, ev=ev)
             return self._send(200, r)
 
         if path in ("/api/timeline/summary", "/api/timeline/page",
@@ -1707,6 +1908,28 @@ class Handler(BaseHTTPRequestHandler):
                 "note": _t("server.artifacts.cost_what_will_take"),
             })
 
+        if path == "/api/artifacts/presence":
+            ev = s.current
+            agg = {"recyclebin": {"found": False, "count": 0},
+                  "prefetch": {"found": False, "count": 0},
+                  "browser": {"found": False, "profiles": []}}
+            if ev is not None:
+                parts = [p for p in ev.volumes["partitions"]
+                        if p.get("allocated") and p.get("detected")]
+                for p in parts:
+                    try:
+                        fs = s.fs(p["offset"])
+                    except Exception:
+                        continue
+                    got = artifacts_mod.presence(fs, _root_node(fs))
+                    for key in ("recyclebin", "prefetch"):
+                        agg[key]["found"] = agg[key]["found"] or got[key]["found"]
+                        agg[key]["count"] += got[key]["count"]
+                    if got["browser"]["found"]:
+                        agg["browser"]["found"] = True
+                        agg["browser"]["profiles"] += got["browser"]["profiles"]
+            return self._send(200, agg)
+
         if path == "/api/triage":
             return self._send(200, _triage(s))
 
@@ -1727,9 +1950,11 @@ class Handler(BaseHTTPRequestHandler):
     def _region_from_query(self):
         sess = self._session()
         part = self._q("part", None, int)
+        snap = self._q("snap", None, int)
         raw = self._q("entry", "")
         if raw:
-            fs = sess.fs(part or 0)
+            fs = sess.fs(part or 0) if snap is None \
+                else sess.snapshot_fs(part or 0, snap)
             entry = json.loads(raw)
             stream = self._q("stream", "")
             try:
@@ -1744,10 +1969,31 @@ class Handler(BaseHTTPRequestHandler):
                               cur.file_bytes if cur is not None else None)
         if part is None:
             return sess.image
+        if snap is not None:
+            region = sess.region(part)
+            report = vss_mod.snapshots(region)
+            if not report.get("present"):
+                raise ValueError("No shadow copies on this volume.")
+            snaps = report.get("snapshots") or []
+            if snap < 0 or snap >= len(snaps):
+                raise ValueError("No such shadow copy (index %d)." % snap)
+            return vss_mod.VssOverlay(region, snaps[snap],
+                                      findings=list(report.get("findings")
+                                                    or []))
         return sess.region(part)
+
+    def _readonly_refusal(self, s, path):
+        if s.case is not None:
+            try:
+                s.case.log("readonly.refused", {"path": path})
+            except Exception:
+                pass
+        return {"error": _t("server.readonly.refused")}
 
     def _api_post(self, path, body):
         s = self._session()
+        if _blocked_by_readonly(s.read_only, path):
+            return self._send(403, self._readonly_refusal(s, path))
         if path == "/api/whoami":
             name = (body.get("name") or "").strip()
             if not name:
@@ -1978,6 +2224,80 @@ class Handler(BaseHTTPRequestHandler):
                       % (body.get("name") or start),
                 detail=_t("server.recurse.detail")))
 
+        if path == "/api/diff":
+            # body: {"a": {"ev": <evidence_id?>, "part": <int>,
+            #              "snap": <int?>},
+            #         "b": {...}} -- ev omitted = current exhibit; snap
+            # omitted = live volume. fold is optional (server decides).
+            fold = bool(body.get("fold"))
+
+            def side(spec):
+                ev = s.evidence((spec or {}).get("ev")) or s.current
+                part = int((spec or {}).get("part") or 0)
+                snap = (spec or {}).get("snap")
+                region = s.region(part, ev=ev)
+                if snap in (None, ""):
+                    return s.fs(part, ev=ev), ev, part, None
+                snap = int(snap)
+                snaps = vss_mod.snapshots(region)["snapshots"]
+                if snap < 0 or snap >= len(snaps) \
+                        or not snaps[snap].get("block_list_offset"):
+                    raise _DiffSideError(_t("server.diff.no_snapshot"))
+                chain = [x["block_list_offset"] for x in snaps[:snap + 1]
+                         if x.get("block_list_offset")]
+                # Not s.fs(): Session.fs caches by int offset only and a
+                # snapshot fs instance would poison that cache; the
+                # snapshot fs stays local to the task.
+                fs = ntfs_mod.open_fs(vssstore_mod.SnapshotReader(region,
+                                                                  chain))
+                return fs, ev, part, snap
+
+            try:
+                fa, ev_a, part_a, snap_a = side(body.get("a"))
+                fb, ev_b, part_b, snap_b = side(body.get("b"))
+            except _DiffSideError as exc:
+                return self._send(400, {"error": str(exc)})
+            except ntfs_mod.EncryptedVolume as exc:
+                return self._send(200, {"encrypted": True, "kind": exc.kind,
+                                        "error": str(exc)})
+
+            # NTFS is case-preserving/case-insensitive; exFAT/FAT store
+            # upcased names so folding is a no-op there; ext4/APFS stay
+            # case-sensitive. The client may force folding with "fold".
+            # Each side folds on its OWN filesystem type: an ext4-vs-NTFS
+            # diff must not fold the ext4 side too, or two ext4 entries
+            # differing only in case collapse into one and the other is
+            # silently dropped from the whole diff.
+            ignore_case_a = fold or getattr(fa, "name", "") == "NTFS"
+            ignore_case_b = fold or getattr(fb, "name", "") == "NTFS"
+
+            def run_diff(progress):
+                state_a, state_b = {}, {}
+                ea = filesearch_mod.collect(
+                    fa, _root_node(fa), state=state_a,
+                    progress=lambda n: progress(0.0, count=n))
+                progress(0.5)
+                eb = filesearch_mod.collect(
+                    fb, _root_node(fb), state=state_b,
+                    progress=lambda n: progress(0.5, count=n))
+                progress(1.0)
+                d = listingdiff_mod.compare(ea, eb,
+                                            ignore_case_a=ignore_case_a,
+                                            ignore_case_b=ignore_case_b)
+                return {
+                    "diff": d,
+                    "a": {"ev": getattr(ev_a, "evidence_id", None),
+                          "part": part_a, "snap": snap_a,
+                          "truncated": bool(state_a.get("truncated"))},
+                    "b": {"ev": getattr(ev_b, "evidence_id", None),
+                          "part": part_b, "snap": snap_b,
+                          "truncated": bool(state_b.get("truncated"))},
+                }
+
+            return self._send(200, s.start_task(
+                "diff", run_diff, label=_t("server.diff.label"),
+                detail=_t("server.diff.detail")))
+
         if path == "/api/evidence/select":
             ev = s.evidence(body.get("evidence_id"))
             if ev is None:
@@ -2006,9 +2326,9 @@ class Handler(BaseHTTPRequestHandler):
             gone = s.case.remove_evidence(ev_id)
             if gone is None:
                 return self._send(400, {"error": _t("server.evidence_select.such_evidence_item")})
+            s.close(ev_id)
             gone["timelines"] = s.drop_timelines(
                 ev_id, tagged=bool(gone.get("removed")))
-            s.close(ev_id)
             state = s.state()
             state["removed"] = gone
             return self._send(200, state)
@@ -2048,6 +2368,39 @@ class Handler(BaseHTTPRequestHandler):
             if s.running_tasks():
                 return self._send(409, self._tasks_busy(s, "close the case"))
             return self._send(200, s.close_case())
+
+        # Both of these change the case, so they are POST routes -- and they
+        # sit ahead of the "no evidence open" gate below, because a case can
+        # be opened with nothing loaded yet. The relocation used to be
+        # served only on GET while the interface POSTed to it, so the move
+        # never ran and legacy cases kept the whole index in the record.
+        if path == "/api/index/relocate":
+            if not s.case:
+                return self._send(400, {"error": _t("server.export.case_open")})
+            if not getattr(s.case, "index_pending", 0):
+                return self._send(200, {"moved": 0, "nothing_to_do": True})
+
+            def run(progress):
+                return s.case.relocate_index(progress=progress)
+
+            return self._send(200, s.start_task(
+                "index-relocate", run,
+                label=_t("server.index_relocate.label"),
+                detail=_t("server.index_relocate.detail")))
+
+        if path == "/api/case/compact":
+            if not s.case:
+                return self._send(400, {"error": _t("server.export.case_open")})
+            if s.running_tasks():
+                return self._send(409, self._tasks_busy(s, "compact the case"))
+
+            def run(progress):
+                return s.case.compact(progress=progress)
+
+            return self._send(200, s.start_task(
+                "case-compact", run,
+                label=_t("server.case_compact.label"),
+                detail=_t("server.case_compact.detail")))
 
         if path == "/api/case/forget":
             who = self._who(s, body.get("examiner"))
@@ -2602,12 +2955,36 @@ class Handler(BaseHTTPRequestHandler):
 
             def run(progress):
                 found, history, downloads, cookies = [], [], [], []
+                cache = []
+                cache_skipped = 0
+                cache_blockfile = 0
+                cache_index = False
                 entries = filesearch_mod.collect(fs, root)
                 total = max(1, len(entries))
                 for i, e in enumerate(entries):
                     if i % 64 == 0:
                         progress(i / total)
                     if e.get("is_dir") or not (e.get("size") or 0):
+                        continue
+                    ck = browsercache_mod.classify(e)
+                    if ck == "blockfile":
+                        cache_blockfile += 1
+                        continue
+                    if ck == "index":
+                        cache_index = True
+                        continue
+                    if ck:
+                        try:
+                            row = browsercache_mod.parse_entry(
+                                fs.read_file(e, browsercache_mod.READ_CAP), e)
+                        except Exception:
+                            row = None
+                        if row is None:
+                            cache_skipped += 1
+                        elif len(cache) < 20000:
+                            cache.append(row)
+                        else:
+                            cache_skipped += 1
                         continue
                     nm = (e.get("name") or "").lower()
                     if not (nm in ("history", "places.sqlite", "cookies",
@@ -2648,16 +3025,38 @@ class Handler(BaseHTTPRequestHandler):
                             r["product"] = product
                             r["db"] = e.get("path")
                             history.append(r)
+                cache.sort(key=lambda c: c.get("last_modified")
+                           or c.get("last_fetched") or "", reverse=True)
                 history.sort(key=lambda r: r.get("visited_at") or "",
                              reverse=True)
                 progress(1.0)
                 cookies.sort(key=lambda c: (c.get("host") or "",
                                             c.get("name") or ""))
+                cache_findings = []
+                if cache_blockfile:
+                    cache_findings.append(
+                        "Legacy Chromium blockfile cache found (%d file%s "
+                        "under a Cache data directory); its entries were not "
+                        "parsed." % (cache_blockfile,
+                                     "" if cache_blockfile == 1 else "s"))
+                if cache_index:
+                    cache_findings.append(
+                        "A Chromium cache index (index-dir/the-real-index) is "
+                        "present; entry files were read directly and the index "
+                        "was not parsed.")
+                if cache_skipped:
+                    cache_findings.append(
+                        "%d cache entry file%s could not be read or parsed."
+                        % (cache_skipped, "" if cache_skipped == 1 else "s"))
                 return {"databases": found, "history": history[:20000],
                         "downloads": downloads,
                         "cookies": cookies[:20000],
                         "cookie_count": len(cookies),
-                        "history_count": len(history)}
+                        "history_count": len(history),
+                        "cache": cache,
+                        "cache_count": len(cache),
+                        "cache_skipped": cache_skipped,
+                        "findings": cache_findings}
 
             return self._send(200, s.start_task(
                 "browser", run, label="Collecting browser history",
@@ -2970,6 +3369,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"tasks": s.task_list()})
 
         if path == "/api/search/index":
+            # The index is being rewritten into a new file; anything written
+            # to the old one now would be lost when the new one is swapped in.
+            if s.index_updating():
+                return self._send(409, self._tasks_busy(s, "build the index"))
             full = bool(body.get("full"))
             if "whole_disk" in body:
                 whole = bool(body.get("whole_disk"))
@@ -3082,6 +3485,14 @@ class Handler(BaseHTTPRequestHandler):
                             r["offset"] = off
                             r["evidence"] = ev.evidence_id
                             r["exhibit"] = ev.label
+                            if full and r.get("text_capped"):
+                                findings.append(
+                                    "%s: %d file(s) held more than %s of "
+                                    "text; only the first %s of each is "
+                                    "searchable." % (
+                                        label, r["text_capped"],
+                                        fmt_bytes(r["text_cap"]),
+                                        fmt_bytes(r["text_cap"])))
                             filesystems.append(r)
                             covered += sz
 
@@ -3179,15 +3590,36 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/unlock":
             part = int(body.get("part") or 0)
             secret = body.get("secret") or ""
+            keyfile_path = body.get("keyfile") or ""
             v = s.vault(part)
             if v is None:
                 return self._send(400, {
                     "error": _t("server.unlock.partition_encrypted_volume_tool")})
-            if not secret:
+
+            is_bde = isinstance(v, bitlocker_mod.BitLocker)
+            bek_key = None
+            if keyfile_path:
+                if not is_bde:
+                    return self._send(400, {
+                        "error": _t("server.unlock.startup_key_file_only")})
+                try:
+                    with open(keyfile_path, "rb") as fh:
+                        bek_data = fh.read(4096)
+                except OSError as exc:
+                    return self._send(400, {"error": str(exc)})
+                bek_key = bitlocker_mod.parse_bek_file(bek_data)
+                if bek_key is None:
+                    return self._send(400, {
+                        "error": _t("server.unlock.not_a_valid_bek_file")})
+
+            has_free = is_bde and any(
+                p.usable and p.kind == "none" for p in v.protectors)
+            if not secret and not bek_key and not has_free:
                 return self._send(400, {"error": _t("server.unlock.enter_password_key")})
 
             def run(progress):
-                r = v.unlock(secret, progress=progress)
+                kwargs = {"bek_key": bek_key} if is_bde else {}
+                r = v.unlock(secret, progress=progress, **kwargs)
                 if r.get("unlocked"):
                     s.unlocked[part] = v
                     s.fs_cache.pop(part, None)
@@ -3270,6 +3702,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"locked": True, "part": part})
 
         if path == "/api/index/clear":
+            if s.index_updating():
+                return self._send(409, self._tasks_busy(s, "clear the index"))
             part = body.get("part")
             ev_id = None if part is None else s.evidence_id
             textindex_mod.clear(s.case, part, ev_id)
@@ -3311,7 +3745,8 @@ class Handler(BaseHTTPRequestHandler):
                         "truncated": len(rows) > 2000}
 
             t = s.start_task("hash", run, label="Hashing files",
-                              detail="MD5, SHA-1 and SHA-256 in one pass per file.")
+                              detail="MD5, SHA-1, SHA-256 and a fuzzy hash "
+                                      "in one pass per file.")
             s.case.log("hash.run", {"part": part, "scope": scope})
             return self._send(200, t)
 
@@ -3440,7 +3875,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/export/file":
             part = int(body.get("part") or 0)
-            fs = s.fs(part)
+            snap = body.get("snap")
+            snap = int(snap) if snap is not None else None
+            try:
+                fs = s.fs(part) if snap is None else s.snapshot_fs(part, snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = body.get("entry") or _entry_from_body(fs, body)
             out_dir = body.get("dir") or os.path.join(
                 os.path.dirname(s.path), "strata-export")
@@ -3448,7 +3888,7 @@ class Handler(BaseHTTPRequestHandler):
                 rec, safe, n = _export_one(
                     fs, entry, out_dir, s, dest=body.get("dest"),
                     manifest=body.get("manifest", True),
-                    stream=body.get("stream") or "")
+                    stream=body.get("stream") or "", snap=snap)
             except _STREAM_ERRORS as exc:
                 return self._send(400,
                                   _stream_error(exc, body.get("stream") or ""))
@@ -3459,14 +3899,19 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     out["exhibit"] = _add_derived(
                         s, safe, s.current, entry.get("path"), rec["sha256"],
-                        body.get("add_as") or "auto")
+                        body.get("add_as") or "auto", snap=snap)
                 except Exception as exc:
                     out["exhibit"] = {"added": False, "error": str(exc)}
             return self._send(200, out)
 
         if path == "/api/export/folder":
             part = int(body.get("part") or 0)
-            fs = s.fs(part)
+            snap = body.get("snap")
+            snap = int(snap) if snap is not None else None
+            try:
+                fs = s.fs(part) if snap is None else s.snapshot_fs(part, snap)
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
             entry = body.get("entry")
             if not entry or not entry.get("is_dir"):
                 return self._send(400, {"error": _t("server.export_folder.folder")})
@@ -3486,7 +3931,8 @@ class Handler(BaseHTTPRequestHandler):
                     p = t.get("path") or t.get("name") or "item"
                     rel = p[len(base):] if base and p.startswith(base) else p
                     try:
-                        rec, _, n = _export_one(fs, t, out_dir, s, rel=rel)
+                        rec, _, n = _export_one(fs, t, out_dir, s, rel=rel,
+                                                snap=snap)
                         written += n
                         done += 1
                     except TaskCancelled:
@@ -3495,14 +3941,14 @@ class Handler(BaseHTTPRequestHandler):
                         failed += 1
                 s.case.log("export.folder", {"path": entry.get("path"),
                                              "dest": out_dir, "files": done,
-                                             "failed": failed})
+                                             "failed": failed, "snap": snap})
                 out = {"dir": out_dir, "files": done, "failed": failed,
                        "bytes": written, "considered": len(targets)}
                 if body.get("add_exhibit") and s.case and done:
                     try:
                         out["exhibit"] = _add_derived(
                             s, out_dir, ev_at_start, entry.get("path"), None,
-                            "logical")
+                            "logical", snap=snap)
                     except Exception as exc:
                         out["exhibit"] = {"added": False, "error": str(exc)}
                 return out
@@ -3522,6 +3968,12 @@ class Handler(BaseHTTPRequestHandler):
             part = body.get("part", 0)
             off = int(body["offset"]) + int(part or 0)
             length = int(body["length"])
+            fragments = body.get("fragments")
+            if fragments is not None and not (
+                    isinstance(fragments, list) and fragments and all(
+                        isinstance(fr, (list, tuple)) and len(fr) == 2
+                        for fr in fragments)):
+                return self._send(400, {"error": "Invalid fragments."})
             chosen = body.get("dest")
             if chosen:
                 dest = os.path.abspath(os.path.expanduser(chosen))
@@ -3534,16 +3986,28 @@ class Handler(BaseHTTPRequestHandler):
                 dest = os.path.join(out_dir, name)
             os.makedirs(out_dir or ".", exist_ok=True)
             src = s.region(part) if part else s.image
-            written = 0
-            with open(dest, "wb") as f:
-                pos = int(body["offset"]) if part else off
-                while written < length:
-                    chunk = src.read_at(pos, min(1 << 20, length - written))
+
+            def read_range(rel_offset, rel_length, f):
+                pos = int(rel_offset)
+                remaining = int(rel_length)
+                n = 0
+                while remaining > 0:
+                    chunk = src.read_at(pos, min(1 << 20, remaining))
                     if not chunk:
                         break
                     f.write(chunk)
-                    written += len(chunk)
+                    n += len(chunk)
                     pos += len(chunk)
+                    remaining -= len(chunk)
+                return n
+
+            written = 0
+            with open(dest, "wb") as f:
+                if fragments:
+                    for frag_off, frag_len in fragments:
+                        written += read_range(frag_off, frag_len, f)
+                else:
+                    written = read_range(body["offset"], length, f)
             h = hashlib.sha256()
             with open(dest, "rb") as f:
                 for blk in iter(lambda: f.read(1 << 20), b""):
@@ -3556,6 +4020,24 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": _t("server.report.unknown_route")})
 
 _TIMELINE_KEY = re.compile(r"^(tagged|ev[0-9]+-p[0-9]+)$")
+_TIMELINE_FILE = re.compile(
+    r"^timeline-ev([0-9]+)-p[0-9]+\.sqlite(-wal|-shm|-journal)?$")
+
+def _remove(path, tries=30):
+    # Windows refuses to delete a file anything still has open, and that is
+    # usually momentary -- a request finishing, a scanner letting go.
+    for i in range(tries):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return False
+        except PermissionError:
+            if i == tries - 1:
+                return False
+            time.sleep(0.1)
+        except OSError:
+            return False
 
 MAX_HIVE = 512 << 20
 
@@ -3587,7 +4069,7 @@ _FTYP_MIME = {
 }
 
 MANIFEST_COLS = ["source", "exported_to", "bytes", "md5", "sha1", "sha256",
-                 "deleted", "modified", "exported_at", "examiner"]
+                 "deleted", "modified", "exported_at", "examiner", "snapshot"]
 
 def _safe_stream_name(stream):
     out = "".join(c if (c.isalnum() or c in "-_.") else "_"
@@ -3644,7 +4126,7 @@ def _exhibit_kind(path, asked="auto"):
             except Exception:
                 pass
 
-def _add_derived(s, path, parent, source_path, digest, asked="auto"):
+def _add_derived(s, path, parent, source_path, digest, asked="auto", snap=None):
     kind = _exhibit_kind(path, asked)
     s.case.log("exhibit.derived", {
         "dest": path,
@@ -3654,6 +4136,7 @@ def _add_derived(s, path, parent, source_path, digest, asked="auto"):
         "from_image": getattr(parent, "path", None),
         "source_path": source_path,
         "sha256": digest,
+        "snap": snap,
     })
     state = s.open(path, add=True, logical=(kind == "logical"))
     return {"added": True, "as": kind, "path": path, "state": state}
@@ -3724,7 +4207,7 @@ def _entry_from_body(fs, body):
     return entry
 
 def _export_one(fs, entry, out_dir, session, rel=None, dest=None,
-                manifest=True, stream=""):
+                manifest=True, stream="", snap=None):
     if dest:
         safe = os.path.abspath(os.path.expanduser(dest))
         out_dir = os.path.dirname(safe)
@@ -3760,7 +4243,7 @@ def _export_one(fs, entry, out_dir, session, rel=None, dest=None,
     session.case.log("export.item", {"path": entry.get("path"),
                                      "stream": stream or None,
                                      "dest": safe, "bytes": written,
-                                     "sha256": digest})
+                                     "sha256": digest, "snap": snap})
     rec = {"source": (entry.get("path") or entry.get("name"))
            + (":" + stream if stream else ""),
            "exported_to": os.path.relpath(safe, out_dir),
@@ -3771,7 +4254,8 @@ def _export_one(fs, entry, out_dir, session, rel=None, dest=None,
            "deleted": bool(entry.get("deleted")),
            "modified": entry.get("modified"),
            "exported_at": casedb_mod.utcnow(),
-           "examiner": session.case.examiner}
+           "examiner": session.case.examiner,
+           "snapshot": snap if snap is not None else ""}
     if manifest:
         _append_manifest(out_dir, rec, session)
     return rec, safe, written
@@ -3931,6 +4415,12 @@ def _carve_error(exc):
     say = _CARVE_ERRORS.get(exc.key, _CARVE_ERRORS["not_a_signature"])
     return say(*exc.args_)
 
+class _DiffSideError(ValueError):
+    """A /api/diff side cannot be resolved (no such snapshot)."""
+
+
+
+
 def _root_node(fs):
     root = getattr(fs, "root_node", None)
     if root is None:
@@ -4081,7 +4571,10 @@ class _Server(ThreadingHTTPServer):
         self.server_name = host
         self.server_port = port
 
-def serve(host="127.0.0.1", port=8722, image=None, examiner=None):
+def serve(host="127.0.0.1", port=8722, image=None, examiner=None,
+          read_only=False):
+    global READ_ONLY
+    READ_ONLY = bool(read_only)
     if image:
         SESSION.open(image, examiner=examiner)
     set_bound_address(host, port)

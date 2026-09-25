@@ -1,10 +1,16 @@
+import codecs
 import re
+import threading
+import unicodedata
+import zlib
 
 from . import filesearch
 from . import entropy as entropy_mod
 from . import officedoc as officedoc_mod
 
 MAX_TEXT_PER_FILE = 256 * 1024
+
+FULL_TEXT_PER_FILE = 8 << 20
 
 DEFAULT_READ_BYTES = 2 << 20
 
@@ -50,46 +56,170 @@ def extract_text(data, limit=MAX_TEXT_PER_FILE, min_run=MIN_RUN,
                  wide_ascii_only=False):
     out = []
     total = 0
-
-    run = bytearray()
-    for b in data:
-        if 32 <= b < 127:
-            run.append(b)
-            continue
-        if len(run.strip()) >= min_run:
-            out.append(run.decode("ascii"))
-            total += len(run)
-            if total >= limit:
-                return _WS.sub(" ", " ".join(out)).strip()[:limit]
-        run = bytearray()
-    if len(run.strip()) >= min_run:
-        out.append(run.decode("ascii"))
+    for run in _ascii_runs(data, min_run):
+        out.append(run)
         total += len(run)
-
-    if total < limit:
-        try:
-            wide = data.decode("utf-16-le", "ignore")
-        except Exception:
-            wide = ""
-        run = []
-        for ch in wide:
-            ok = (" " <= ch <= "~") if wide_ascii_only else (
-                ch == " " or (ch.isprintable() and not ch.isspace()))
-            if ok:
-                run.append(ch)
-                continue
-            s = "".join(run).strip()
-            if len(s) >= min_run:
-                out.append(s)
-                total += len(s)
-                if total >= limit:
-                    break
-            run = []
-        s = "".join(run).strip()
-        if len(s) >= min_run:
-            out.append(s)
-
+        if total >= limit:
+            return _WS.sub(" ", " ".join(out)).strip()[:limit]
+    for run in _wide_runs(data, min_run, wide_ascii_only):
+        out.append(run)
+        total += len(run)
+        if total >= limit:
+            break
     return _WS.sub(" ", " ".join(out)).strip()[:limit]
+
+# Text stored as UTF-16
+#
+# Any two bytes decode as some UTF-16 character, most of them printable, so
+# keeping every printable run filled the index with text that never existed:
+# binary, and text read one byte out of step, decode to plausible-looking
+# ideographs and syllables. The data is decoded at both byte alignments -- a
+# string can start on an odd byte -- and split wherever the script changes,
+# and a run in another script is kept only when it reads like text: long
+# enough, mostly unaccented if Latin, and for ideographs and Hangul not one of
+# the patterns binary and misaligned text leave. ASCII stored as UTF-16 is
+# kept as it always was, whatever surrounds it.
+
+_WIDE_ASCII = {}
+_ASCII_RE = {}
+_CLASSES = None
+_CLASSES_LOCK = threading.Lock()
+_EAST_ASIAN = frozenset(("CJK", "HIRAGANA", "KATAKANA", "BOPOMOFO",
+                         "IDEOGRAPHIC", "HALFWIDTH"))
+# A run: one script, with spaces, digits, punctuation and combining marks
+# inside it. Plain ASCII is left to its own pass, so a Latin run is only
+# looked for where an accented letter sits against another letter -- binary
+# is full of lone ones -- and is widened afterwards to take in the
+# unaccented letters before it. For any other script the pattern asks for
+# four of its letters, so what cannot be kept is never returned.
+_SCRIPT_RUN = re.compile(r"(?:(?<=a)l|l(?=[al]))[ald.m]*"
+                         r"|([^ald.mz#])(?=(?:[.dmz]*\1){3})(?:\1|[.dmz])*")
+
+def _ascii_runs(data, min_run):
+    pattern = _ASCII_RE.get(min_run)
+    if pattern is None:
+        pattern = _ASCII_RE[min_run] = re.compile(
+            rb"[\x20-\x7e]{%d,}" % min_run)
+    for m in pattern.finditer(data):
+        run = m.group().decode("ascii")
+        if len(run.strip()) >= min_run:
+            yield run
+
+def _big(cp):
+    return 0x3400 <= cp <= 0x9FFF or 0xAC00 <= cp <= 0xD7A3
+
+def _class_of(cp, scripts):
+    # One letter per character: "a" ASCII letter, "d" other printable ASCII,
+    # "m" combining mark, "." space, digit or punctuation from elsewhere,
+    # "z" (below), "l" accented Latin, "E" East Asian, "K" Hangul, a letter
+    # of its own for each other script, "#" anything that ends a run.
+    if 0xD800 <= cp <= 0xDFFF or cp == 0xFFFD:
+        return "#"
+    if cp & 0xFF == 0 and 0x20 <= cp >> 8 <= 0x7E:
+        # UTF-16 ASCII read one byte out of step decodes to nothing but
+        # these ("o" then a zero byte is U+6F00). They may sit inside a run
+        # of real text -- U+4E00 is the character for "one" -- but cannot
+        # start one, so a stretch made only of them is never considered.
+        return "z"
+    ch = chr(cp)
+    if 0x21 <= cp <= 0x7E:
+        return "a" if ch.isalpha() else "d"
+    cat = unicodedata.category(ch)
+    if cat[0] == "M":
+        # Devanagari and Thai vowels among them; they belong to the run.
+        return "m"
+    if ch.isspace() or cat[0] in "PNZ" or cat in ("Sm", "Sc", "Sk"):
+        return "." if (ch == " " or ch.isprintable()) else "#"
+    if not ch.isprintable() or cat[0] == "C" or cat == "So":
+        return "#"
+    word = unicodedata.name(ch, "?").split(" ")[0]
+    if word in _EAST_ASIAN:
+        return "E"
+    if word == "HANGUL":
+        return "K"
+    if word == "LATIN":
+        return "l"
+    got = scripts.get(word)
+    if got is None:
+        got = scripts[word] = chr(0x100 + len(scripts))
+    return got
+
+def _classes():
+    # Built on first use rather than at import: a pass over every BMP
+    # character, as translate tables so a whole string is classified, and
+    # a run judged, at C speed.
+    global _CLASSES
+    with _CLASSES_LOCK:
+        if _CLASSES is None:
+            scripts = {}
+            cls, facts = {}, {}
+            for cp in range(0x10000):
+                cls[cp] = _class_of(cp, scripts)
+                if _big(cp):
+                    # Three characters per ideograph or syllable: its high
+                    # byte, its low byte, and whether both are printable
+                    # ASCII. Anything else translates to nothing.
+                    hi, lo = cp >> 8, cp & 0xFF
+                    both = 0x20 <= lo <= 0x7E and 0x20 <= hi <= 0x7E
+                    facts[cp] = (chr(0x100 + hi) + chr(0x100 + lo)
+                                 + ("1" if both else "0"))
+                else:
+                    facts[cp] = None
+            _CLASSES = (str.maketrans(cls), str.maketrans(facts))
+        return _CLASSES
+
+def _crowded(s):
+    # Three in four sharing one value.
+    return len(s) >= 4 and max(map(s.count, set(s))) >= 0.75 * len(s)
+
+def _reads_as_text(text, cls, min_run, facts_t):
+    kind = cls[0]
+    if kind in "ald":
+        n = len(cls) - cls.count(".") - cls.count("m") - cls.count("z")
+        latin = cls.count("l")
+        # Real Latin text is mostly unaccented letters.
+        return n >= min_run and latin <= n - latin
+    if cls.count(kind) < min_run:
+        return False
+    if kind not in "EK":
+        return True
+    facts = text.translate(facts_t)
+    n = len(facts) // 3
+    if n < 4:
+        return True
+    # ASCII read one byte out of step: both bytes printable.
+    if facts[2::3].count("1") >= 0.6 * n:
+        return False
+    # Repeated binary, or UTF-16 text read out of step: nearly every
+    # ideograph or syllable sharing a byte. Kana are left out of this --
+    # they fit in one 256-character block, so real Japanese shares a high
+    # byte too.
+    return not (_crowded(facts[0::3]) or _crowded(facts[1::3]))
+
+def _wide_runs(data, min_run, ascii_only=False):
+    pattern = _WIDE_ASCII.get(min_run)
+    if pattern is None:
+        pattern = _WIDE_ASCII[min_run] = re.compile(
+            r"[\x20-\x7e]{%d,}" % min_run)
+    tables = None if ascii_only else _classes()
+    for align in (0, 1):
+        body = data[align:]
+        text = body[:len(body) & ~1].decode("utf-16-le", "replace")
+        for m in pattern.finditer(text):
+            run = m.group().strip()
+            if len(run) >= min_run:
+                yield run
+        if tables is None:
+            continue
+        cls = text.translate(tables[0])
+        for m in _SCRIPT_RUN.finditer(cls):
+            a, b = m.span()
+            if cls[a] == "l":
+                # Take in the unaccented letters of the word it starts in.
+                while a and cls[a - 1] == "a":
+                    a -= 1
+            if _reads_as_text(text[a:b], cls[a:b], min_run, tables[1]):
+                yield text[a:b].strip()
 
 RAW_CHUNK = 64 << 10
 
@@ -177,7 +307,6 @@ def build_usn(fs, case, part, live_names=None, progress=None, evidence=None,
             rows = []
     if rows:
         _flush(case, rows)
-    case.index.commit()
     if progress:
         progress(1.0)
     return {"present": True, "documents": len(docs), "records": stats["records"],
@@ -273,16 +402,16 @@ def build(fs, case, part, root_node, progress=None, want_live_names=False,
     if not getattr(case, "fts", False):
         return {"error": "This SQLite has no FTS5; indexed search is unavailable."}
 
-    case.index.execute(
-        "DELETE FROM content_index WHERE part = ? AND evidence = ?",
-        (part, str(evidence if evidence is not None else "")))
-    case.index.commit()
+    case.index_remove("part = ? AND evidence = ?",
+                      (part, str(evidence if evidence is not None else "")))
 
     walk = {}
     live_names = {} if want_live_names else None
     rows = []
+    if not max_text:
+        max_text = FULL_TEXT_PER_FILE
     counts = {"candidates": 0, "indexed": 0, "read_total": 0,
-             "with_exif": 0, "structured": 0}
+             "with_exif": 0, "structured": 0, "text_capped": 0}
     skip = {"empty": 0, "unreadable": 0, "no_text": 0}
     evidence_key = str(evidence if evidence is not None else "")
 
@@ -323,19 +452,18 @@ def build(fs, case, part, root_node, progress=None, want_live_names=False,
         body = structured_text(data, e.get("name") or "")
         if body:
             counts["structured"] += 1
-            if max_text:
-                body = body[:max_text]
+            body = body[:max_text]
         else:
-            body = extract_text(data, max_text if max_text else len(data))
+            body = extract_text(data, max_text)
         meta = image_metadata_text(data)
         if meta:
             counts["with_exif"] += 1
-            body = (meta + " " + (body or "")).strip()
-            if max_text:
-                body = body[:max_text]
+            body = (meta + " " + (body or "")).strip()[:max_text]
         if not body:
             skip["no_text"] += 1
             return
+        if len(body) >= max_text:
+            counts["text_capped"] += 1
         node = (e.get("mft") if e.get("mft") is not None
                 else e.get("inode") if e.get("inode") is not None
                 else e.get("oid") if e.get("oid") is not None
@@ -365,16 +493,21 @@ def build(fs, case, part, root_node, progress=None, want_live_names=False,
            "bytes_read": counts["read_total"],
            "structured": counts["structured"],
            "with_exif": counts["with_exif"],
+           "text_capped": counts["text_capped"],
+           "text_cap": max_text,
            "walk_truncated": bool(walk.get("truncated"))}
     if want_live_names:
         out["live_names"] = live_names
     return out
 
 def _flush(case, rows):
-    case.index.executemany(
-        "INSERT INTO content_index (name,path,body,node,part,size,deleted,"
-        "modified,abs_offset,kind,evidence) VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
-    case.index.commit()
+    case.index_add(list(rows))
+
+def _documents(case):
+    # Where one row per indexed document can be counted: content_docs for a
+    # compressed index, without going through FTS5 at all.
+    fn = getattr(case, "index_documents", None)
+    return fn() if fn else "content_index"
 
 def _scope(part, evidence):
     if part is None:
@@ -389,7 +522,8 @@ def status(case, part=None, evidence=None):
     try:
         where, args = _scope(part, evidence)
         n = case.index.execute(
-            "SELECT COUNT(*) c FROM content_index" + where, args).fetchone()["c"]
+            "SELECT COUNT(*) c FROM " + _documents(case) + where,
+            args).fetchone()["c"]
     except Exception:
         return {"available": True, "built": False, "documents": 0}
     out = {"available": True, "built": n > 0, "documents": n}
@@ -401,7 +535,7 @@ def coverage(case, part=None, evidence=None):
            "usn_documents": 0}
     try:
         where, args = _scope(part, evidence)
-        sql = ("SELECT kind, COUNT(*) c FROM content_index" + where
+        sql = ("SELECT kind, COUNT(*) c FROM " + _documents(case) + where
                + " GROUP BY kind")
         rows = case.index.execute(sql, args)
         for r in rows:
@@ -440,23 +574,12 @@ def query(case, terms, part=None, mode="any", limit=1000, snippet=True,
     if not expr:
         return {"hits": [], "indexed_documents": st["documents"]}
 
-    cols = ("name, path, node, part, size, deleted, modified, abs_offset, "
-            "kind, evidence")
-    sn = ("snippet(content_index, 2, '', '', '…', 12)" if snippet else "''")
-    sql = ("SELECT %s, %s AS ctx FROM content_index "
-           "WHERE content_index MATCH ?" % (cols, sn))
-    args = [expr]
-    if part is not None:
-        sql += " AND part = ?"
-        args.append(part)
-        if evidence is not None:
-            sql += " AND evidence = ?"
-            args.append(str(evidence))
-    sql += " ORDER BY rank LIMIT ?"
-    args.append(limit)
-
     try:
-        rows = case.index.execute(sql, args).fetchall()
+        if getattr(case, "index_layout", None) == "compressed":
+            rows = _compressed_hits(case, expr, terms, part, evidence, limit,
+                                    snippet)
+        else:
+            rows = _plain_hits(case, expr, part, evidence, limit, snippet)
     except Exception as exc:
         return {"error": "Index query failed: %s" % exc}
 
@@ -480,6 +603,135 @@ def query(case, terms, part=None, mode="any", limit=1000, snippet=True,
     return {"hits": hits, "indexed_documents": st["documents"],
             "truncated": len(hits) >= limit,
             "coverage": _coverage_note(st, len(hits))}
+
+_COLS = ("name", "path", "node", "part", "size", "deleted", "modified",
+         "abs_offset", "kind", "evidence")
+
+def _plain_hits(case, expr, part, evidence, limit, snippet):
+    sn = ("snippet(content_index, 2, '', '', '…', 12)" if snippet else "''")
+    sql = ("SELECT %s, %s AS ctx FROM content_index "
+           "WHERE content_index MATCH ?" % (", ".join(_COLS), sn))
+    args = [expr]
+    if part is not None:
+        sql += " AND part = ?"
+        args.append(part)
+        if evidence is not None:
+            sql += " AND evidence = ?"
+            args.append(str(evidence))
+    sql += " ORDER BY rank LIMIT ?"
+    args.append(limit)
+    return case.index.execute(sql, args).fetchall()
+
+def _compressed_hits(case, expr, terms, part, evidence, limit, snippet):
+    # Ranking needs only FTS5's own index, and the scope columns are plain
+    # columns of content_docs, so the hit list is found without reading any
+    # document's text. Text is then read only for the hits being returned,
+    # and only as far as the snippet needs.
+    sql = ("SELECT f.rowid AS id, %s%s FROM content_index f "
+           "JOIN content_docs d ON d.id = f.rowid "
+           "WHERE content_index MATCH ?"
+           % (", ".join("d." + c for c in _COLS),
+              ", d.body AS blob" if snippet else ""))
+    args = [expr]
+    if part is not None:
+        sql += " AND d.part = ?"
+        args.append(part)
+        if evidence is not None:
+            sql += " AND d.evidence = ?"
+            args.append(str(evidence))
+    sql += " ORDER BY f.rank LIMIT ?"
+    args.append(limit)
+    rows = case.index.execute(sql, args).fetchall()
+    rx = _term_pattern(terms) if snippet else None
+    out = []
+    for r in rows:
+        hit = {c: r[c] for c in _COLS}
+        hit["ctx"] = ""
+        if snippet:
+            hit["ctx"] = _snippet(case, expr, rx, r)
+        out.append(hit)
+    return out
+
+SNIPPET_TOKENS = 12
+_SNIPPET_CHUNK = 64 << 10
+_SNIPPET_REACH = 600
+# unicode61's token characters are letters and digits; underscore and
+# everything else separate tokens.
+_TOKEN = re.compile(r"[^\W_]+")
+
+def _term_pattern(terms):
+    alts = []
+    for t in terms:
+        words = _TOKEN.findall(t or "")
+        if words:
+            alts.append(r"(?<![^\W_])" + r"[\W_]+".join(map(re.escape, words))
+                        + r"(?![^\W_])")
+    return re.compile("|".join(alts), re.IGNORECASE) if alts else None
+
+def _window(text, start, end, at_end):
+    before = list(_TOKEN.finditer(text, max(0, start - _SNIPPET_REACH), start))
+    after = list(_TOKEN.finditer(text, end, min(len(text),
+                                                end + _SNIPPET_REACH)))
+    want = SNIPPET_TOKENS - 1
+    take_before = min(len(before), want // 2)
+    take_after = min(len(after), want - take_before)
+    take_before = min(len(before), want - take_after)
+    a = before[-take_before].start() if take_before else start
+    b = after[take_after - 1].end() if take_after else end
+    return (("" if a == 0 else "…") + text[a:b]
+            + ("" if at_end and b >= len(text.rstrip()) else "…"))
+
+def _opening(blob):
+    text = zlib.decompressobj().decompress(blob[:_SNIPPET_CHUNK])
+    text = text.decode("utf-8", "ignore")
+    words = list(_TOKEN.finditer(text))
+    if not words:
+        return text[:200]
+    end = words[min(len(words), SNIPPET_TOKENS) - 1].end()
+    more = end < len(text.rstrip()) or len(blob) > _SNIPPET_CHUNK
+    return text[:end] + ("…" if more else "")
+
+def _find_passage(blob, rx):
+    z = zlib.decompressobj()
+    dec = codecs.getincrementaldecoder("utf-8")("ignore")
+    text, scanned = "", 0
+    pos, n = 0, len(blob)
+    while pos < n or not z.eof:
+        chunk = blob[pos:pos + _SNIPPET_CHUNK]
+        pos += len(chunk)
+        text += dec.decode(z.decompress(chunk) if chunk else z.flush(),
+                           final=pos >= n)
+        m = rx.search(text, max(0, scanned - _SNIPPET_REACH))
+        if m:
+            # Read a little further so the passage can run on past the hit.
+            while pos < n and len(text) - m.end() < _SNIPPET_REACH:
+                chunk = blob[pos:pos + _SNIPPET_CHUNK]
+                pos += len(chunk)
+                text += dec.decode(z.decompress(chunk), final=pos >= n)
+            return _window(text, m.start(), m.end(), pos >= n)
+        scanned = len(text)
+        if not chunk:
+            break
+    return None
+
+def _snippet(case, expr, rx, row):
+    blob = row["blob"]
+    if not blob:
+        return ""
+    if rx is not None:
+        found = _find_passage(blob, rx)
+        if found is not None:
+            return found
+        where = "%s %s" % (row["name"] or "", row["path"] or "")
+        if rx.search(where):
+            # The match is in the name or path, not the text. FTS5 shows the
+            # text's opening words then, and so does this.
+            return _opening(blob)
+    got = case.index.execute(
+        "SELECT snippet(content_index, 2, '', '', '…', 12) FROM content_index "
+        "WHERE content_index MATCH ? AND rowid = ?",
+        (expr, row["id"])).fetchone()
+    return got[0] if got else ""
 
 def _coverage_note(st, found):
     note = dict(st)
@@ -515,12 +767,9 @@ def clear(case, part=None, evidence=None):
     if not getattr(case, "fts", False):
         return 0
     if part is None:
-        case.index.execute("DELETE FROM content_index")
+        case.index_remove()
     elif evidence is None:
-        case.index.execute("DELETE FROM content_index WHERE part=?", (part,))
+        case.index_remove("part=?", (part,))
     else:
-        case.index.execute(
-            "DELETE FROM content_index WHERE part=? AND evidence=?",
-            (part, str(evidence)))
-    case.index.commit()
+        case.index_remove("part=? AND evidence=?", (part, str(evidence)))
     return 1

@@ -453,3 +453,77 @@ def build_ext4_extent_loop():
                                   extent_area([extent_index(0, loop)], 1),
                                   FL_EXTENTS))
     return img.to_bytes()
+
+
+def xattr_entries_area(entries, value_base):
+    """The entry array + zero terminator + values for an
+    ext4_xattr_entry list (see engine.fs.ext4._xattr_entries):
+    `entries` is [(name_index, name_bytes, value_bytes), ...].
+    `value_base` is what e_value_offs is measured from -- 0 for an
+    in-inode list (offsets count from right after the ibody magic) or 32
+    for an external block (offsets count from the start of the block,
+    i.e. past its own 32-byte header)."""
+    padded = [(index, name, value, (-(16 + len(name))) % 4)
+              for index, name, value in entries]
+    entries_len = sum(16 + len(name) + pad for _, name, _, pad in padded)
+    cursor = value_base + entries_len + 4
+    out_entries = bytearray()
+    out_values = bytearray()
+    for index, name, value, pad in padded:
+        out_entries += struct.pack("<BBHIII", len(name), index, cursor, 0,
+                                   len(value), 0) + name + bytes(pad)
+        vpad = (-len(value)) % 4
+        out_values += value + bytes(vpad)
+        cursor += len(value) + vpad
+    return bytes(out_entries) + bytes(4) + bytes(out_values)
+
+
+def inline_xattr_multi(entries):
+    """In-inode xattr area carrying several entries (see inline_data_xattr
+    for the original single-entry version this generalises)."""
+    return struct.pack("<I", 0xEA020000) + xattr_entries_area(entries, 0)
+
+
+def xattr_block(entries):
+    """A whole external xattr block (ext4_xattr_header + entries), for an
+    inode whose i_file_acl points at it."""
+    header = struct.pack("<IIII", 0xEA020000, 1, 1, 0) + bytes(16)
+    return (header + xattr_entries_area(entries, 32)).ljust(BLOCK_SIZE,
+                                                             b"\x00")
+
+
+INO_XATTR_INLINE = 12
+INO_XATTR_BLOCK = 13
+
+
+def build_ext4_xattrs():
+    """root dir, an inode with several in-inode extended attributes
+    ("xattrs.txt", inode 12), and an inode whose attributes live in an
+    external block via i_file_acl ("xattrs-ext.txt", inode 13, block
+    xattr holding "trusted.origin")."""
+    img = Ext4Image(blocks=64)
+    img.superblock(INCOMPAT_FILETYPE | INCOMPAT_EXTENTS, 0, journal_inum=0)
+
+    inline_raw = bytearray(inode_bytes(
+        S_IFREG | 0o644, 0, b"", xattr=inline_xattr_multi([
+            (1, b"comment", b"hello world"),
+            (6, b"selinux", b"unconfined_u"),
+        ])))
+    img.set_inode(INO_XATTR_INLINE, bytes(inline_raw))
+
+    block = img.alloc()
+    img.write_block(block, xattr_block([(4, b"origin", b"remote-server")]))
+    ext_raw = bytearray(inode_bytes(S_IFREG | 0o644, 0, b""))
+    struct.pack_into("<I", ext_raw, 104, block)         # i_file_acl_lo
+    img.set_inode(INO_XATTR_BLOCK, bytes(ext_raw))
+
+    root = img.alloc()
+    img.write_block(root, dir_block([
+        (2, ".", 2), (2, "..", 2),
+        (INO_XATTR_INLINE, "xattrs.txt", 1),
+        (INO_XATTR_BLOCK, "xattrs-ext.txt", 1),
+    ]))
+    img.set_inode(2, inode_bytes(S_IFDIR | 0o755, BLOCK_SIZE,
+                                 struct.pack("<15I", root, *([0] * 14)),
+                                 links=2))
+    return img.to_bytes()

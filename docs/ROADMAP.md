@@ -30,10 +30,15 @@ recognised and refused by name today; these entries are about *reading* it.
 - [ ] **Ex01 / Lx01** (EWF v2) — detected and refused. Same lineage as the
       E01 already read, with a different header and compression framing.
       Cheapest real win of the set.
-- [~] **Split raw sets** (`.001`, `.002`, …) — joined into one exhibit, with
-      a finding for a missing or wrongly sized piece. Tested only on
-      synthetic sets so far; check against sets written by FTK Imager, `dd`
-      with `split`, and Guymager.
+- [~] **Split raw sets** (`.001`, `.0000`, `.aa`, …) — the set shapes real
+      acquisition tools write are joined into one exhibit: FTK Imager's
+      three-digit `.001`, Guymager's zero-based numbering at whatever width
+      the disk needs, and `dd` with `split`, both its default alphabetic
+      suffixes and `-d` numeric ones. A missing, wrongly sized or mixed-width
+      piece raises a finding naming the piece in the set's own numbering.
+      Verified against genuine `split` and `dd` output; FTK Imager and
+      Guymager naming was reconstructed from their documentation and source,
+      so sets written by those tools themselves still need checking.
 - [ ] **VHD** (the older `conectix` format, not VHDX) — a fixed VHD is raw
       with a footer appended and nearly free; dynamic and differencing disks
       need their own block allocation table.
@@ -45,26 +50,26 @@ recognised and refused by name today; these entries are about *reading* it.
 
 ### Shadow copies
 
-- [ ] **Read a Volume Shadow Copy.** Snapshots are found and listed today, but
-      none can be opened. Reading one means a block-redirect overlay over the
-      volume, then browsing its tree as a filesystem in its own right, plus
-      the differential-area store types.
+- [~] **Read a Volume Shadow Copy.** Snapshots are found and listed, and a
+      snapshot can now be opened: a block-redirect overlay over the volume plus
+      the differential-area store types let Strata browse a snapshot's tree as a
+      filesystem in its own right. Tested on synthetic images only so far.
 
 ### Filesystems
 
 - [ ] **HFS** (the original, not HFS+), `com.apple.decmpfs` compressed files,
       and hard links through the private metadata directory.
-- [ ] **APFS snapshots** — the superblock's snapshot metadata is located but
-      snapshots are not listed or read.
-- [ ] **ext4 extended attributes** — only the in-inode `system.data`
-      attribute that holds inline data is read; the rest (in-inode and
-      external xattr blocks) are not shown.
+- [~] **APFS snapshots** — snapshots are listed and can be opened as a
+      read-only view of the volume. Tested on synthetic images only so far.
 
 ### Encryption
 
-- [ ] **BitLocker startup keys (`.BEK`) and clear-key volumes.** Both protector
-      types are recognised, but unlocking only accepts a password or a
-      recovery key, so neither can be used yet.
+- [ ] **BitLocker startup keys (`.BEK`) and clear-key volumes** — implemented
+      and verified against synthetic FVE volumes built to the published
+      format spec (including cross-checking the protector-type values
+      against an independent tool); a real `.BEK` file and a real
+      clear-key volume from actual Windows-run BitLocker still need to be
+      confirmed before this can be called done.
 - [ ] **BitLocker with the Elephant diffuser** — Vista and Windows 7 volumes
       are identified and refused rather than decrypted wrongly.
 - [ ] **LUKS2 with Argon2 against real cryptsetup images** — implemented and
@@ -80,14 +85,18 @@ recognised and refused by name today; these entries are about *reading* it.
 - [ ] **`$LogFile`** — the log NTFS keeps for crash recovery. A different
       structure from `$UsnJrnl` and a much shorter window, but it records the
       operations rather than a summary per file.
-- [ ] **Browser disk cache** — the on-disk cache format, separate from the
-      history databases already read.
+- [~] **Browser disk cache** — Chromium Simple Cache and Firefox cache2
+      entries are read (URL, status, content type, times, fetch count),
+      separate from the history databases. The Chromium blockfile cache and
+      index are recognised and counted, not parsed. Tested on synthetic
+      entries only so far.
 - [ ] **Event ID descriptions**, and timelining across logs.
 - [ ] **PST:** ANSI (32-bit) files are refused today; OST-specific
       structures are not handled.
-- [ ] **Legacy Office body text** — Word's piece table, Excel's BIFF stream,
-      PowerPoint's records. Properties are read; the body is deliberately left
-      unread rather than guessed at.
+- [~] **Legacy Office body text** — Word's piece table, Excel's BIFF stream
+      and PowerPoint's records are decoded, and whatever cannot be proven from
+      the file is a finding rather than a guess. Tested on synthetic files
+      only so far.
 
 ---
 
@@ -150,8 +159,15 @@ Agreeing with another tool is agreement, not verification.
 
 ## Analysis
 
-- [ ] Fuzzy hashing (ssdeep-style) and image similarity.
-- [ ] Carving across fragments, starting with bi-fragment gap carving.
+- [ ] Image similarity (perceptual hashing) -- needs pixel-level image
+      decoding this codebase does not otherwise have a reason to carry, so
+      it is scoped separately from fuzzy hashing (done).
+- [ ] Carving across fragments beyond the first slice: a gap that is not a
+      currently-allocated extent (both fragments sit in unallocated space,
+      with unrelated deleted data between them), sizer-only (no-footer)
+      signatures, and three or more fragments. The first slice --
+      footer-terminated types split around exactly one allocated gap -- is
+      done.
 - [ ] A map view for GPS coordinates.
 
 ---
@@ -160,16 +176,11 @@ Agreeing with another tool is agreement, not verification.
 
 - [ ] Configurable columns in the folder view, and the filter controls search
       already has (both can share `filesearch.matches_filters`).
-- [ ] Read-only mode that refuses export and report writing.
-- [ ] Ask before re-running an artefact replaces its earlier result — fine on a
-      first pass, wrong once someone has worked from the earlier output.
-- [ ] Cheap artefact *presence* checks that could honestly run on open — is
-      there a Recycle Bin with content, a browser profile, a prefetch folder —
-      as counts rather than parses.
+- [x] Read-only mode that refuses export and report writing.
 - [ ] Template editor, so an examiner can define a structure without Python.
       The templates in `engine/structure.py` are already declarative enough to
       make this mostly an interface problem.
-- [ ] Diff two images, or two snapshots of one volume.
+- [x] Diff two images, or two snapshots of one volume.
 - [ ] Scripting or plugin API for custom parsers.
 - [ ] Multi-examiner case notes with attribution.
 - [~] Localisation — the interface and engine messages already load from
@@ -179,10 +190,10 @@ Agreeing with another tool is agreement, not verification.
 
 ## Performance and debt
 
-- [ ] Gallery thumbnails load the full-size image for every picture.
-- [ ] Tagged items are keyed on the filesystem handle (MFT record / inode):
-      stable within an image, but a tag will not follow the same volume
-      re-acquired into another image.
+- [x] Tagged items are keyed on the filesystem handle (MFT record / inode),
+      which is stable only within an image; tags now follow the same volume
+      re-acquired into another image, matched on the filesystem's own
+      identifier.
 
 ---
 

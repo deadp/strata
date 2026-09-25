@@ -1,3 +1,106 @@
+def _node_of(e):
+    return (e.get("mft") if e.get("mft") is not None
+            else e.get("inode") if e.get("inode") is not None
+            else e.get("oid") if e.get("oid") is not None
+            else e.get("start_cluster"))
+
+def _safe_listdir(fs, node, path):
+    try:
+        return fs.listdir(node, path)
+    except Exception:
+        return []
+
+def _find_dir(fs, root, *names):
+    """Walks a fixed chain of case-insensitive directory names from root,
+    one listdir() per level -- the "one directory read" an instant
+    presence check is allowed, not a walk of the tree. Returns
+    (node, path) for the last name found, or (None, None) as soon as one
+    is missing."""
+    node, path = root, "/"
+    for name in names:
+        low = name.lower()
+        found = next((e for e in _safe_listdir(fs, node, path)
+                     if e.get("is_dir") and (e.get("name") or "").lower() == low),
+                    None)
+        if found is None:
+            return None, None
+        node = _node_of(found)
+        path = path.rstrip("/") + "/" + found["name"]
+    return node, path
+
+def presence_recyclebin(fs, root):
+    """A count of distinct deleted items under $Recycle.Bin (or its
+    legacy names), without reading a single $I/$R file's content."""
+    node = path = None
+    for name in ("$Recycle.Bin", "RECYCLER", "RECYCLED"):
+        node, path = _find_dir(fs, root, name)
+        if node is not None:
+            break
+    if node is None:
+        return {"found": False, "count": 0}
+    keys = set()
+    for sid in _safe_listdir(fs, node, path):
+        if not sid.get("is_dir"):
+            continue
+        sid_path = path.rstrip("/") + "/" + sid["name"]
+        for e in _safe_listdir(fs, _node_of(sid), sid_path):
+            nm = e.get("name") or ""
+            if len(nm) > 2 and nm[0] == "$" and nm[1] in "IiRr":
+                keys.add((sid["name"], nm[2:]))
+    return {"found": bool(keys), "count": len(keys)}
+
+def presence_prefetch(fs, root):
+    """A count of .pf files in the default Windows\\Prefetch location --
+    not the recursive whole-volume search the real prefetch artefact
+    does, so a relocated prefetch folder will not be counted here."""
+    node, path = _find_dir(fs, root, "Windows", "Prefetch")
+    if node is None:
+        return {"found": False, "count": 0}
+    count = sum(1 for e in _safe_listdir(fs, node, path)
+               if not e.get("is_dir") and (e.get("name") or "").lower()
+               .endswith(".pf"))
+    return {"found": count > 0, "count": count}
+
+BROWSER_PROFILE_PATHS = (
+    ("AppData", "Local", "Google", "Chrome", "User Data"),
+    ("AppData", "Local", "Microsoft", "Edge", "User Data"),
+    ("AppData", "Local", "BraveSoftware", "Brave-Browser", "User Data"),
+    ("AppData", "Roaming", "Mozilla", "Firefox", "Profiles"),
+)
+
+_NON_USER_DIRS = ("public", "default", "default user", "all users")
+
+def presence_browser(fs, root):
+    """Which local user profiles have a known browser's data folder --
+    existence only, not the schema-matching walk the real browser
+    artefact does to find every history database."""
+    users_node, users_path = _find_dir(fs, root, "Users")
+    if users_node is None:
+        return {"found": False, "profiles": []}
+    profiles = []
+    for u in _safe_listdir(fs, users_node, users_path):
+        if not u.get("is_dir") or (u.get("name") or "").lower() in _NON_USER_DIRS:
+            continue
+        for segs in BROWSER_PROFILE_PATHS:
+            node, path = _find_dir(fs, _node_of(u), *segs)
+            if node is not None:
+                profiles.append({"user": u["name"], "browser": segs[-2],
+                                 "path": path})
+    return {"found": bool(profiles), "profiles": profiles}
+
+def presence(fs, root):
+    """Instant, non-recursive presence checks -- one or two directory
+    reads each -- for artefacts an examiner would otherwise only find out
+    about by running the real (recursive or parsing) thing. A count or
+    "found" here is a reason to run the real artefact, not a substitute
+    for it: a relocated prefetch folder or an unrecognised browser still
+    needs the real scan to be found."""
+    return {
+        "recyclebin": presence_recyclebin(fs, root),
+        "prefetch": presence_prefetch(fs, root),
+        "browser": presence_browser(fs, root),
+    }
+
 INSTANT, QUICK, MINUTES, LONG = "instant", "quick", "minutes", "long"
 
 COST_ORDER = {INSTANT: 0, QUICK: 1, MINUTES: 2, LONG: 3}
