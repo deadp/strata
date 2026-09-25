@@ -85,8 +85,6 @@ def parse_simple_entry(data):
     if len(data) < _SIMPLE_HDR.size:
         return None
     _, version, key_length, _, _ = _SIMPLE_HDR.unpack_from(data, 0)
-    if SIMPLE_INITIAL_MAGIC != SIMPLE_INITIAL_MAGIC & 0 or version == 0:
-        pass  # magic checked below via unpack; version 0 means garbage
     magic = struct.unpack_from("<Q", data, 0)[0]
     if magic != SIMPLE_INITIAL_MAGIC:
         return None

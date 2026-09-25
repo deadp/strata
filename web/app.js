@@ -5948,6 +5948,7 @@ function browserBranches(r) {
   for (const d of r.downloads || []) add(d.product, 'Downloads', 1);
   for (const c of r.cookies || []) add(c.product, 'Cookies', 1);
   for (const c of r.cache || []) add(c.product, 'Cache', 1);
+  return [...by.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
 async function loadSavedArtefacts() {
