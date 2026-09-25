@@ -165,9 +165,10 @@ def build_doc(pieces=None, corrupt_clx=False, drop_pcdt=False,
         nchars = len(blob) // 2 if not comp else len(blob)
         cps.append(cps[-1] + nchars)
         # PCD FcCompressed: bit 30 = fCompressed, bits 0-29 = fc. A
-        # compressed piece stores its *byte* offset halved (the reader
-        # computes fc >> 1); an uncompressed piece stores the raw offset.
-        fc = off >> 1 if comp else off
+        # compressed piece stores twice its byte offset ([MS-DOC]
+        # FcCompressed: the text starts at fc/2); an uncompressed piece
+        # stores the raw offset.
+        fc = off << 1 if comp else off
         if comp:
             fc |= 0x40000000
         pcds.append(struct.pack("<HI", 0, fc) + struct.pack("<H", 0))

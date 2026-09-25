@@ -518,7 +518,7 @@ def _word_body(worddoc, table, findings, label):
         comp = bool(fc & 0x40000000)
         off = fc & 0x3FFFFFFF
         if comp:
-            off <<= 1
+            off >>= 1
         end = off + span * (2 if not comp else 1)
         if off < 0 or end > len(worddoc) or off > end:
             findings.append("%s: piece %d points outside the "
@@ -562,7 +562,7 @@ def _rk_value(rk):
         if v & 0x20000000:
             v -= 0x40000000
         return v / div
-    bits = struct.pack("<I", rk & 0xFFFFFFFC) + b"\x00" * 4
+    bits = b"\x00" * 4 + struct.pack("<I", rk & 0xFFFFFFFC)
     return struct.unpack("<d", bits)[0] / div
 
 def _xls_number_text(v):

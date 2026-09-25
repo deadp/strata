@@ -38,6 +38,37 @@ records, not how the code changed.
   just because its MFT records moved. Snapshot reads come straight from
   the shadow-copy store, layered over the live volume
   ([#74](https://github.com/switch-nz/strata/issues/74)).
+- **Word documents in the legacy binary .doc format now yield their body
+  text instead of nothing.** A .doc is a compound file whose text lives
+  in the piece table named by the File Information Block, and until now
+  Strata offered no text from it rather than text that might be wrong.
+  The text is now decoded by following compressed (8-bit) and UTF-16
+  pieces in document order, with carriage returns, form feeds and
+  paragraph marks mapped to newlines. Whatever cannot be proven from the
+  file is reported as a finding with the reason, and only text the
+  format itself supports is offered
+  ([#62](https://github.com/switch-nz/strata/issues/62)).
+
+- **Excel workbooks in the legacy binary .xls format now yield their body
+  text instead of nothing.** An .xls is a compound file whose text lives
+  in the BIFF record stream, and until now Strata offered no text from
+  it rather than text that might be wrong. The text is now decoded from
+  the shared-string table and each sheet's cell records, laid out per
+  sheet as the application shows them. Whatever cannot be proven from
+  the file is reported as a finding with the reason, and only text the
+  format itself supports is offered
+  ([#62](https://github.com/switch-nz/strata/issues/62)).
+
+- **PowerPoint presentations in the legacy binary .ppt format now yield
+  their body text instead of nothing.** A .ppt is a compound file whose
+  text lives in the slide records, and until now Strata offered no text
+  from it rather than text that might be wrong. The text is now decoded
+  via the Current User stream's edit history and the persist directory
+  it points at, reading the newest edit of each slide so superseded text
+  is not presented alongside the final one. Whatever cannot be proven
+  from the file is reported as a finding with the reason, and only text
+  the format itself supports is offered
+  ([#62](https://github.com/switch-nz/strata/issues/62)).
 
 ## [0.4.0] - 2026-09-24
 
@@ -229,38 +260,6 @@ Upgrade from 0.2.0.
   footer to leave room for it, are left as before, unsplit
   ([#66](https://github.com/switch-nz/strata/issues/66), two-fragment
   gap carving of footer-terminated types only).
-
-- **Word documents in the legacy binary .doc format now yield their body
-  text instead of nothing.** A .doc is a compound file whose text lives
-  in the piece table named by the File Information Block, and until now
-  Strata offered no text from it rather than text that might be wrong.
-  The text is now decoded by following compressed (8-bit) and UTF-16
-  pieces in document order, with carriage returns, form feeds and
-  paragraph marks mapped to newlines. Whatever cannot be proven from the
-  file is reported as a finding with the reason, and only text the
-  format itself supports is offered
-  ([#62](https://github.com/switch-nz/strata/issues/62)).
-
-- **Excel workbooks in the legacy binary .xls format now yield their body
-  text instead of nothing.** An .xls is a compound file whose text lives
-  in the BIFF record stream, and until now Strata offered no text from
-  it rather than text that might be wrong. The text is now decoded from
-  the shared-string table and each sheet's cell records, laid out per
-  sheet as the application shows them. Whatever cannot be proven from
-  the file is reported as a finding with the reason, and only text the
-  format itself supports is offered
-  ([#62](https://github.com/switch-nz/strata/issues/62)).
-
-- **PowerPoint presentations in the legacy binary .ppt format now yield
-  their body text instead of nothing.** A .ppt is a compound file whose
-  text lives in the slide records, and until now Strata offered no text
-  from it rather than text that might be wrong. The text is now decoded
-  via the Current User stream's edit history and the persist directory
-  it points at, reading the newest edit of each slide so superseded text
-  is not presented alongside the final one. Whatever cannot be proven
-  from the file is reported as a finding with the reason, and only text
-  the format itself supports is offered
-  ([#62](https://github.com/switch-nz/strata/issues/62)).
 
 ## [0.2.0] - 2026-09-19
 

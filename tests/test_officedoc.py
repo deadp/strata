@@ -123,6 +123,40 @@ class WordPieceTable(unittest.TestCase):
                           "no text was read."])
 
 
+class WordSpecOffsets(unittest.TestCase):
+    """The piece table is written by Word, not by our fixture builder, so
+    these build the stream straight from [MS-DOC] rather than through
+    imagebuild_office: a reader and a fixture can agree with each other
+    and both be wrong."""
+
+    @staticmethod
+    def _doc(fc, cps, text_at, text):
+        worddoc = bytearray(0x800)
+        struct.pack_into("<H", worddoc, 0, 0xA5EC)
+        worddoc[text_at:text_at + len(text)] = text
+        plc = struct.pack("<%dI" % len(cps), *cps)             + struct.pack("<HIH", 0, fc, 0)
+        clx = b"" + struct.pack("<I", len(plc)) + plc
+        struct.pack_into("<II", worddoc, 0x01A2, 0, len(clx))
+        return bytes(worddoc), clx
+
+    def test_compressed_piece_starts_at_half_its_fc(self):
+        # FcCompressed: with fCompressed set the text starts at fc / 2.
+        worddoc, clx = self._doc(0x40000000 | (0x200 << 1), (0, 5),
+                                 0x200, b"Hello")
+        findings = []
+        self.assertEqual(officedoc._word_body(worddoc, clx, findings, "w"),
+                         "Hello")
+        self.assertEqual(findings, [])
+
+    def test_uncompressed_piece_starts_at_its_fc(self):
+        worddoc, clx = self._doc(0x200, (0, 2), 0x200,
+                                 "Hi".encode("utf-16-le"))
+        findings = []
+        self.assertEqual(officedoc._word_body(worddoc, clx, findings, "w"),
+                         "Hi")
+        self.assertEqual(findings, [])
+
+
 class XlsCellRecords(unittest.TestCase):
     """Text via the SST and per-sheet BIFF8 cell records ([MS-XLS])."""
 
@@ -215,6 +249,34 @@ class XlsCellRecords(unittest.TestCase):
         self.assertEqual(res["findings"],
                          ["Excel workbook (legacy .xls): sheet 0 does not "
                           "start at a BOF record; it was skipped."])
+
+
+class XlsRkNumbers(unittest.TestCase):
+    """RK numbers ([MS-XLS] 2.5.122). Excel's default numeric encoding, so
+    the non-integer branch matters as much as the integer one."""
+
+    def test_float_rk_is_the_top_half_of_a_double(self):
+        # 3.5 is 0x400C000000000000; the RK keeps 0x400C0000.
+        self.assertEqual(officedoc._rk_value(0x400C0000), 3.5)
+
+    def test_float_rk_with_the_divide_by_100_flag(self):
+        # 314.0 is 0x4073A00000000000; flag bit 0 divides by 100.
+        self.assertEqual(officedoc._rk_value(0x4073A000 | 0x01), 3.14)
+
+    def test_integer_rk_signed_and_scaled(self):
+        self.assertEqual(officedoc._rk_value((42 << 2) | 0x02), 42)
+        self.assertEqual(officedoc._rk_value(((-5 & 0x3FFFFFFF) << 2) | 0x02),
+                         -5)
+        self.assertEqual(officedoc._rk_value((314 << 2) | 0x03), 3.14)
+
+    def test_rk_and_mulrk_cells_reach_the_text(self):
+        sheets = [("R", [("rk", 0, 0, 0x400C0000),
+                         ("rk", 0, 1, (42 << 2) | 0x02),
+                         ("mulrk", 1, 0, [0x4073A000 | 0x01,
+                                          (7 << 2) | 0x02])])]
+        res = parse(ib.build_xls(sheets), "t.xls")
+        self.assertEqual(res["text"], "R\n3.5\t42\n3.14\t7")
+        self.assertEqual(res["findings"], [])
 
 
 class PptSlideText(unittest.TestCase):
