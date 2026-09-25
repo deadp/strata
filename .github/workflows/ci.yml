@@ -128,13 +128,22 @@ jobs:
           if-no-files-found: error
 
   native-release:
-    # Attaches the built sidecars to a GitHub release as engine/native/
-    # <target>/<soname>, ready to be committed or shipped with the app.
-    # Triggered manually with a tag, or on any published release.
+    # Packages the built sidecars as one zip laid out as engine/native/
+    # <target>/<soname> (extract it at the repo root and the loader finds
+    # them) and attaches it, with a checksum, to an existing release. Only
+    # runs when dispatched with a tag: .github/scripts/release.sh dispatches
+    # it for every release it cuts, and it can be run by hand for an older
+    # tag. (A release created with GITHUB_TOKEN cannot trigger a `release`
+    # event workflow, so there is deliberately no such trigger.)
+    #
+    # One zip, not one asset per file: the five targets produce only three
+    # distinct file names (libstrata_native.so for both Linux targets,
+    # libstrata_native.dylib for both macOS ones), which as separate assets
+    # would overwrite each other.
     name: Attach sidecars to release
     runs-on: ubuntu-latest
     needs: native-build
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+    if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
     permissions:
       contents: write
     steps:
@@ -150,11 +159,13 @@ jobs:
             cp "$d"/* "stage/engine/native/$t/"
           done
           find stage -type f
-      - name: Attach to release
+      - name: Package and attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
         run: |
-          TAG=${{ github.event.release.tag_name || inputs.tag }}
-          for f in stage/engine/native/*/*; do
-            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
-          done
+          zip_name="strata-native-$TAG.zip"
+          (cd stage && zip -r -X "../$zip_name" engine)
+          sha256sum "$zip_name" > "$zip_name.sha256"
+          unzip -l "$zip_name"
+          gh release upload "$TAG" "$zip_name" "$zip_name.sha256"             --repo "$GITHUB_REPOSITORY" --clobber
