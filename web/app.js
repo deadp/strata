@@ -5924,7 +5924,7 @@ function artCount(mode, r) {
   }
   if (mode === 'browser') {
     return (r.history || []).length + (r.downloads || []).length
-         + (r.cookies || []).length;
+         + (r.cookies || []).length + (r.cache || []).length;
   }
   if (mode === 'lnk') {
     return (r.items || []).length + (r.jumplists || []).reduce(
@@ -5947,6 +5947,7 @@ function browserBranches(r) {
   for (const h of r.history || []) add(h.product, h.deleted ? 'Recovered' : 'History', 1);
   for (const d of r.downloads || []) add(d.product, 'Downloads', 1);
   for (const c of r.cookies || []) add(c.product, 'Cookies', 1);
+  for (const c of r.cache || []) add(c.product, 'Cache', 1);
   return [...by.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
@@ -6026,9 +6027,12 @@ function renderBrowserSlice(r, part, product, kind) {
   const hist = (r.history || []).filter(wanted);
   const dl = (r.downloads || []).filter(wanted);
   const ck = (r.cookies || []).filter(wanted);
-  let items, what;
+  const ca = (r.cache || []).filter(wanted);
   if (kind === 'Cookies') {
     return drawCookieList($('#art-results'), ck, product);
+  }
+  if (kind === 'Cache') {
+    return drawCacheList($('#art-results'), ca, product);
   }
   if (kind === 'Downloads') {
     items = dl;
@@ -6101,6 +6105,31 @@ function drawBrowserList(box, items, product, what, asDownloads) {
         <div class="path">${esc(h.url || '')}</div>
         <div class="meta">${h.visited_at ? fmt.time(h.visited_at) : 'no timestamp'}${
           h.visit_count ? ' · ' + h.visit_count + ' visits' : ''}${
+          h.note ? ' · ' + esc(h.note) : ''}</div>
+      </div>`).join('');
+}
+
+function drawCacheList(box, items, product) {
+  if (!items.length) {
+    box.innerHTML = `<p class="empty">${txt('ui.artefacts.none_for', {
+      what: txt('ui.browser.cache_entries', { count: 0 }),
+      product: esc(product) })}</p>`;
+    return;
+  }
+  box.innerHTML = `<div class="results-head">${esc(product)} · ${
+      txt('ui.browser.cache_entries', { count: items.length })}</div>` +
+    items.slice(0, 5000).map((h, i) => `
+      <div class="result" data-i="${i}">
+        <div class="top">
+          <span class="kind">${esc(h.source || '')}</span>
+          <span class="off">${h.size ? fmt.bytes(h.size) : ''}</span>
+        </div>
+        <div class="name">${esc(h.url || '')}</div>
+        <div class="path">${esc(h.path || '')}</div>
+        <div class="meta">${h.last_modified || h.last_fetched
+          ? fmt.time(h.last_modified || h.last_fetched) : 'no timestamp'}${
+          h.status ? ' · HTTP ' + h.status : ''}${
+          h.content_type ? ' · ' + esc(h.content_type) : ''}${
           h.note ? ' · ' + esc(h.note) : ''}</div>
       </div>`).join('');
 }
@@ -6626,8 +6655,12 @@ function renderBrowser(r, part) {
   const box = $('#art-results');
   const hist = r.history || [];
   const dbs = r.databases || [];
-  if (!hist.length) {
-    box.innerHTML = `<p class="empty">${txt('ui.browser_history_found_dbs_databases_examined', { dbs: dbs.length })}</p>`;
+  const cache = r.cache || [];
+  const notes = (r.findings || []).map(f =>
+    `<div class="notice">${esc(f)}</div>`).join('');
+  if (!hist.length && !cache.length) {
+    box.innerHTML = notes +
+      `<p class="empty">${txt('ui.browser_history_found_dbs_databases_examined', { dbs: dbs.length })}</p>`;
     tabCount('triage', 0);
     return;
   }
@@ -6638,7 +6671,9 @@ function renderBrowser(r, part) {
       databases: dbs.length.toLocaleString() })}${
       products.length ? ' · ' + products.join(', ') : ''}${
       deleted ? ' · ' + deleted + ' recovered from deleted rows' : ''}${
-      r.downloads?.length ? ' · ' + r.downloads.length + ' downloads' : ''}</div>` +
+      r.downloads?.length ? ' · ' + r.downloads.length + ' downloads' : ''}${
+      cache.length ? ' · ' + txt('ui.browser.cache_entries', { count: cache.length }) : ''}</div>` +
+    notes +
     hist.slice(0, 3000).map((h, i) => `
       <div class="result ${h.deleted ? 'match-notable' : ''}" data-i="${i}">
         <div class="top">

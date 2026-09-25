@@ -39,6 +39,10 @@
   "binary_size_printable_strings_first_value": "Binary, {size} — no printable strings in the first {value}.",
   "bitlocker_volume": "BitLocker volume",
   "browser": {
+    "cache_entries": {
+      "one": "cache entry",
+      "other": "cache entries"
+    },
     "cookies_from_hosts": {
       "one": "{count} cookie from {hosts} hosts",
       "other": "{count} cookies from {hosts} hosts"

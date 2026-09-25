@@ -30,6 +30,15 @@ records, not how the code changed.
   move to the new exhibit. A volume whose identifier matches several the
   case already holds is reported rather than guessed
   ([#82](https://github.com/switch-nz/strata/issues/82)).
+- **Browser disk caches are now read alongside browser history.** Running
+  the Browser artefact on a volume lists the cached pages, not just the
+  visited ones: each Chromium Simple Cache entry and Firefox cache2 entry
+  shows its URL, HTTP status, content type, last-modified and last-fetched
+  times and fetch count, under a Cache category for each browser profile.
+  The Chromium index and the older blockfile cache (`data_0`–`data_4`,
+  `f_XXXXXX`) are recognised and counted but not parsed, and an entry too
+  damaged to read is counted and reported rather than shown with guessed
+  values.
 - **Two volumes can be diffed, per path.** A new Diff tab picks any two
   loaded exhibits (or a volume and one of its own shadow-copy snapshots)
   and lists what was added, removed and changed between them — compared
