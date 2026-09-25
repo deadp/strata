@@ -442,6 +442,457 @@ def _property_set(blob, names, findings, label):
                 out[name] = val
     return out
 
+def _word_body(worddoc, table, findings, label):
+    """Text of a WordDocument stream via its piece table ([MS-DOC]). The
+    Clx in the table stream is walked for Prcs and the final Pcdt; each
+    PCD names a byte range of the WordDocument stream, compressed
+    (latin-1, fc halved) or not (UTF-16LE). Only proven pieces are
+    returned: a piece that cannot be decoded in full is dropped, not
+    guessed at."""
+    if len(worddoc) < 0x01AA or struct.unpack_from("<H", worddoc, 0)[0] != 0xA5EC:
+        findings.append("%s: the WordDocument stream does not begin with a "
+                        "Word 97 FIB; no text was read." % label)
+        return ""
+    fcclx, lcbclx = struct.unpack_from("<II", worddoc, 0x01A2)
+    tblname = "1table" if struct.unpack_from("<H", worddoc, 0x000A)[0] & 0x0200 \
+        else "0table"
+    if table is None or len(table) < fcclx + lcbclx:
+        findings.append("%s: the piece table (%s) is missing or shorter "
+                        "than the FIB records; no text was read."
+                        % (label, tblname))
+        return ""
+    clx = table[fcclx:fcclx + lcbclx]
+
+    at, pieces = 0, None
+    while at < len(clx):
+        clxt = clx[at]
+        if clxt == 0x01:                       # Prc: skip its PrcData
+            if at + 3 > len(clx):
+                findings.append("%s: a piece-table property modifier is "
+                                "cut short; the piece table ends here."
+                                % label)
+                break
+            cb, = struct.unpack_from("<H", clx, at + 1)
+            at += 3 + cb
+        elif clxt == 0x02:                     # Pcdt: the PlcPcd follows
+            if at + 5 > len(clx):
+                findings.append("%s: the piece table descriptor is cut "
+                                "short; no text was read." % label)
+                return ""
+            lcb, = struct.unpack_from("<I", clx, at + 1)
+            plc = clx[at + 5:at + 5 + lcb]
+            if len(plc) < lcb or lcb < 12 or (lcb - 4) % 12:
+                findings.append("%s: the piece table's size does not "
+                                "match its structure; no text was read."
+                                % label)
+                return ""
+            pieces = plc
+            break
+        else:
+            findings.append("%s: the piece table holds an unknown Clxt "
+                            "value (0x%02X); the piece table ends here."
+                            % (label, clxt))
+            break
+    if pieces is None:
+        findings.append("%s: the Clx holds no piece table descriptor "
+                        "(Pcdt); no text was read." % label)
+        return ""
+
+    n = (len(pieces) - 4) // 12
+    cps = struct.unpack_from("<%dI" % (n + 1), pieces, 0)
+    if any(cps[i] >= cps[i + 1] for i in range(n)):
+        findings.append("%s: the piece table's character positions are "
+                        "not strictly increasing; no text was read."
+                        % label)
+        return ""
+
+    out = []
+    for i in range(n):
+        pcd = pieces[4 * (n + 1) + 8 * i:4 * (n + 1) + 8 * (i + 1)]
+        _flags, fc = struct.unpack_from("<HI", pcd, 0)
+        span = cps[i + 1] - cps[i]
+        if fc & 0x80000000:
+            findings.append("%s: piece %d points past the 2 GB text "
+                            "limit; it was skipped." % (label, i))
+            continue
+        comp = bool(fc & 0x40000000)
+        off = fc & 0x3FFFFFFF
+        if comp:
+            off >>= 1
+        end = off + span * (2 if not comp else 1)
+        if off < 0 or end > len(worddoc) or off > end:
+            findings.append("%s: piece %d points outside the "
+                            "WordDocument stream; it was skipped."
+                            % (label, i))
+            continue
+        raw = worddoc[off:end]
+        try:
+            txt = raw.decode("latin-1" if comp else "utf-16-le")
+        except UnicodeDecodeError:
+            findings.append("%s: piece %d is not decodable %s text; it "
+                            "was skipped."
+                            % (label, i,
+                               "latin-1" if comp else "UTF-16LE"))
+            continue
+        if len(txt) != span:
+            findings.append("%s: piece %d decodes to %d characters, not "
+                            "the %d its character positions promise; it "
+                            "was skipped." % (label, i, len(txt), span))
+            continue
+        out.append(txt)
+    return "".join(out).replace("\r", "\n").replace("\x07", "\n")
+
+BOF_RECORD = 0x0809
+SST_RECORD = 0x00FC
+CONTINUE_RECORD = 0x003C
+BOUNDSHEET_RECORD = 0x0085
+LABELSST_RECORD = 0x00FD
+NUMBER_RECORD = 0x0203
+RK_RECORD = 0x027E
+MULRK_RECORD = 0x00BD
+EOF_RECORD = 0x000A
+
+def _rk_value(rk):
+    """The number an RK value encodes ([MS-XLS] 2.5.122): a signed
+    30-bit integer or the top 32 bits of a double, divided by 100 when
+    the low flag is set."""
+    div = 100.0 if rk & 0x01 else 1.0
+    if rk & 0x02:
+        v = rk >> 2
+        if v & 0x20000000:
+            v -= 0x40000000
+        return v / div
+    bits = b"\x00" * 4 + struct.pack("<I", rk & 0xFFFFFFFC)
+    return struct.unpack("<d", bits)[0] / div
+
+def _xls_number_text(v):
+    if isinstance(v, float) and v.is_integer() and abs(v) < 1e16:
+        return str(int(v))
+    return repr(v)
+
+
+def _xls_short_string(body, at):
+    """A ShortXLUnicodeString: cch u8, flags u8, then cch characters
+    (UTF-16LE when the high-byte flag is set). Returns (text, offset
+    just past the string)."""
+    cch = body[at]
+    high = bool(body[at + 1] & 0x01)
+    raw = body[at + 2:at + 2 + cch * (2 if high else 1)]
+    try:
+        return raw.decode("utf-16-le" if high else "latin-1"), at + 2 + len(raw)
+    except UnicodeDecodeError:
+        return "", at + 2
+
+def _xls_body(blob, findings, label):
+    """Text of a Workbook stream in BIFF8 ([MS-XLS]): the SST holds the
+    strings, BOUNDSHEET records name sheets and point at their
+    substreams, and the substreams' LABELSST/NUMBER/RK/MULRK records
+    carry the cells. Only proven cells are emitted: an SST index past
+    the end yields an empty cell, never a guess."""
+    at, sst, sheets = 0, [], []
+    while at + 4 <= len(blob):
+        rid, rlen = struct.unpack_from("<HH", blob, at)
+        body = blob[at + 4:at + 4 + rlen]
+        if len(body) < rlen:
+            findings.append("%s: the record stream is cut short inside a "
+                            "record; parsing stops here." % label)
+            break
+        at += 4 + rlen
+        if rid == SST_RECORD:
+            sst, at = _xls_read_sst(blob, at - 4 - rlen, findings, label)
+            continue
+        if rid == BOUNDSHEET_RECORD and len(body) >= 7:
+            lb, hs, dt = struct.unpack_from("<IHB", body, 0)
+            name, _rest = _xls_short_string(body, 7)
+            sheets.append((lb, dt, name))
+            continue
+    # Sheets are parsed from their substreams below, keyed by the BOUNDSHEET
+    # entry order.
+    out = []
+    for si, (lb, dt, name) in enumerate(sheets):
+        if lb < 0 or lb + 4 > len(blob):
+            findings.append("%s: sheet %d starts outside the workbook "
+                            "stream; it was skipped." % (label, si))
+            continue
+        rid, rlen = struct.unpack_from("<HH", blob, lb)
+        if rid != BOF_RECORD:
+            findings.append("%s: sheet %d does not start at a BOF "
+                            "record; it was skipped." % (label, si))
+            continue
+        grid, at = {}, lb + 4 + rlen
+        ended = False
+        while not ended and at + 4 <= len(blob):
+            rid, rlen = struct.unpack_from("<HH", blob, at)
+            body = blob[at + 4:at + 4 + rlen]
+            if len(body) < rlen:
+                findings.append("%s: sheet %d's record stream is cut "
+                                "short; parsing stops here." % (label, si))
+                break
+            at += 4 + rlen
+            if rid == BOF_RECORD:
+                break
+            if rid == EOF_RECORD:
+                ended = True
+                break
+            if rid == LABELSST_RECORD and len(body) >= 10:
+                row, col, _xf, isst = struct.unpack_from("<HHHI", body, 0)
+                grid[(row, col)] = sst[isst] if 0 <= isst < len(sst) else ""
+            elif rid == NUMBER_RECORD and len(body) >= 14:
+                row, col, _xf = struct.unpack_from("<HHH", body, 0)
+                v, = struct.unpack_from("<d", body, 6)
+                grid[(row, col)] = _xls_number_text(v)
+            elif rid == RK_RECORD and len(body) >= 10:
+                row, col, _xf, rk = struct.unpack_from("<HHHI", body, 0)
+                grid[(row, col)] = _xls_number_text(_rk_value(rk))
+            elif rid == MULRK_RECORD and len(body) >= 10:
+                row, col_first = struct.unpack_from("<HH", body, 0)
+                col_last, = struct.unpack_from("<H", body, len(body) - 2)
+                for k, pos in enumerate(range(4, len(body) - 2, 6)):
+                    _xf, rk = struct.unpack_from("<HI", body, pos)
+                    grid[(row, col_first + k)] = _xls_number_text(_rk_value(rk))
+                if col_first + (len(body) - 6) // 6 - 1 != col_last:
+                    findings.append("%s: sheet %d holds a multi-cell "
+                                    "record whose column count does not "
+                                    "match its span; the columns it "
+                                    "covers were still read."
+                                    % (label, si))
+        rows = {}
+        for (r, c) in sorted(grid):
+            rows.setdefault(r, []).append((c, grid[(r, c)]))
+        lines = ["\t".join(v for _c, v in sorted(cells))
+                 for _r, cells in sorted(rows.items())]
+        lines = [ln for ln in lines if ln.strip()]
+        if lines:
+            out.append(name if name else "sheet %d" % (si + 1))
+            out.extend(lines)
+    return "\n".join(out)
+
+def _xls_read_sst(blob, at, findings, label):
+    """Parse one SST record plus its CONTINUE record tail. Returns
+    (strings, offset just past the CONTINUE chain)."""
+    rid, rlen = struct.unpack_from("<HH", blob, at)
+    body_end = at + 4 + rlen
+    unique, = struct.unpack_from("<I", blob, at + 8)
+    strings = []
+    pos = at + 12
+    end = body_end
+    while len(strings) < unique:
+        if pos + 3 > end:
+            findings.append("%s: the shared-string table names more "
+                            "strings than it holds; the rest read as "
+                            "empty." % label)
+            break
+        cch, = struct.unpack_from("<H", blob, pos)
+        flags = blob[pos + 2]
+        pos += 3
+        rich = bool(flags & 0x08)
+        ext = bool(flags & 0x04)
+        high = bool(flags & 0x01)
+        if rich:
+            pos += 2 * struct.unpack_from("<H", blob, pos)[0] if pos + 2 <= end else 0
+            if pos > end:
+                break
+        # (cRun skipped; format runs carry no text)
+        if ext:
+            cb, = struct.unpack_from("<H", blob, pos) if pos + 2 <= end else (0,)
+            pos += 2 + cb
+            if pos > end:
+                break
+        want = cch * (2 if high else 1)
+        raw = bytearray()
+        while len(raw) < want and pos < end:
+            room = min(end - pos, want - len(raw))
+            raw += blob[pos:pos + room]
+            pos += room
+            if len(raw) < want and pos == end:
+                # find the CONTINUE record that extends this string
+                if pos + 4 <= len(blob):
+                    nrid, nlen = struct.unpack_from("<HH", blob, pos)
+                    if nrid == CONTINUE_RECORD:
+                        pos += 4
+                        end = pos + nlen
+                        if want - len(raw) >= 1:
+                            # a fresh flags byte applies when the
+                            # continuation starts mid-string
+                            if pos < end:
+                                flags = blob[pos]
+                                pos += 1
+                                high = bool(flags & 0x01)
+                        continue
+                findings.append("%s: a shared string runs past the end "
+                                "of its record; it was dropped." % label)
+                break
+        if len(raw) < want:
+            break
+        try:
+            strings.append(raw.decode("utf-16-le" if high else "latin-1"))
+        except UnicodeDecodeError:
+            strings.append(raw.decode("utf-16-le", "replace") if high
+                           else raw.decode("latin-1"))
+    skip = end
+    while skip + 4 <= len(blob):
+        nrid, nlen = struct.unpack_from("<HH", blob, skip)
+        if nrid != CONTINUE_RECORD:
+            break
+        skip += 4 + nlen
+    return strings, skip
+
+
+# PowerPoint record types ([MS-PPT]; ids per POI RecordTypes).
+PPT_SLIDE = 0x03EE
+PPT_DOCUMENT = 0x03E8
+PPT_TEXT_HEADER = 0x0F9F
+PPT_TEXT_CHARS = 0x0FA0
+PPT_ESCHER_CLIENT = 0xF00D
+PPT_TEXT_BYTES = 0x0FA8
+PPT_USER_EDIT = 0x0FF5
+PPT_PERSIST_DIR = 0x1772
+PPT_PERSIST_DIR_FULL = 0x1771
+
+
+def _ppt_text_records(blob, top, findings, label):
+    """Text runs of one Slide container: a bounded recursive walk of
+    nested containers (records whose instance/version field is 0xF)
+    collecting TextHeaderAtom + TextCharsAtom/TextBytesAtom pairs. Text
+    whose header is missing or whose bytes cannot be decoded in full is
+    dropped, not guessed at. Returns a list of run strings."""
+    runs = []
+    stack = [(top, top + 8 + struct.unpack_from("<I", blob, top + 4)[0])]
+    steps = 0
+    while stack:
+        steps += 1
+        if steps > 4096 or len(stack) > 64:
+            findings.append("%s: a slide holds too many nested records "
+                            "to walk; the rest was skipped." % label)
+            break
+        base, limit = stack[-1]
+        if base + 8 > limit:
+            stack.pop()
+            continue
+        ver, rid, rlen = struct.unpack_from("<HHI", blob, base)
+        end = base + 8 + rlen
+        if end > limit or end > len(blob):
+            findings.append("%s: a nested record runs past its parent "
+                            "container; the rest of the slide was "
+                            "skipped." % label)
+            break
+        if ver & 0x000F == 0x000F or rid == PPT_ESCHER_CLIENT:
+            # Containers (0xF) descend; Escher client-textbox wrappers
+            # are formally atoms but their body is a record list.
+            stack[-1] = (base + 8, end)
+            continue
+        stack[-1] = (end, limit)
+        if rid == PPT_TEXT_HEADER:
+            _ver, _ttype, tlen = struct.unpack_from("<HHI", blob, base)
+            nxt = base + 8 + tlen
+            if tlen < 4 or nxt + 8 > limit or nxt + 8 > len(blob):
+                findings.append("%s: a text header is cut short; its "
+                                "text was skipped." % label)
+                continue
+            nver, nrid, nlen = struct.unpack_from("<HHI", blob, nxt)
+            if nrid == PPT_TEXT_CHARS:
+                txt = blob[nxt + 8:min(nxt + 8 + nlen, limit)]
+                if len(txt) != nlen or nlen % 2:
+                    findings.append("%s: a unicode text run is cut "
+                                    "short; it was skipped." % label)
+                    continue
+                runs.append(txt.decode("utf-16-le"))
+            elif nrid == PPT_TEXT_BYTES:
+                txt = blob[nxt + 8:min(nxt + 8 + nlen, limit)]
+                if len(txt) != nlen:
+                    findings.append("%s: a byte text run is cut "
+                                    "short; it was skipped." % label)
+                    continue
+                runs.append(txt.decode("latin-1"))
+    return runs
+
+
+def _ppt_body(doc, current, findings, label):
+    """Text of a PowerPoint Document stream: from the Current User
+    stream, walk the chain of UserEditAtoms newest to oldest, merge
+    their persist directories (first record seen for a persist id
+    wins), then read each persist record the directories point at and
+    pull the text runs out of Slide containers. Only text that can be
+    proven from well-formed records is returned."""
+    if len(current) < 32:
+        findings.append("%s: the Current User stream is too short to "
+                        "hold a CurrentUserAtom; no text was read." % label)
+        return ""
+    offset, = struct.unpack_from("<I", current, 16)
+    if not offset or offset >= len(doc) or offset + 8 > len(doc):
+        findings.append("%s: the Current User stream does not point at "
+                        "a UserEditAtom inside the PowerPoint stream; "
+                        "no text was read." % label)
+        return ""
+    persist = {}
+    edits = 0
+    while offset and len(persist) < 4096:
+        edits += 1
+        if edits > 64 or offset + 8 > len(doc):
+            findings.append("%s: the edit history is cut short; the "
+                            "remaining edits were skipped." % label)
+            break
+        ver, rid, rlen = struct.unpack_from("<HHI", doc, offset)
+        end = offset + 8 + rlen
+        if rid != PPT_USER_EDIT or end > len(doc) or rlen < 0x18 \
+                or rlen > 0x20:
+            findings.append("%s: the edit history does not lead through "
+                            "well-formed UserEditAtoms; the remaining "
+                            "edits were skipped." % label)
+            break
+        pptr, = struct.unpack_from("<I", doc, offset + 8 + 12)
+        prev, = struct.unpack_from("<I", doc, offset + 8 + 8)
+        if pptr + 8 > len(doc):
+            findings.append("%s: a persist directory sits outside the "
+                            "PowerPoint stream; the remaining edits "
+                            "were skipped." % label)
+            break
+        pver, prid, plen = struct.unpack_from("<HHI", doc, pptr)
+        if prid not in (PPT_PERSIST_DIR, PPT_PERSIST_DIR_FULL):
+            findings.append("%s: a UserEditAtom does not point at a "
+                            "persist directory; the remaining edits "
+                            "were skipped." % label)
+            break
+        blob = doc[pptr + 8:min(pptr + 8 + plen, len(doc))]
+        at = 0
+        while at + 4 <= len(blob):
+            info, = struct.unpack_from("<I", blob, at)
+            first, count = info & 0xFFFFF, info >> 20
+            if count and at + 4 + 4 * count > len(blob):
+                findings.append("%s: a persist directory entry names "
+                                "records past the end of the stream; "
+                                "it was skipped." % label)
+                at = len(blob)
+                break
+            for i in range(count):
+                pos, = struct.unpack_from("<I", blob, at + 4 + 4 * i)
+                if first + i not in persist:
+                    persist[first + i] = pos
+            at += 4 + 4 * count
+            if count == 0:
+                at += 4
+        offset = prev
+    if not persist:
+        findings.append("%s: no persist directory could be read; no "
+                        "text was read." % label)
+        return ""
+
+    out = []
+    for pid in sorted(persist):
+        pos = persist[pid]
+        if not pos or pos + 8 > len(doc):
+            findings.append("%s: a persist record sits outside the "
+                            "PowerPoint stream; it was skipped." % label)
+            continue
+        ver, rid, rlen = struct.unpack_from("<HHI", doc, pos)
+        if (ver & 0x000F) != 0x000F or rid != PPT_SLIDE:
+            continue                          # Document, fonts, etc.
+        runs = _ppt_text_records(doc, pos, findings, label)
+        if runs:
+            out.append("\n".join(runs))
+    return "\n\n".join(out)
+
+
 def parse_ole2_document(data, name=""):
     if not ole2.looks_like_ole2(data[:8]):
         return None
@@ -470,20 +921,72 @@ def parse_ole2_document(data, name=""):
             kind = label
             break
 
+    # Body text for the three formats we decode. The Outlook message
+    # kind and plain compound documents keep the properties-only note.
+    sections = []
+    if kind == "Word document (legacy .doc)":
+        worddoc = o.read(names["worddocument"], MAX_PART)
+        table = None
+        for tname in ("1table", "0table"):
+            tent = names.get(tname)
+            if tent is not None:
+                table = o.read(tent, MAX_PART)
+                break
+        txt = _word_body(worddoc, table, findings, kind)
+        if txt.strip():
+            sections.append(("document", txt))
+    elif kind == "Excel workbook (legacy .xls)":
+        sent = names.get("workbook") or names.get("book")
+        txt = _xls_body(o.read(sent, MAX_PART), findings, kind)
+        if txt.strip():
+            sections.append(("workbook", txt))
+    elif kind == "PowerPoint presentation (legacy .ppt)":
+        doc = o.read(names["powerpoint document"], MAX_PART)
+        current = b""
+        cuent = names.get("current user")
+        if cuent is not None:
+            current = o.read(cuent, MAX_PART)
+        txt = _ppt_body(doc, current, findings, kind)
+        if txt.strip():
+            sections.append(("slides", txt))
+
+    body, total, truncated = [], 0, False
+    for label2, txt in sections:
+        if not txt.strip():
+            continue
+        if total + len(txt) > MAX_TEXT:
+            txt = txt[:max(0, MAX_TEXT - total)]
+            truncated = True
+        body.append((label2, txt))
+        total += len(txt)
+        if truncated:
+            break
+    if truncated:
+        findings.append(
+            "Text was truncated at %d characters. The document is longer; the "
+            "whole of it is still in the evidence." % MAX_TEXT)
+
+    if kind in ("Outlook message (.msg)", "OLE2 compound document"):
+        note = ("The body of a legacy Office document is a binary format of "
+                "its own — Word's piece table, Excel's BIFF record stream — "
+                "and is not decoded here, so no text is offered rather than "
+                "text that might be wrong. The properties below are from the "
+                "document's own property set: they are written by the "
+                "application from whatever it was told and can be edited.")
+    else:
+        note = ("Document properties are written by the application from "
+                "whatever it was told and can be edited afterwards. They are "
+                "a record of what the file claims, not of what happened.")
+
     return {
         "kind": kind,
         "family": "ole2",
         "metadata": meta,
-        "sections": [],
-        "text": "",
-        "characters": 0,
+        "sections": [{"name": n, "text": t} for n, t in body],
+        "text": "\n\n".join(t for _n, t in body),
+        "characters": total,
         "parts": len(o.entries),
         "streams": [n for n, _e in o.streams()][:64],
         "findings": findings,
-        "note": ("The body of a legacy Office document is a binary format of "
-                 "its own — Word's piece table, Excel's BIFF record stream — "
-                 "and is not decoded here, so no text is offered rather than "
-                 "text that might be wrong. The properties below are from the "
-                 "document's own property set: they are written by the "
-                 "application from whatever it was told and can be edited."),
+        "note": note,
     }
