@@ -59,6 +59,7 @@ const S = {
   lastSearchPart: null,
   prefs: {},
   markCats: [],
+  snap: null,
   readOnly: false,
 };
 
@@ -349,7 +350,8 @@ class HexView {
                                      entry: S.scope.entry
                                        ? JSON.stringify(S.scope.entry)
                                        : undefined,
-                                     stream: S.scope.stream || undefined });
+                                     stream: S.scope.stream || undefined,
+                                     snap: S.scope.snap ?? undefined });
     if (this.pending !== token) return;
     const bin = atob(r.data || '');
     const arr = new Uint8Array(bin.length);
@@ -1074,20 +1076,26 @@ function spanAt(off) {
 }
 
 const dirCache = new Map();
-const dirKey = (part, node, ev) =>
-  `${ev ?? S.activeId ?? '?'}:${part}:${node ?? 'root'}`;
+const dirKey = (part, node, ev, snap) =>
+  `${ev ?? S.activeId ?? '?'}:${part}:${node ?? 'root'}${snap != null ? `:s${snap}` : ''}`;
 
 const walkCache = new Map();
 const walkKey = (part, node) =>
-  dirKey(partOffset(part), node, part && part.ev_id);
+  dirKey(partOffset(part), node, part && part.ev_id,
+         part && part.snap);
 
-async function fetchDir(part, nodeId, path, ev) {
-  const key = dirKey(part, nodeId, ev);
+async function fetchDir(part, nodeId, path, ev, snap = null) {
+  // A VSS snapshot index is threaded through explicitly (part.snap); an
+  // APFS snapshot name comes from the global S.snap instead, so a caller
+  // that doesn't pass one falls back to whichever one is active.
+  snap = snap ?? snapParam(part);
+  const key = dirKey(part, nodeId, ev, snap);
   const hit = dirCache.get(key);
   if (hit) return hit;
 
   let r = await api.get('dir', { part, node: nodeId, path, types: 1,
-                                 ev: ev ?? undefined });
+                                 ev: ev ?? undefined,
+                                 snap: snap ?? undefined });
   if (r.building) {
     const done = await awaitTask(r.task, 'Indexing MFT', {
       modal: {
@@ -1097,11 +1105,23 @@ async function fetchDir(part, nodeId, path, ev) {
     });
     if (!done) return { error: txt('messages.indexing_interrupted') };
     r = await api.get('dir', { part, node: nodeId, path, types: 1,
-                               ev: ev ?? undefined });
+                               ev: ev ?? undefined,
+                               snap: snap ?? undefined });
   }
   if (!r.error) dirCache.set(key, r);
   return r;
 }
+
+const snapParam = part => {
+  // VSS snapshots are threaded on the part object itself (part.snap, a
+  // numeric index); APFS snapshots go through the global S.snap instead
+  // (a name, keyed to whichever part it was opened on), since only one
+  // of the two kinds of snapshot is ever open at a time.
+  if (part && part.snap != null) return part.snap;
+  const off = typeof part === 'object' && part !== null
+    ? partOffset(part) : part;
+  return S.snap && S.snap.part === off ? S.snap.name : undefined;
+};
 
 let selectedRow = null;
 function selectRow(el) {
@@ -1584,7 +1604,7 @@ function clearViewer() {
 
 function setScope(part, size, label, meta) {
   S.scope = { part, size, label, entry: null, stream: null,
-              extents: null, chunks: null, ev: S.activeId };
+              extents: null, chunks: null, ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = profileCache.get(profileKey(part)) || null;
   S.cursor = 0;
@@ -1650,7 +1670,7 @@ async function revealInTree(part, nodeId) {
 function setEmptyScope(label, part) {
   S.scope = { part: partOffset(part), size: 0, label, entry: null,
               stream: null, extents: null, chunks: null, empty: true,
-              ev: S.activeId };
+              ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = null;
   S.cursor = 0;
@@ -1670,7 +1690,7 @@ function setFileScope(entry, part, size, label, stream = null,
                      extents = null, chunks = null) {
   S.scope = { part: partOffset(part), size: size || 0, label,
               entry, stream, file: true, extents: extents || null,
-              chunks: chunks || null, ev: S.activeId };
+              chunks: chunks || null, ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = profileCache.get(profileKey(partOffset(part), S.scope)) || null;
   S.cursor = 0;
@@ -1855,7 +1875,8 @@ async function showEntry(e, part, from = null, stream = null) {
     <div class="subtitle">${txt('ui.show_entry.reading')}</div>`;
   const st = await api.get('stat', { part: partOffset(part),
                                     entry: JSON.stringify(e),
-                                    stream: stream ? stream.name : undefined });
+                                    stream: stream ? stream.name : undefined,
+                                    snap: snapParam(part) });
 
   if (!st || st.error) {
     i.innerHTML = `<div class="title">${esc(e.name)}</div>
@@ -2129,7 +2150,8 @@ async function exportEntry(e, part, dest = null, stream = '',
     part: partOffset(part), entry: e,
     node: e.mft ?? e.inode ?? e.oid ?? e.start_cluster,
     name: e.name, path: e.path, size: e.size, dest, stream,
-    add_exhibit: addExhibit });
+    add_exhibit: addExhibit,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (r.error) return toast(r.error);
   if (r.exhibit) {
     if (r.exhibit.added) {
@@ -2150,12 +2172,14 @@ async function exportEntry(e, part, dest = null, stream = '',
 const COPY_MAX = 1 << 20;
 
 async function rangeBytes(start, length) {
+  const snap = S.scope.snap;
   const r = S.scope.entry
     ? await api.get('hex', { offset: start, length, part: S.scope.part,
                              entry: JSON.stringify(S.scope.entry),
-                             stream: S.scope.stream || undefined })
+                             stream: S.scope.stream || undefined,
+                             snap: snap ?? undefined })
     : await api.get('hex', { offset: start + (S.scope.part || 0),
-                             length, part: null });
+                             length, part: null, snap: snap ?? undefined });
   if (r.error) throw new Error(r.error);
   return b64ToBytes(r.data);
 }
@@ -2450,18 +2474,32 @@ function typedCard(kind, e, truncated) {
 
 function fileURL(entry, part) {
   const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  const snap = snapParam(part);
+  if (snap != null) q.set('snap', String(snap));
   return `/api/file?${q}`;
 }
 
 function thumbnailURL(entry, part) {
   const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  if (part.snap != null) q.set('snap', String(part.snap));
   return `/api/thumbnail?${q}`;
 }
 
 function dirSet(name, meta, html) {
+  const snapBanner = S.snap
+    ? `<div class="notice snap-banner">${esc(
+        txt('ui.snaps.viewing', { name: S.snap.name }))}
+        <button class="ghost btn-snap-close">${esc(txt('ui.snaps.close'))}</button></div>`
+    : '';
   $('#dir-name').textContent = name;
   $('#dir-meta').textContent = meta || '';
+  const list = $('#dirlist');
+  const prev = list.previousElementSibling;
+  if (prev && prev.classList.contains('snap-banner')) prev.remove();
+  if (snapBanner) list.insertAdjacentHTML('beforebegin', snapBanner);
   $('#dirlist').innerHTML = html;
+  const btn = $('.btn-snap-close');
+  if (btn) btn.addEventListener('click', exitSnapshot);
 }
 
 function pvSet(title, kind, html) {
@@ -2607,7 +2645,7 @@ function visibleEntries() {
 
 async function previewDir(entries, name, part, id = undefined, self = null,
                           parent = null, scope = null) {
-  await loadHashMap(partOffset(part));
+  if (part && part.snap == null) await loadHashMap(partOffset(part));
   if (scope) {
     dirView.trail = [];
   } else if (!parent) {
@@ -2918,10 +2956,12 @@ async function previewEntry(e, part, from = null, stream = null) {
     pvSet(e.name || txt('ui.preview.preview_title'), '',
           `<p class="empty">${txt('messages.folder_has_a_listing_not_a_preview')}</p>`);
     const nodeId = e.mft ?? e.inode ?? e.oid ?? e.start_cluster;
-    if (!dirCache.has(dirKey(part.offset, nodeId, part.ev_id))) {
+    if (!dirCache.has(dirKey(part.offset, nodeId, part.ev_id,
+                       part.snap))) {
       dirSet(e.name, 'reading…', `<p class="empty">${txt('ui.reading_directory')}</p>`);
     }
-    const r = await fetchDir(part.offset, nodeId, e.path, part.ev_id);
+    const r = await fetchDir(part.offset, nodeId, e.path, part.ev_id,
+                             part.snap);
     if (pvToken !== token) return;
     if (r.error) return dirSet(e.name, 'error', `<p class="empty">${esc(r.error)}</p>`);
     return previewDir(r.entries, e.name, part, nodeId, e, from);
@@ -2940,7 +2980,8 @@ async function previewEntry(e, part, from = null, stream = null) {
   const want = Math.min(size, PV_MAX);
   const r = await api.get('preview', { part: part.offset,
                                        entry: JSON.stringify(e), length: want,
-                                       stream: stream ? stream.name : undefined });
+                                       stream: stream ? stream.name : undefined,
+                                       snap: snapParam(part) });
   if (pvToken !== token) return;
   if (r.error) return pvSet(label, 'error', `<p class="empty">${esc(r.error)}</p>`);
 
@@ -3472,7 +3513,8 @@ function redrawDates() {
 
 async function openArchive(e, part) {
   const r = await api.get('archive', { part: partOffset(part),
-                                      entry: JSON.stringify(e) });
+                                       entry: JSON.stringify(e),
+                                       snap: snapParam(part) });
   if (r.error) {
     return pvSet(e.name, 'archive',
       `<p class="empty">${esc(r.error)}</p>` +
@@ -3516,7 +3558,8 @@ async function openArchiveEntry(i) {
   const item = a.info.items.filter(x => !x.is_dir)[i];
   if (!item) return;
   const r = await api.get('archive', {
-    part: a.part, entry: JSON.stringify(a.entry), inner: item.name });
+    part: a.part, entry: JSON.stringify(a.entry), inner: item.name,
+    snap: a.part && a.part.snap != null ? a.part.snap : undefined });
   if (r.error) return toast(r.error);
   const bytes = Uint8Array.from(atob(r.preview || ''), c => c.charCodeAt(0));
   const notes = (r.notes || []).map(n =>
@@ -3576,7 +3619,10 @@ function partIn(evId, offset) {
 function renderURL(e, part, as) {
   const q = new URLSearchParams({ part: String(partOffset(part)),
                                   entry: JSON.stringify(e) });
+  if (part && part.snap != null) q.set('snap', String(part.snap));
   if (as) q.set('as', as);
+  const snap = snapParam(part);
+  if (snap) q.set('snap', snap);
   return `/api/render?${q}`;
 }
 
@@ -3594,7 +3640,8 @@ function sanitisedNote(findings, what) {
 
 async function openPdf(e, part) {
   const info = await api.get('render', { part: partOffset(part),
-                                         entry: JSON.stringify(e) });
+                                         entry: JSON.stringify(e),
+                                         snap: snapParam(part) });
   if (info.error) return pvSet(e.name, 'pdf', `<p class="empty">${esc(info.error)}</p>`);
 
   const meta = [
@@ -3628,10 +3675,10 @@ async function openPdf(e, part) {
       (${info.active_content.length})</summary><ul>${active}</ul></details>` : ''}
     ${body}`);
 }
-
 async function openMarkup(e, part, kind) {
   const info = await api.get('render', { part: partOffset(part),
-                                         entry: JSON.stringify(e) });
+                                         entry: JSON.stringify(e),
+                                         snap: snapParam(part) });
   if (info.error) return pvSet(e.name, kind, `<p class="empty">${esc(info.error)}</p>`);
   if (!info.renderable) {
     return pvSet(e.name, kind,
@@ -3660,7 +3707,8 @@ async function openRegistry(entry, part, path = '') {
   reg.part = part; reg.entry = entry; reg.path = path;
   pvSet(entry.name, txt('ui.registry_hive'), `<p class="empty">${txt('ui.reading_hive')}</p>`);
   const r = await api.get('registry', {
-    part: part.offset, entry: JSON.stringify(entry), key: path });
+    part: part.offset, entry: JSON.stringify(entry), key: path,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (pvToken !== token) return;
   if (r.error) return pvSet(entry.name, 'registry', `<p class="empty">${esc(r.error)}</p>`);
   renderRegistry(r);
@@ -3780,10 +3828,11 @@ const EVTX_PAGE = 2000;
 async function openEventLog(entry, part, offset = 0) {
   const token = Symbol();
   pvToken = token;
+  const t = await api.post('evtx', {
+    part: part.offset, entry, limit: EVTX_PAGE, offset,
+    snap: part && part.snap != null ? part.snap : undefined });
   pvSet(entry.name, txt('ui.event_log'),
         `<p class="empty">${txt('ui.decoding_records_progress_task_tray')}</p>`);
-  const t = await api.post('evtx', {
-    part: part.offset, entry, limit: EVTX_PAGE, offset });
   const r = await awaitTask(t, txt('ui.decoding_events'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, txt('ui.event_log'),
@@ -3869,9 +3918,9 @@ const sq = { entry: null, part: null, table: null, info: null, tables: [],
 async function openSqlite(entry, part, table = null, recover = false) {
   const token = Symbol();
   pvToken = token;
-  pvSet(entry.name, 'database', `<p class="empty">${txt('ui.reading_pages')}</p>`);
   const t = await api.post('sqlite', {
-    part: part.offset, entry, table, recover, limit: 5000 });
+    part: part.offset, entry, table, recover, limit: 5000,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, txt('ui.reading_database'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'database',
@@ -3971,8 +4020,9 @@ const eseView = { entry: null, part: null, table: null };
 async function openEse(entry, part, table = null) {
   const token = Symbol();
   pvToken = token;
-  pvSet(entry.name, 'database', `<p class="empty">${txt('ui.reading_pages')}</p>`);
-  const t = await api.post('ese', { part: part.offset, entry, table, limit: 2000 });
+  const t = await api.post('ese', {
+    part: part.offset, entry, table, limit: 2000,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, txt('ui.reading_database'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'database',
@@ -4045,7 +4095,9 @@ async function openLevelDb(entry, part) {
   const token = Symbol();
   pvToken = token;
   pvSet(entry.name, 'leveldb', `<p class="empty">${txt('ui.decompressing_blocks')}</p>`);
-  const t = await api.post('leveldb', { part: part.offset, entry });
+  const t = await api.post('leveldb', {
+    part: part.offset, entry,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, 'Reading LevelDB');
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'leveldb', `<p class="empty">${txt('ui.open_sqlite.cancelled')}</p>`);
@@ -4182,12 +4234,12 @@ $('#unlock-show')?.addEventListener('change', e => {
 async function previewRoot(part) {
   const token = Symbol();
   pvToken = token;
-  const label = partName(part);
-  if (!dirCache.has(dirKey(part.offset, null, part.ev_id))) {
+  const label = S.snapLabel || partName(part);
+  if (!dirCache.has(dirKey(part.offset, null, part.ev_id, part.snap))) {
     dirSet(label + ' · /', 'reading…',
            `<p class="empty">${txt('ui.reading_root_directory')}</p>`);
   }
-  const r = await fetchDir(part.offset, null, '/', part.ev_id);
+  const r = await fetchDir(part.offset, null, '/', part.ev_id, part.snap);
   if (pvToken !== token) return;
   if (r.error) {
     return dirSet(label + ' · /', 'error', `<p class="empty">${esc(r.error)}</p>`);
@@ -4348,7 +4400,8 @@ async function exportFolder(e, part, { addExhibit = false } = {}) {
   if (dest === '') return;
   const t = await api.post('export/folder', {
     part: partOffset(part), entry: e, dest: dest || null,
-    add_exhibit: addExhibit });
+    add_exhibit: addExhibit,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (t.error) return toast(t.error);
   const r = await awaitTask(t, 'Exporting ' + (e.name || 'folder'), {
     modal: { title: 'Exporting ' + (e.name || 'folder'),
@@ -5847,15 +5900,18 @@ const ART_RENDER = {
   prefetch: renderPrefetch, shellbags: renderShellbags, mail: renderMail,
   leveldb: renderLevelDbSweep, lnk: renderLnk, recyclebin: renderRecycleBin,
   wallets: renderWallets,
+  snapshots: renderSnapshots,
 };
 
 const ART_ORDER = ['recyclebin', 'lnk', 'browser', 'appcompat', 'prefetch',
-                   'usn', 'shellbags', 'mail', 'leveldb', 'vss', 'wallets'];
+                   'usn', 'shellbags', 'mail', 'leveldb', 'vss', 'snapshots',
+                   'wallets'];
 const ART_LABEL = {
   recyclebin: 'Recycle Bin', lnk: 'Shortcuts', browser: 'Browsing',
   appcompat: 'Programs', prefetch: 'Execution', usn: txt('ui.change_journal'),
   shellbags: 'Folders', mail: 'Mail', leveldb: 'LevelDB',
-  vss: txt('ui.tree.shadow_copies'), wallets: 'Crypto',
+  vss: txt('ui.tree.shadow_copies'), snapshots: txt('ui.tree.apfs_snapshots'),
+  wallets: 'Crypto',
 };
 
 let artPick = null;
@@ -6126,6 +6182,10 @@ async function doArtifacts(force = false) {
   if (artMode === 'vss') {
     return renderVss(cacheArtefact('vss', part, await api.get('vss', { part })), part);
   }
+  if (artMode === 'snapshots') {
+    return renderSnapshots(cacheArtefact('snapshots', part,
+      await api.get('snapshots', { part })), part);
+  }
   if (artMode === 'browser') {
     const t = await api.post('browser', { part, recover: true });
     const r = await awaitTask(t, txt('ui.browser_history'), {
@@ -6212,6 +6272,149 @@ async function doArtifacts(force = false) {
   renderRecycleBin(cacheArtefact('recyclebin', part,
                                  await api.get('recyclebin', { part })), part);
 }
+
+// ---- Diff (issue #74): two exhibits, or live volume vs one of its VSS
+// snapshots. Server walks both trees and compares per path.
+
+let diffPartsLoaded = false;
+
+function renderDiffPanel() {
+  const box = $('#diff-results');
+  if (!S.open) {
+    box.innerHTML = `<p class="empty">${txt('ui.open_image_see_volume_structure')}</p>`;
+    return;
+  }
+  if (diffPartsLoaded) return;
+  diffPartsLoaded = true;
+
+  const items = (S.exhibits && S.exhibits.length)
+    ? S.exhibits
+    : [{ evidence_id: S.evidenceId ?? null, label: S.image.segments[0] }];
+  const fill = (sel) => {
+    const el = $(sel);
+    el.innerHTML = '';
+    for (const ev of items) {
+      const parts = partsOf(ev);
+      for (const p of parts) {
+        if (p.allocated === false || (!p.detected && !logicalRegion(p))) continue;
+        const o = document.createElement('option');
+        o.value = JSON.stringify({ ev: ev.evidence_id ?? null, part: p.offset });
+        o.textContent = `${ev.label || ev.path} — ${partLabel(p, parts)}`;
+        el.appendChild(o);
+      }
+    }
+    el.addEventListener('change', () => loadDiffSnaps(sel));
+  };
+  fill('#diff-a');
+  fill('#diff-b');
+  if ($('#diff-b').options.length > 1) $('#diff-b').selectedIndex = 1;
+  loadDiffSnaps('#diff-a');
+  loadDiffSnaps('#diff-b');
+}
+
+async function loadDiffSnaps(sel) {
+  const spec = $(sel).value;
+  const snapSel = $(sel === '#diff-a' ? '#diff-a-snap' : '#diff-b-snap');
+  snapSel.innerHTML = `<option value="">${txt('ui.diff.current')}</option>`;
+  if (!spec) return;
+  let v;
+  try { v = JSON.parse(spec); } catch { return; }
+  const r = await api.get('vss', { part: v.part, ev: v.ev ?? undefined });
+  const snaps = (r && r.snapshots) || [];
+  snaps.forEach((s, i) => {
+    if (!s.block_list_offset) return;
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = `#${i} · ${s.created_at || s.id}`;
+    snapSel.appendChild(o);
+  });
+}
+
+async function runDiff() {
+  const box = $('#diff-results');
+  const a = $('#diff-a').value, b = $('#diff-b').value;
+  if (!a || !b) return toast(txt('ui.diff.pick_two'));
+  const spec = sel => {
+    const v = JSON.parse($(sel).value);
+    const snap = $(sel === '#diff-a' ? '#diff-a-snap' : '#diff-b-snap').value;
+    return { ev: v.ev, part: v.part, snap: snap === '' ? null : +snap };
+  };
+  box.innerHTML = `<p class="empty">${txt('ui.diff.running')}</p>`;
+  const t = await api.post('diff', { a: spec('#diff-a'), b: spec('#diff-b') });
+  if (r_encrypted(t)) return;
+  if (t.building) {
+    await awaitTask(t.task, txt('ui.diff.running'));
+    return runDiff();
+  }
+  const r = await awaitTask(t, txt('ui.diff.running'), {
+    modal: { title: txt('ui.diff.running'),
+             detail: txt('help.diff.walks_both_trees') },
+  });
+  if (!r) return;
+  renderDiffResult(r);
+}
+
+function r_encrypted(r) {
+  if (r.encrypted) { toast(r.error || r.kind); return true; }
+  return false;
+}
+
+function renderDiffResult(r) {
+  const box = $('#diff-results');
+  const d = r.diff || {};
+  const cap = 500;
+  const side = x => x == null ? '' : `#${x}`;
+  const head = `<div class="results-head">${
+    txt('ui.diff.added', { n: (d.added || []).length }) } · ${
+    txt('ui.diff.removed', { n: (d.removed || []).length }) } · ${
+    txt('ui.diff.changed', { n: (d.changed || []).length }) } · ${
+    txt('ui.diff.unchanged', { n: d.unchanged_count || 0 })}</div>`;
+  if (!(d.added || []).length && !(d.removed || []).length
+      && !(d.changed || []).length) {
+    box.innerHTML = head + `<p class="empty">${txt('ui.diff.no_changes')}</p>`;
+    return;
+  }
+  const row = (cls, path, a, b) =>
+    `<tr class="${cls}"><td>${esc(path)}</td><td>${a}</td><td>${b}</td></tr>`;
+  const field = (f, name) => f == null ? '' : esc(String(f));
+  const size = f => f && f.size != null ? fmt.bytes(f.size) : '';
+  const mod = f => f && f.modified ? esc(String(f.modified)) : '';
+  const del = f => f && f.deleted ? '✓' : '';
+  const table = (title, rows, columns) => `
+    <div class="results-head">${esc(title)}</div>
+    <table class="diff-table"><thead><tr>${columns.map(c =>
+      `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${
+      rows.join('')}</tbody></table>`;
+  const added = (d.added || []).slice(0, cap).map(x =>
+    row('add', x.path, '', `${size(x.b)}${del(x.b)}`));
+  const removed = (d.removed || []).slice(0, cap).map(x =>
+    row('rm', x.path, `${size(x.a)}${del(x.a)}`, ''));
+  const changed = (d.changed || []).slice(0, cap).map(x =>
+    row('ch', x.path,
+        `${size(x.a)} · ${mod(x.a)}${del(x.a)}`,
+        `${size(x.b)} · ${mod(x.b)}${del(x.b)}`));
+  const listed = [d.added, d.removed, d.changed]
+    .reduce((n, l) => n + (l || []).length, 0);
+  const foot = [d.added, d.removed, d.changed]
+    .some(l => (l || []).length > cap)
+    ? `<p class="hint">${txt('ui.diff.showing_n_of_m', { n: cap, m: listed })}</p>`
+    : '';
+  const trunc = [r.a && r.a.truncated, r.b && r.b.truncated]
+    .some(Boolean)
+    ? `<p class="hint">${txt('help.diff.truncated_budget')}</p>`
+    : '';
+  box.innerHTML = head + trunc
+    + (added.length ? table(txt('ui.diff.added', { n: (d.added || []).length }),
+        added, ['Path', 'Size', '']) : '')
+    + (removed.length ? table(txt('ui.diff.removed', { n: (d.removed || []).length }),
+        removed, ['Path', 'Size', '']) : '')
+    + (changed.length ? table(txt('ui.diff.changed', { n: (d.changed || []).length }),
+        changed, ['Path', 'A', 'B']) : '')
+    + foot
+    + (!added.length && !removed.length && !changed.length
+        ? `<p class="empty">${txt('ui.diff.no_changes')}</p>` : '');
+}
+
 
 function jumpRows(lists) {
   const rows = [];
@@ -6373,7 +6576,78 @@ function renderVss(r, part) {
       <div class="path">${esc(s.id || '')}</div>
       ${s.unsupported ? `<div class="meta">${esc(s.unsupported)}</div>` : ''}
     </div>`).join('');
+  [...box.querySelectorAll('.result')].forEach((el, i) => {
+    const s = snaps[i];
+    if (!s || s.unsupported) return;
+    const btn = document.createElement('button');
+    btn.className = 'ghost';
+    btn.textContent = txt('ui.snaps.open');
+    btn.addEventListener('click', () => openSnapshot(part, i, s));
+    el.querySelector('.top').appendChild(btn);
+  });
   tabCount('triage', snaps.length);
+}
+
+function renderSnapshots(r, part) {
+  const box = $('#art-results');
+  if (r.error) return box.innerHTML = `<p class="empty">${esc(r.error)}</p>`;
+  const snaps = r.snapshots || [];
+  const notes = (r.findings || []).map(f =>
+    `<div class="notice">${esc(f)}</div>`).join('');
+  if (!snaps.length) {
+    box.innerHTML = notes + `<p class="empty">${esc(r.note
+      || txt('ui.snaps.none'))}</p>`;
+    tabCount('triage', 0);
+    return;
+  }
+  box.innerHTML = notes + `<div class="results-head">${
+    txt('ui.snaps.apfs_newest_first', { snaps: snaps.length })}</div>` +
+    snaps.map((s, i) => `
+    <div class="result" data-i="${i}">
+      <div class="top">
+        <span class="kind">snapshot</span>
+        <span class="off">${s.snapshot_xid ? 'xid ' + s.snapshot_xid : ''}</span>
+      </div>
+      <div class="name">${esc(s.name || '')}</div>
+      <div class="meta">${s.created_at ? fmt.time(s.created_at) : ''}${
+        s.inum ? ' · inode ' + s.inum : ''}</div>
+      ${s.dataless ? `<div class="meta">${esc(txt('ui.snaps.dataless'))}</div>` : ''}
+      <div class="path">${esc(txt('ui.snaps.browse'))} →</div>
+    </div>`).join('');
+  bindResults(box, el => {
+    const s = snaps[+el.dataset.i];
+    if (s) enterSnapshot(part, s.name);
+  });
+  tabCount('triage', snaps.length);
+}
+
+async function enterSnapshot(part, name) {
+  S.snap = { part: partOffset(part), name };
+  dirCache.clear();
+  toast(txt('ui.snaps.viewing', { name }));
+  const p = (S.volumes?.partitions || [])
+    .find(x => x.offset === partOffset(part)) || part;
+  await previewRoot(p);
+}
+
+function exitSnapshot() {
+  const was = S.snap;
+  S.snap = null;
+  dirCache.clear();
+  if (!was) return;
+  const p = (S.volumes?.partitions || [])
+    .find(x => x.offset === was.part) || null;
+  if (p) previewRoot(p);
+}
+
+async function openSnapshot(part, i, s) {
+  const po = partObj(part);
+  if (!po) return toast(txt('messages.toast.pick_filesystem'));
+  const pseudo = { ...po, offset: po.offset, snap: i, ev_id: S.activeId };
+  S.lastPick = { kind: 'entry', e: null, part: pseudo, from: null, stream: null };
+  S.snapLabel = txt('ui.snaps.snapshot_view',
+                    { created: fmt.time(s.created_at) });
+  await previewRoot(pseudo);
 }
 
 function renderBrowser(r, part) {
@@ -6857,7 +7131,7 @@ function tabCount(view, n) {
   const tab = $(`.tab[data-view="${view}"]`);
   const base = { carve: 'Carved', find: 'Search', marks: 'Marks',
                  time: 'Timeline', tags: 'Tagged', hash: 'Hashes',
-                 triage: 'Triage', attack: 'ATT&CK' }[view];
+                 triage: 'Triage', attack: 'ATT&CK', diff: 'Diff' }[view];
   if (!base) return;
   tab.innerHTML = n == null ? base : `${base} <span class="count">${n}</span>`;
 }
@@ -7708,7 +7982,8 @@ async function showEventBytes(e) {
                   ...nodeEntry(part.detected, n) };
   const st = n == null ? null
     : await api.get('stat', { part: partOffset(part),
-                              entry: JSON.stringify(entry) }).catch(() => null);
+                              entry: JSON.stringify(entry),
+                              snap: snapParam(part) }).catch(() => null);
   if (seq !== eventBytesSeq) return;
   if (!scopedTo(part)) {
     setScope(partOffset(part), part.size ?? S.image.size, scopeLabel(part), null);
@@ -7849,7 +8124,8 @@ async function openMark(d) {
   Object.assign(entry, nodeEntry(fsName, n));
   const st = await api.get('stat', { part: partOffset(p),
                                      entry: JSON.stringify(entry),
-                                     stream: d.stream || undefined });
+                                     stream: d.stream || undefined,
+                                     snap: snapParam(p) });
   if (!st || st.error) return toast(txt('messages.mark_file_not_readable'));
   const bytes = st.size != null ? st.size : null;
   if (!bytes) return toast(txt('messages.mark_file_not_readable'));
@@ -7910,7 +8186,8 @@ async function openDocument(e, part) {
   const token = (pvToken = Symbol());
   pvSet(e.name, 'document', `<p class="empty">${txt('ui.preview_entry.reading')}</p>`);
   const d = await api.get('document', { part: partOffset(part),
-                                       entry: JSON.stringify(e) });
+                                       entry: JSON.stringify(e),
+                                       snap: snapParam(part) });
   if (pvToken !== token) return;
   if (d.error) return pvSet(e.name, 'document',
     `<div class="notice bad">${esc(d.error)}</div>`);
@@ -8787,6 +9064,7 @@ function applyNoCase() {
   S.activeId = null;
   S.evidenceId = null;
   S.scope = null;
+  S.snapLabel = null;
   S.marks = [];
   S.tags = [];
   $('#evidence-bar').innerHTML = `
@@ -8807,6 +9085,7 @@ $('#btn-new-case')?.addEventListener('click', newCaseDialog);
 $('#btn-open-case')?.addEventListener('click', () => caseDialog());
 $('#btn-case-add')?.addEventListener('click', () => openDialog({ add: !!S.casePath }));
 $('#btn-close-case')?.addEventListener('click', closeCaseDialog);
+$('#btn-compact-case')?.addEventListener('click', compactCase);
 $('#newcase-name')?.addEventListener('input', pathHint);
 $('#newcase-path')?.addEventListener('input', pathHint);
 $('#dlg-new-case')?.addEventListener('close', () => {
@@ -9021,9 +9300,29 @@ async function relocateIndex(pending) {
   const t = await api.post('index/relocate', {}).catch(() => null);
   if (!t || t.error || t.nothing_to_do) return;
   const r = await awaitTask(t, txt('ui.index.moving'));
-  if (r && r.moved) {
+  if (r && r.moved && r.converted) {
+    toast(txt('messages.index_converted', {
+      before: fmt.bytes(r.before), after: fmt.bytes(r.after) }), 'task');
+  } else if (r && r.moved) {
     toast(txt('messages.index_moved', { count: r.moved }), 'task');
+  } else if (r && r.deferred) {
+    toast(txt('messages.index_move_deferred', {
+      need: fmt.bytes(r.need), free: fmt.bytes(r.free) }));
+  } else if (r && r.error) {
+    toast(txt('messages.index_move_failed', { error: r.error }));
   }
+}
+
+async function compactCase() {
+  if (!S.casePath) return toast(txt('messages.cases.none_open'));
+  const t = await api.post('case/compact', {}).catch(() => null);
+  if (!t) return;
+  if (t.error) return toast(t.tasks?.length ? `${t.error} ${t.advice}` : t.error);
+  const r = await awaitTask(t, txt('ui.cases.compacting'));
+  if (!r) return;
+  if (!r.compacted) return toast(r.error || txt('messages.cases.compact_failed'));
+  toast(txt('messages.cases.compacted', {
+    before: fmt.bytes(r.before), after: fmt.bytes(r.after) }), 'task');
 }
 
 async function loadVersion() {
@@ -9443,6 +9742,7 @@ $('#find-scope').addEventListener('change', refreshIndexState);
 $('#btn-save-search').addEventListener('click', saveCurrentSearch);
 $('#btn-hash').addEventListener('click', doHash);
 $('#btn-duplicates').addEventListener('click', doDuplicates);
+$('#btn-diff').addEventListener('click', runDiff);
 $('#btn-similar').addEventListener('click', doSimilar);
 $('#btn-artifacts').addEventListener('click', () => doArtifacts(true));
 $('#art-scope')?.addEventListener('change', () => { artPick = null; renderArtTree(); });
@@ -9694,6 +9994,7 @@ function setModule(view) {
   if (view === 'sources') core.draw();
   if (view === 'cases') renderCases();
   if (view === 'time') loadStoredTimeline();
+  if (view === 'diff') renderDiffPanel();
   hex.resize();
 }
 

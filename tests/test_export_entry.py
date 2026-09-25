@@ -18,6 +18,7 @@ Issue #94: exFAT's actual read-path branch is `contiguous`, not `deleted`
 had the same silent-truncation problem even after #91.
 """
 
+import csv
 import os
 import shutil
 import sys
@@ -160,6 +161,74 @@ class ExfatContiguousByNodeAlone(unittest.TestCase):
         self.assertEqual(written, e["size"])
         with open(path, "rb") as fh:
             self.assertEqual(fh.read(), self.fs.read_file(e))
+
+
+class _FakeSessionWithOpen(FakeSession):
+    """FakeSession plus the .open() _add_derived calls after logging."""
+
+    def open(self, path, add=False, logical=False):
+        return {"opened": True, "path": path, "logical": logical}
+
+
+class ExportRecordsSnapshotOrigin(unittest.TestCase):
+    """Regression: an export's case-log entry and manifest row didn't say
+    which snapshot (if any) the bytes actually came from -- an examiner
+    reading the case log or manifest.csv later had no way to tell a
+    snapshot-sourced export from a live one."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.files = ImageFiles()
+        cls.image = cls.files.open(build.build_fat(16))
+        cls.layout, cls.part, cls.fs = open_first_volume(cls.image)
+        cls.root = by_name(cls.fs.listdir(0))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.files.close()
+
+    def setUp(self):
+        self.out_dir = tempfile.mkdtemp(prefix="strata-export-snap-test-")
+        self.addCleanup(shutil.rmtree, self.out_dir, ignore_errors=True)
+        self.session = _FakeSessionWithOpen()
+
+    def test_export_one_records_the_snapshot_index(self):
+        e = self.root["_ELETED.TXT"]
+        rec, _, _ = server._export_one(
+            self.fs, e, self.out_dir, self.session, manifest=False, snap=2)
+        self.assertEqual(rec["snapshot"], 2)
+        action, detail = self.session.case.logged[-1]
+        self.assertEqual(action, "export.item")
+        self.assertEqual(detail["snap"], 2)
+
+    def test_export_one_records_no_snapshot_as_empty_not_missing(self):
+        e = self.root["_ELETED.TXT"]
+        rec, _, _ = server._export_one(
+            self.fs, e, self.out_dir, self.session, manifest=False)
+        self.assertEqual(rec["snapshot"], "")
+        action, detail = self.session.case.logged[-1]
+        self.assertIsNone(detail["snap"])
+
+    def test_add_derived_logs_the_snapshot_it_came_from(self):
+        parent = type("Parent", (), {"evidence_id": 1, "label": "x",
+                                     "path": "/img.E01"})()
+        derived_dir = os.path.join(self.out_dir, "derived")
+        os.makedirs(derived_dir)
+        server._add_derived(self.session, derived_dir, parent, "/a.txt",
+                            "deadbeef", "logical", snap=3)
+        action, detail = self.session.case.logged[-1]
+        self.assertEqual(action, "exhibit.derived")
+        self.assertEqual(detail["snap"], 3)
+
+    def test_manifest_csv_carries_the_snapshot_column(self):
+        e = self.root["_ELETED.TXT"]
+        server._export_one(self.fs, e, self.out_dir, self.session,
+                           manifest=True, snap=1)
+        with open(os.path.join(self.out_dir, "manifest.csv"),
+                  newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["snapshot"], "1")
 
 
 class TaggedItemsContiguousColumn(unittest.TestCase):
