@@ -292,70 +292,115 @@ fn cbc_decrypt_inner<A: BlockDecrypt + KeyInit + BlockSizeUser<BlockSize = U16>>
     STRATA_OK
 }
 
-/// Load-time self-test.  Nonzero return = the loader refuses the library
-/// and stays on pure Python.
+/// Load-time self-test: known-answer vectors, not consistency checks.
 ///
-/// The RFC 9106 §5 vectors all carry secret + associated data, which the
-/// argon2 crate's raw `hash_password_into(pwd, salt)` does not accept; the
-/// authoritative vector comparison therefore runs in Python
-/// (tests/test_native_crypto.py) against the pure-Python oracle, and the
-/// native wrapper falls back whenever it cannot reproduce an output.
-/// Here we pin: (a) the call succeeds, (b) it is deterministic, (c) CBC
-/// links and produces stable output for a fixed input.
+/// Each primitive is checked against a published answer, so a build that
+/// links, loads and runs but computes the wrong thing (a compiler or
+/// platform problem, or a later refactor of the hand-rolled XTS loop) is
+/// refused and the loader stays on pure Python:
+///
+/// * Argon2id -- RFC 9106 section 5.3 (secret and associated data included),
+///   through the same `strata_argon2_derive` the engine calls.
+/// * AES-CBC -- NIST SP 800-38A F.2.2 (CBC-AES128.Decrypt, first block).
+/// * AES-XTS -- IEEE 1619-2007 vectors 1 and 2 (AES-128), through
+///   `strata_xts_decrypt`. Vector 2 uses a nonzero sector, which exercises
+///   the tweak encoding.
+///
+/// Broader agreement with the pure-Python implementation (key sizes, sector
+/// sizes, ciphertext stealing being refused) is checked by
+/// tests/test_native_crypto.py, not at load time.
 #[no_mangle]
 pub extern "C" fn strata_selftest() -> i32 {
+    // RFC 9106 5.3, Argon2id: pwd 32x01, salt 16x02, secret 8x03, ad 12x04,
+    // t=3, m=32 KiB, p=4, 32-byte tag.
+    const ARGON2ID_TAG: [u8; 32] = [
+        0x0d, 0x64, 0x0d, 0xf5, 0x8d, 0x78, 0x76, 0x6c, 0x08, 0xc0, 0x37,
+        0xa3, 0x4a, 0x8b, 0x53, 0xc9, 0xd0, 0x1e, 0xf0, 0x45, 0x2d, 0x75,
+        0xb6, 0x5e, 0xb5, 0x25, 0x20, 0xe9, 0x6b, 0x01, 0xe6, 0x59,
+    ];
+    let (pwd, salt, secret, ad) = ([0x01u8; 32], [0x02u8; 16], [0x03u8; 8], [0x04u8; 12]);
     let mut tag = [0u8; 32];
-    let args = (
-        [0x01u8; 32], [0x02u8; 16], [0x03u8; 8], [0x04u8; 12],
-    );
     if strata_argon2_derive(
-        args.0.as_ptr(), 32,
-        args.1.as_ptr(), 16,
+        pwd.as_ptr(), pwd.len(),
+        salt.as_ptr(), salt.len(),
         3, 32, 4, 32,
         2, 0x13,
-        args.2.as_ptr(), 8,
-        args.3.as_ptr(), 12,
+        secret.as_ptr(), secret.len(),
+        ad.as_ptr(), ad.len(),
         tag.as_mut_ptr(),
     ) != STRATA_OK
+        || tag != ARGON2ID_TAG
     {
         return STRATA_ERR_SELFTEST;
     }
-    let mut tag2 = [0u8; 32];
-    if strata_argon2_derive(
-        args.0.as_ptr(), 32,
-        args.1.as_ptr(), 16,
-        3, 32, 4, 32,
-        2, 0x13,
-        args.2.as_ptr(), 8,
-        args.3.as_ptr(), 12,
-        tag2.as_mut_ptr(),
-    ) != STRATA_OK
-        || tag != tag2
-    {
-        return STRATA_ERR_SELFTEST;
-    }
-    // CBC: a fixed key/iv/block must decrypt to a stable value; assert the
-    // roundtrip property using the block cipher direction we don't export:
-    // encrypt via the argon2-free aes crate directly.
-    use aes::cipher::BlockEncrypt;
-    let key = [0x2bu8; 16];
-    let iv = [0u8; 16];
-    let plain = [0x6bu8; 16];
-    let mut enc_block = Block::from(plain);
-    let cipher = match aes::Aes128::new_from_slice(&key) {
-        Ok(c) => c,
-        Err(_) => return STRATA_ERR_SELFTEST,
-    };
-    cipher.encrypt_block(&mut enc_block);
-    let ct: [u8; 16] = enc_block.into();
+
+    // NIST SP 800-38A F.2.2, CBC-AES128.Decrypt, block 1.
+    let cbc_key: [u8; 16] = [
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+        0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+    ];
+    let cbc_iv: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    ];
+    let cbc_ct: [u8; 16] = [
+        0x76, 0x49, 0xab, 0xac, 0x81, 0x19, 0xb2, 0x46,
+        0xce, 0xe9, 0x8e, 0x9b, 0x12, 0xe9, 0x19, 0x7d,
+    ];
+    let cbc_pt: [u8; 16] = [
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+        0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+    ];
     let mut dec = [0u8; 16];
     if strata_cbc_decrypt(
-        key.as_ptr(), 16,
-        iv.as_ptr(),
-        ct.as_ptr(), 16,
+        cbc_key.as_ptr(), cbc_key.len(),
+        cbc_iv.as_ptr(),
+        cbc_ct.as_ptr(), cbc_ct.len(),
         dec.as_mut_ptr(),
     ) != STRATA_OK
-        || dec != plain
+        || dec != cbc_pt
+    {
+        return STRATA_ERR_SELFTEST;
+    }
+
+    // IEEE 1619-2007 XTS-AES-128 vector 1: key1 = key2 = 0, data unit 0,
+    // 32 zero bytes of plaintext.
+    let zero_key = [0u8; 16];
+    let xts1_ct: [u8; 32] = [
+        0x91, 0x7c, 0xf6, 0x9e, 0xbd, 0x68, 0xb2, 0xec,
+        0x9b, 0x9f, 0xe9, 0xa3, 0xea, 0xdd, 0xa6, 0x92,
+        0xcd, 0x43, 0xd2, 0xf5, 0x95, 0x98, 0xed, 0x85,
+        0x8c, 0x02, 0xc2, 0x65, 0x2f, 0xbf, 0x92, 0x2e,
+    ];
+    let mut xts_out = [0xffu8; 32];
+    if strata_xts_decrypt(
+        zero_key.as_ptr(), zero_key.as_ptr(), zero_key.len(),
+        0, xts1_ct.len(),
+        xts1_ct.as_ptr(), xts1_ct.len(),
+        xts_out.as_mut_ptr(),
+    ) != STRATA_OK
+        || xts_out != [0u8; 32]
+    {
+        return STRATA_ERR_SELFTEST;
+    }
+
+    // Vector 2: key1 = 16x11, key2 = 16x22, data unit 0x3333333333,
+    // plaintext 32x44.
+    let (k1, k2) = ([0x11u8; 16], [0x22u8; 16]);
+    let xts2_ct: [u8; 32] = [
+        0xc4, 0x54, 0x18, 0x5e, 0x6a, 0x16, 0x93, 0x6e,
+        0x39, 0x33, 0x40, 0x38, 0xac, 0xef, 0x83, 0x8b,
+        0xfb, 0x18, 0x6f, 0xff, 0x74, 0x80, 0xad, 0xc4,
+        0x28, 0x93, 0x82, 0xec, 0xd6, 0xd3, 0x94, 0xf0,
+    ];
+    let mut xts_out = [0u8; 32];
+    if strata_xts_decrypt(
+        k1.as_ptr(), k2.as_ptr(), k1.len(),
+        0x3333333333, xts2_ct.len(),
+        xts2_ct.as_ptr(), xts2_ct.len(),
+        xts_out.as_mut_ptr(),
+    ) != STRATA_OK
+        || xts_out != [0x44u8; 32]
     {
         return STRATA_ERR_SELFTEST;
     }

@@ -113,6 +113,49 @@ def _raw_selftest():
     return lib.strata_selftest()
 
 
+class PublishedAesVectors(unittest.TestCase):
+    """Published known answers for the pure implementation -- the oracle
+    every differential test here trusts -- and, when the sidecar is loaded,
+    for the sidecar too. The same vectors are compiled into the sidecar's
+    load-time self-test (native/src/lib.rs, strata_selftest)."""
+
+    # IEEE 1619-2007 XTS-AES-128, vectors 1 and 2.
+    XTS = (
+        (bytes(16), bytes(16), 0, bytes(32),
+         "917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e"),
+        (b"\x11" * 16, b"\x22" * 16, 0x3333333333, b"\x44" * 32,
+         "c454185e6a16936e39334038acef838bfb186fff7480adc4289382ecd6d394f0"),
+    )
+    # NIST SP 800-38A F.2.2, CBC-AES128.Decrypt, block 1.
+    CBC_KEY = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
+    CBC_IV = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+    CBC_CT = bytes.fromhex("7649abac8119b246cee98e9b12e9197d")
+    CBC_PT = bytes.fromhex("6bc1bee22e409f96e93d7e117393172a")
+
+    def test_pure_xts_matches_ieee_1619_vectors(self):
+        for k1, k2, sector, plain, ct in self.XTS:
+            self.assertEqual(
+                aes._xts_decrypt_py(k1, k2, sector, bytes.fromhex(ct)), plain)
+
+    def test_pure_cbc_matches_nist_800_38a(self):
+        self.assertEqual(
+            aes._cbc_decrypt_py(self.CBC_KEY, self.CBC_IV, self.CBC_CT),
+            self.CBC_PT)
+
+    @unittest.skipUnless(NATIVE, "native sidecar not available")
+    def test_native_xts_matches_ieee_1619_vectors(self):
+        for k1, k2, sector, plain, ct in self.XTS:
+            self.assertEqual(
+                native.aes_xts_decrypt(k1, k2, sector, bytes.fromhex(ct)),
+                plain)
+
+    @unittest.skipUnless(NATIVE, "native sidecar not available")
+    def test_native_cbc_matches_nist_800_38a(self):
+        self.assertEqual(
+            native.aes_cbc_decrypt(self.CBC_KEY, self.CBC_IV, self.CBC_CT),
+            self.CBC_PT)
+
+
 class FallbackContract(unittest.TestCase):
     """Runs everywhere: with native forced unavailable, behavior is
     exactly the pure-Python one."""
