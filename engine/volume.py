@@ -140,6 +140,13 @@ def _fat_label(source, offset):
         return _clean_label(boot[0x2B:0x36].decode("latin-1"))
     return None
 
+def _hfsplus_label(source, offset):
+    from .ewf import OffsetReader
+    from .fs import hfsplus
+    size = max(0, getattr(source, "size", 0) - offset)
+    return _clean_label(hfsplus.HfsPlus(
+        OffsetReader(source, offset, size)).volume_name())
+
 def volume_label(source, offset, detected):
     if not detected:
         return None
@@ -153,6 +160,8 @@ def volume_label(source, offset, detected):
             return _exfat_label(source, offset)
         if fs.startswith("FAT"):
             return _fat_label(source, offset)
+        if fs.startswith("HFS"):
+            return _hfsplus_label(source, offset)
     except Exception:
         return None
     return None
@@ -208,10 +217,15 @@ def _absent_fs_note(source, part):
             "The declared type may be stale, or the volume header damaged."
             % part["type"])
 
-def parse_mbr(source, sector_size=512):
+EXTENDED_TYPES = (0x05, 0x0F, 0x85)
+MAX_LOGICAL = 128
+
+def parse_mbr(source, sector_size=512, findings=None):
     d = source.read_at(0, 512)
     if len(d) < 512 or d[510:512] != b"\x55\xAA":
         return None, []
+    if findings is None:
+        findings = []
     parts = []
     protective = False
     for i in range(4):
@@ -226,15 +240,89 @@ def parse_mbr(source, sector_size=512):
         if start * sector_size >= source.size or \
                 (start + count) * sector_size > source.size * 2:
             continue
-        parts.append({
+        part = {
             "scheme": "MBR", "index": i, "slot": "MBR %d" % (i + 1),
             "type_id": "0x%02X" % ptype,
             "type": MBR_TYPES.get(ptype, "Unknown (0x%02X)" % ptype),
             "bootable": bool(e[0] & 0x80),
             "start_sector": start, "sector_count": count,
             "offset": start * sector_size, "size": count * sector_size,
-        })
+        }
+        parts.append(part)
+        if ptype in EXTENDED_TYPES:
+            part["container"] = True
+            parts.extend(_logical_partitions(source, sector_size, start,
+                                             count, findings))
     return ("GPT protective" if protective else "MBR"), parts
+
+def _logical_partitions(source, sector_size, ext_start, ext_count, findings):
+    """The logical partitions in an extended partition: a chain of extended
+    boot records, each describing one logical partition (relative to the
+    EBR itself) and the next EBR (relative to the extended partition)."""
+    out = []
+    ext_end = ext_start + ext_count
+    ebr = ext_start
+    seen = set()
+    while len(out) < MAX_LOGICAL:
+        if ebr in seen:
+            findings.append(
+                "The chain of extended boot records loops back to LBA %d; "
+                "the logical partitions before the loop are listed." % ebr)
+            break
+        seen.add(ebr)
+        d = source.read_at(ebr * sector_size, 512)
+        if len(d) < 512 or d[510:512] != b"\x55\xAA":
+            findings.append(
+                "The extended boot record at LBA %d has no boot signature, "
+                "so no logical partition from there on is listed; the "
+                "extended partition's space is still shown." % ebr)
+            break
+        e1, e2 = d[446:462], d[462:478]
+        ptype = e1[4]
+        rel, count = struct.unpack("<II", e1[8:16])
+        if ptype and count:
+            start = ebr + rel
+            if start < ext_start or start + count > ext_end:
+                findings.append(
+                    "A logical partition (type 0x%02X at LBA %d, %d sectors) "
+                    "lies outside the extended partition at LBA %d-%d. It is "
+                    "listed, but the chain describing it is damaged or was "
+                    "edited." % (ptype, start, count, ext_start, ext_end - 1))
+            if start * sector_size < source.size:
+                out.append({
+                    "scheme": "MBR", "index": 4 + len(out),
+                    "slot": "MBR %d" % (5 + len(out)),
+                    "logical_partition": True, "ebr_lba": ebr,
+                    "type_id": "0x%02X" % ptype,
+                    "type": MBR_TYPES.get(ptype, "Unknown (0x%02X)" % ptype),
+                    "bootable": bool(e1[0] & 0x80),
+                    "start_sector": start, "sector_count": count,
+                    "offset": start * sector_size,
+                    "size": count * sector_size,
+                })
+        ntype = e2[4]
+        nrel, ncount = struct.unpack("<II", e2[8:16])
+        if not ntype or not ncount:
+            break
+        if ntype not in EXTENDED_TYPES:
+            findings.append(
+                "The extended boot record at LBA %d links to a type 0x%02X "
+                "entry where the next record belongs; the chain stops there."
+                % (ebr, ntype))
+            break
+        nxt = ext_start + nrel
+        if not ext_start <= nxt < ext_end:
+            findings.append(
+                "The extended boot record at LBA %d links to LBA %d, outside "
+                "its extended partition; the chain stops there." % (ebr, nxt))
+            break
+        ebr = nxt
+    else:
+        findings.append(
+            "The extended partition describes more than %d logical "
+            "partitions; only the first %d are listed."
+            % (MAX_LOGICAL, MAX_LOGICAL))
+    return out
 
 def _gpt_header(source, lba, sector_size):
     findings = []
@@ -264,6 +352,8 @@ def _gpt_header(source, lba, sector_size):
         "lba": lba,
         "this_lba": struct.unpack_from("<Q", hdr, 24)[0],
         "alt_lba": struct.unpack_from("<Q", hdr, 32)[0],
+        "first_usable": struct.unpack_from("<Q", hdr, 40)[0],
+        "last_usable": struct.unpack_from("<Q", hdr, 48)[0],
         "disk_guid": _guid_le(hdr[56:72]),
         "entry_lba": struct.unpack_from("<Q", hdr, 72)[0],
         "n_entries": struct.unpack_from("<I", hdr, 80)[0],
@@ -375,6 +465,23 @@ def parse_gpt(source, sector_size=512):
                     "layout changed after the copy that was left behind.")
     return "GPT", parts, findings
 
+def gpt_usable(source, sector_size=512):
+    """(first, last) byte offsets of the area a GPT says partitions may use
+    (its usable LBA range, end exclusive), or None. Everything outside it is
+    the table itself, front and back; it is not unpartitioned space."""
+    size = getattr(source, "size", 0)
+    primary, _notes = _gpt_header(source, 1, sector_size)
+    alt = primary["alt_lba"] if primary else (size // sector_size) - 1
+    for header in (primary, _gpt_header(source, alt, sector_size)[0]
+                   if alt > 1 else None):
+        if header and header["first_usable"] <= header["last_usable"]:
+            lo = header["first_usable"] * sector_size
+            hi = (header["last_usable"] + 1) * sector_size
+            if lo < size:
+                return lo, min(hi, size)
+    return None
+
+
 def scan(source):
     ss = getattr(source, "bytes_per_sector", 512) or 512
 
@@ -426,7 +533,7 @@ def scan(source):
                         "offset": 0, "size": source.size, "allocated": True,
                         "label": volume_label(source, 0, at_zero),
                     }]}
-        scheme, parts = parse_mbr(source, ss)
+        scheme, parts = parse_mbr(source, ss, gpt_findings)
         if scheme == "GPT protective":
             gpt_findings.append(
                 "This disk carries a protective MBR, which means it was "
@@ -448,6 +555,15 @@ def scan(source):
                 }]}
 
     for p in parts:
+        if p.get("container"):
+            # An extended partition holds boot records and the logical
+            # partitions listed after it, never a filesystem of its own.
+            p["detected"] = None
+            p["allocated"] = True
+            p["label"] = None
+            p["note"] = ("A container for the logical partitions listed "
+                         "after it (MBR 5 onwards), not a volume itself.")
+            continue
         detected = identify_fs(source, p["offset"])
         p["detected"] = detected
         p["allocated"] = True
@@ -461,27 +577,95 @@ def scan(source):
             p["note"] = _absent_fs_note(source, p)
 
     regions = sorted(parts, key=lambda p: p["offset"])
+    containers = [(p["offset"], p["offset"] + p["size"]) for p in parts
+                  if p.get("container")]
     out = []
-    cursor = ss
-    for p in regions:
-        if p["offset"] > cursor + ss:
+
+    def gaps(lo, hi, trailing=False):
+        # Split at container edges: space inside an extended partition is
+        # unused but not unpartitioned.
+        edges = sorted({lo, hi} | {x for c in containers for x in c
+                                   if lo < x < hi})
+        for a, b in zip(edges, edges[1:]):
+            if b - a <= ss:
+                continue
+            inside = any(c0 <= a and b <= c1 for c0, c1 in containers)
+            kind = ("Unused (inside extended partition)" if inside else
+                    "Unpartitioned (trailing)" if trailing and b == hi else
+                    "Unpartitioned")
             out.append({
-                "scheme": "-", "slot": "Gap", "type": "Unpartitioned",
+                "scheme": "-", "slot": "Gap", "type": kind,
                 "label": None,
-                "type_id": "-", "start_sector": cursor // ss,
-                "sector_count": (p["offset"] - cursor) // ss,
-                "offset": cursor, "size": p["offset"] - cursor,
+                "type_id": "-", "start_sector": a // ss,
+                "sector_count": (b - a) // ss,
+                "offset": a, "size": b - a,
                 "allocated": False,
             })
+
+    cursor, end = ss, source.size
+    if scheme == "GPT":
+        usable = gpt_usable(source, ss)
+        if usable:
+            cursor, end = max(ss, usable[0]), usable[1]
+    for p in regions:
+        if p["offset"] > cursor + ss:
+            gaps(cursor, p["offset"])
         out.append(p)
-        cursor = max(cursor, p["offset"] + p["size"])
-    if source.size - cursor > ss:
-        out.append({
-            "scheme": "-", "slot": "Gap", "type": "Unpartitioned (trailing)",
-            "label": None,
-            "type_id": "-", "start_sector": cursor // ss,
-            "sector_count": (source.size - cursor) // ss,
-            "offset": cursor, "size": source.size - cursor, "allocated": False,
-        })
+        # A container's space is accounted for by what is inside it, so the
+        # gaps between its logical partitions are shown too.
+        cursor = max(cursor, p["offset"] if p.get("container")
+                     else p["offset"] + p["size"])
+    if end - cursor > ss:
+        gaps(cursor, end, trailing=True)
     return {"scheme": scheme, "partitions": out,
             "findings": gpt_findings}
+
+
+def identities(source, layout=None):
+    """Volume identities for each detected filesystem in an image.
+
+    Returns [{"part": <partition offset>, "key": "<scheme>:<id>"}] for every
+    partition whose filesystem exposes a stable volume identifier.  Partitions
+    without one (FAT, HFS+, logical folders) are omitted.
+    """
+    # Imported here rather than at module level: ewf and fs.ntfs are heavier
+    # modules and volume.py is imported on nearly every code path.
+    from .ewf import OffsetReader
+    from .fs import ntfs
+
+    layout = layout or scan(source)
+    found = []
+    for p in layout["partitions"]:
+        if not p.get("detected"):
+            continue
+        if p.get("logical") and p.get("detected") == "Logical":
+            continue
+        try:
+            src = OffsetReader(source, p["offset"], p["size"], p["slot"])
+            info = ntfs.open_fs(src).info()
+        except Exception:
+            # Encrypted volumes, unsupported filesystems, damaged boot
+            # records: identity extraction must never fail an acquire.
+            continue
+        kind = info.get("type")
+        if kind == "NTFS":
+            value = info.get("serial")
+            key = "ntfs:" + value if value else None
+        elif kind == "exFAT":
+            value = info.get("serial")
+            key = "exfat:" + value if value else None
+        elif kind == "ext4":
+            value = info.get("uuid")
+            key = "ext4:" + value if value else None
+        elif kind == "APFS":
+            value = info.get("uuid")
+            key = "apfs:" + value if value else None
+        elif kind == "AD1":
+            value = info.get("volume_serial")
+            key = "ad1:" + value if value else None
+        else:
+            key = None
+        if not key:
+            continue
+        found.append({"part": p["offset"], "key": key})
+    return found

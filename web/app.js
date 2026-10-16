@@ -45,6 +45,7 @@ const S = {
   structToken: null,
   fileHits: [],
   tags: [],
+  notes: [],
   tagCounts: {},
   suggestedTags: [],
   savedSearches: [],
@@ -59,6 +60,8 @@ const S = {
   lastSearchPart: null,
   prefs: {},
   markCats: [],
+  snap: null,
+  readOnly: false,
 };
 
 const fmt = {
@@ -72,6 +75,9 @@ const fmt = {
   },
   time(t) {
     if (!t) return '—';
+    // Recorded with no zone (FAT, DOS times, exFAT without an offset): shown
+    // as-is, neither labelled UTC nor converted to the display zone.
+    if (!hasZone(t)) return t.replace('T', ' ');
     const utc = t.replace('T', ' ').replace('Z', '');
     if (!S.tz || timeDisplay === 'utc') return utc + ' UTC';
     const local = fmt.localOf(t);
@@ -82,13 +88,17 @@ const fmt = {
   },
   count(n) { return Number(n || 0).toLocaleString(); },
   localOf(t) {
-    if (!S.tz || !t) return null;
+    if (!S.tz || !t || !hasZone(t)) return null;
     const d = new Date(t.endsWith('Z') ? t : t + 'Z');
     if (isNaN(d)) return null;
     const shifted = new Date(d.getTime() + tzOffsetAt(S.tz, d) * 60000);
     return shifted.toISOString().replace('T', ' ').replace(/\.\d+Z$|Z$/, '');
   },
 };
+
+function hasZone(t) {
+  return /(Z|[+-]\d\d:\d\d)$/.test(String(t));
+}
 
 const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
@@ -341,7 +351,8 @@ class HexView {
                                      entry: S.scope.entry
                                        ? JSON.stringify(S.scope.entry)
                                        : undefined,
-                                     stream: S.scope.stream || undefined });
+                                     stream: S.scope.stream || undefined,
+                                     snap: S.scope.snap ?? undefined });
     if (this.pending !== token) return;
     const bin = atob(r.data || '');
     const arr = new Uint8Array(bin.length);
@@ -957,7 +968,7 @@ function marksHere() {
   if (!S.scope.file) return S.marks.filter(m => (m.frame || 'media') !== 'file');
   const e = S.scope.entry;
   if (!e) return [];
-  const node = String(e.oid ?? e.mft ?? e.inode ?? e.start_cluster ?? e.path ?? '');
+  const node = String(nodeValue(e) ?? e.path ?? '');
   const stream = S.scope.stream || null;
   return S.marks.filter(m => m.frame === 'file'
     && String(m.node ?? '') === node
@@ -985,6 +996,7 @@ function offsetBase() {
 function setTimeDisplay(mode) {
   timeDisplay = ['utc', 'local'].includes(mode) ? mode : 'both';
   savePref('time_display', timeDisplay);
+  renderNotes();
   if (dirView.entries.length) renderDirView();
   if (inspecting && inspecting.entry) {
     showEntry(inspecting.entry, inspecting.part, inspecting.from,
@@ -1066,20 +1078,26 @@ function spanAt(off) {
 }
 
 const dirCache = new Map();
-const dirKey = (part, node, ev) =>
-  `${ev ?? S.activeId ?? '?'}:${part}:${node ?? 'root'}`;
+const dirKey = (part, node, ev, snap) =>
+  `${ev ?? S.activeId ?? '?'}:${part}:${node ?? 'root'}${snap != null ? `:s${snap}` : ''}`;
 
 const walkCache = new Map();
 const walkKey = (part, node) =>
-  dirKey(partOffset(part), node, part && part.ev_id);
+  dirKey(partOffset(part), node, part && part.ev_id,
+         part && part.snap);
 
-async function fetchDir(part, nodeId, path, ev) {
-  const key = dirKey(part, nodeId, ev);
+async function fetchDir(part, nodeId, path, ev, snap = null) {
+  // A VSS snapshot index is threaded through explicitly (part.snap); an
+  // APFS snapshot name comes from the global S.snap instead, so a caller
+  // that doesn't pass one falls back to whichever one is active.
+  snap = snap ?? snapParam(part);
+  const key = dirKey(part, nodeId, ev, snap);
   const hit = dirCache.get(key);
   if (hit) return hit;
 
   let r = await api.get('dir', { part, node: nodeId, path, types: 1,
-                                 ev: ev ?? undefined });
+                                 ev: ev ?? undefined,
+                                 snap: snap ?? undefined });
   if (r.building) {
     const done = await awaitTask(r.task, 'Indexing MFT', {
       modal: {
@@ -1089,11 +1107,23 @@ async function fetchDir(part, nodeId, path, ev) {
     });
     if (!done) return { error: txt('messages.indexing_interrupted') };
     r = await api.get('dir', { part, node: nodeId, path, types: 1,
-                               ev: ev ?? undefined });
+                               ev: ev ?? undefined,
+                               snap: snap ?? undefined });
   }
   if (!r.error) dirCache.set(key, r);
   return r;
 }
+
+const snapParam = part => {
+  // VSS snapshots are threaded on the part object itself (part.snap, a
+  // numeric index); APFS snapshots go through the global S.snap instead
+  // (a name, keyed to whichever part it was opened on), since only one
+  // of the two kinds of snapshot is ever open at a time.
+  if (part && part.snap != null) return part.snap;
+  const off = typeof part === 'object' && part !== null
+    ? partOffset(part) : part;
+  return S.snap && S.snap.part === off ? S.snap.name : undefined;
+};
 
 let selectedRow = null;
 function selectRow(el) {
@@ -1121,6 +1151,9 @@ function node({ label, tag, meta = null, cls = '', depth = 0,
     </span>${tag ? `<span class="tag">${tag}</span>` : ''}`;
   $('.label', el).textContent = label;
   if (meta) $('.meta', el).textContent = meta;
+  // The tree pane is narrow and both lines ellipsise; the hover title keeps
+  // the full text (a filesystem label, say) reachable.
+  $('.stack', el).title = meta ? `${label}\n${meta}` : label;
 
   if (onPick) {
     const box = $('.pick', el);
@@ -1195,12 +1228,20 @@ function partName(p, parts) {
   if (p.allocated === false) return txt('ui.unpartitioned_space');
   if (logicalRegion(p)) return p.slot;
   const n = partNumber(p, parts);
-  return `Partition ${n === null ? '?' : n}${p.label ? ` “${p.label}”` : ''}`;
+  // The name the partition table gives the partition (as FTK Imager and
+  // Disk Management show it); a partition with none, as on an MBR disk, is
+  // titled by its filesystem's label instead.
+  const name = p.name || p.label;
+  return `Partition ${n === null ? '?' : n}${name ? ` “${name}”` : ''}`;
 }
 
 function partDetail(p) {
   if (p.allocated === false) return fmt.bytes(p.size);
-  return `${fmt.bytes(p.size)} · ${p.detected || p.type || 'unrecognised'}`;
+  const parts = [fmt.bytes(p.size), p.detected || p.type || 'unrecognised'];
+  // The title carries the partition's name; the filesystem's own label is a
+  // separate thing and is shown here when there is both.
+  if (p.name && p.label) parts.push(txt('ui.part.volume_label', { name: p.label }));
+  return parts.join(' · ');
 }
 
 function partLabel(p, parts) {
@@ -1484,7 +1525,7 @@ async function listInto(holder, part, nodeId, depth, path, dirName) {
 
   const frag = document.createDocumentFragment();
   for (const e of r.entries) {
-    const childId = e.mft ?? e.inode ?? e.oid ?? e.start_cluster;
+    const childId = nodeValue(e);
     frag.appendChild(node({
       label: e.tree_label || e.name,
       meta: e.tree_label
@@ -1576,7 +1617,7 @@ function clearViewer() {
 
 function setScope(part, size, label, meta) {
   S.scope = { part, size, label, entry: null, stream: null,
-              extents: null, chunks: null, ev: S.activeId };
+              extents: null, chunks: null, ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = profileCache.get(profileKey(part)) || null;
   S.cursor = 0;
@@ -1642,7 +1683,7 @@ async function revealInTree(part, nodeId) {
 function setEmptyScope(label, part) {
   S.scope = { part: partOffset(part), size: 0, label, entry: null,
               stream: null, extents: null, chunks: null, empty: true,
-              ev: S.activeId };
+              ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = null;
   S.cursor = 0;
@@ -1662,7 +1703,7 @@ function setFileScope(entry, part, size, label, stream = null,
                      extents = null, chunks = null) {
   S.scope = { part: partOffset(part), size: size || 0, label,
               entry, stream, file: true, extents: extents || null,
-              chunks: chunks || null, ev: S.activeId };
+              chunks: chunks || null, ev: S.activeId, snap: null };
   S.scopeView = activeView();
   S.profile = profileCache.get(profileKey(partOffset(part), S.scope)) || null;
   S.cursor = 0;
@@ -1683,13 +1724,25 @@ function kv(pairs) {
     `<dt>${k}</dt><dd class="${num ? 'num' : ''}">${v}</dd>`).join('')}</dl>`;
 }
 
+// What a RAID set is made of, as the inspector lists it.
+function raidRows(a) {
+  const rows = [[txt('ui.kv.raid_level'), esc(a.level || '')]];
+  if (a['chunk size']) rows.push([txt('ui.kv.raid_chunk'), fmt.bytes(a['chunk size'])]);
+  if (a.layout) rows.push([txt('ui.kv.raid_layout'), esc(a.layout)]);
+  if (a['read from']) rows.push([txt('ui.kv.raid_read_from'), esc(a['read from'])]);
+  for (const k of Object.keys(a).filter(k => /^member \d+$/.test(k))) {
+    rows.push([k.replace('member', txt('ui.kv.raid_member')), esc(a[k])]);
+  }
+  return rows;
+}
+
 function showPartition(p) {
   const i = $('#inspect');
   if (p === S.image || p.format) {
     const a = S.image.acquisition || {};
     i.innerHTML = `
-      <div class="title">${S.image.segments[0]}</div>
-      <div class="subtitle">${S.image.format}</div>
+      <div class="title">${esc(S.image.segments[0])}</div>
+      <div class="subtitle">${esc(S.image.format)}</div>
       ${kv([
         [txt('ui.kv.size'), fmt.bytes(S.image.size), true],
         [txt('ui.kv.sectors'), (S.image.sector_count || 0).toLocaleString()],
@@ -1699,20 +1752,24 @@ function showPartition(p) {
       ])}
       <h3>${txt('ui.show_partition.acquisition')}</h3>
       ${kv([
-        a.case_number && [txt('ui.kv.case'), a.case_number],
-        a.evidence_number && [txt('ui.kv.evidence'), a.evidence_number],
-        a.examiner && [txt('ui.kv.examiner'), a.examiner],
-        a.acquisition_date && [txt('ui.kv.acquired'), a.acquisition_date],
-        a.acquiry_software && [txt('ui.kv.tool'), a.acquiry_software],
+        a.case_number && [txt('ui.kv.case'), esc(a.case_number)],
+        a.evidence_number && [txt('ui.kv.evidence'), esc(a.evidence_number)],
+        a.examiner && [txt('ui.kv.examiner'), esc(a.examiner)],
+        a.acquisition_date && [txt('ui.kv.acquired'), esc(a.acquisition_date)],
+        a.acquiry_software && [txt('ui.kv.tool'), esc(a.acquiry_software)],
+        a.parent && [txt('ui.kv.parent_disk'), esc(a.parent)],
+        a.parent && a['parent found by']
+          && [txt('ui.kv.parent_found_by'), esc(a['parent found by'])],
+        ...(S.image.raid ? raidRows(a) : []),
       ])}
       <h3>${txt('ui.stored_hashes')}</h3>
       ${kv([
-        [txt('ui.kv.md5'), S.image.stored_md5 || 'not stored'],
-        [txt('ui.kv.sha_1'), S.image.stored_sha1 || 'not stored'],
+        [txt('ui.kv.md5'), esc(S.image.stored_md5 || 'not stored')],
+        [txt('ui.kv.sha_1'), esc(S.image.stored_sha1 || 'not stored')],
       ])}
       ${(S.image.findings || []).length ? `<div class="notice bad">
         <strong>${S.image.findings.length} structural finding(s)</strong><br>
-        ${S.image.findings.slice(0, 6).join('<br>')}</div>` : ''}
+        ${S.image.findings.slice(0, 6).map(esc).join('<br>')}</div>` : ''}
       <div class="actions">
         <button class="ghost" id="btn-verify">${txt('ui.verify_hashes')}</button>
       </div>`;
@@ -1847,7 +1904,8 @@ async function showEntry(e, part, from = null, stream = null) {
     <div class="subtitle">${txt('ui.show_entry.reading')}</div>`;
   const st = await api.get('stat', { part: partOffset(part),
                                     entry: JSON.stringify(e),
-                                    stream: stream ? stream.name : undefined });
+                                    stream: stream ? stream.name : undefined,
+                                    snap: snapParam(part) });
 
   if (!st || st.error) {
     i.innerHTML = `<div class="title">${esc(e.name)}</div>
@@ -1903,6 +1961,41 @@ async function showEntry(e, part, from = null, stream = null) {
     ${stList.length > 1 ? `<p class="hint">Named streams do not appear in a
       directory listing and are not counted in the file's size. Select one to
       read it.</p>` : ''}`;
+
+  const xattrList = st.xattrs || [];
+  const xattrDecoded = d => {
+    if (Array.isArray(d)) {
+      return `<ul class="xattr-urls">${d.map(u => `<li class="mono">${esc(u)}</li>`).join('')}</ul>`;
+    }
+    return kv([
+      d.flags != null && [txt('ui.xattr.flags'), esc(d.flags)],
+      d.agent != null && [txt('ui.xattr.agent'), esc(d.agent)],
+      d.downloaded_at != null && [txt('ui.xattr.downloaded_at'), esc(d.downloaded_at)],
+      d.event_id != null && [txt('ui.xattr.event_id'), esc(d.event_id)],
+    ]);
+  };
+  const xattrs = !xattrList.length ? '' : `<h3>${txt('ui.extended_attributes')}</h3>
+    ${xattrList.map(a => {
+      const header = `<div class="runbar">
+          <span>${esc(a.name)}${a.truncated ? ' · truncated' : ''}</span>
+          <span class="len">${fmt.bytes(a.size)}</span>
+        </div>`;
+      if (a.value == null) {
+        return `${header}<p class="hint">${txt('ui.xattr.value_not_captured')}</p>`;
+      }
+      const bytes = Uint8Array.from(atob(a.value), c => c.charCodeAt(0));
+      if (a.decoded != null) {
+        return `${header}${a.name === 'com.apple.metadata:kMDItemWhereFroms'
+          ? `<p class="hint">${txt('ui.xattr.origin_urls')}</p>${xattrDecoded(a.decoded)}`
+          : xattrDecoded(a.decoded)}`;
+      }
+      const preview = looksTextual(bytes)
+        ? esc(decodeText(bytes).slice(0, 200))
+        : Array.from(bytes.slice(0, 32))
+            .map(b => b.toString(16).padStart(2, '0')).join(' ')
+          + (bytes.length > 32 ? '…' : '');
+      return `${header}<div class="hint mono">${preview}</div>`;
+    }).join('')}`;
 
   const ent = st.entropy && st.entropy.entropy !== null ? `<h3>${txt('ui.show_entry.entropy')}</h3>
     ${kv([
@@ -2000,6 +2093,7 @@ async function showEntry(e, part, from = null, stream = null) {
       e.mft_modified && [txt('ui.kv.mft_changed'), fmt.time(e.mft_modified)],
     ])}
     ${streams}
+    ${xattrs}
     ${exifBlock}
     ${ent}
     ${hashBlock}
@@ -2029,7 +2123,7 @@ async function showEntry(e, part, from = null, stream = null) {
       ${                                                                
                                                                        
                            ''}
-      <button class="ghost" id="btn-export">${txt('ui.show_entry.export')}</button>
+      <button class="ghost" id="btn-export"${S.readOnly ? ' disabled' : ''}>${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-tag">${txt('ui.show_entry.tag')}</button>
       ${stream ? '' : `<button class="ghost" id="btn-hash-one">${
         hb ? 'Rehash' : 'Hash'}</button>`}
@@ -2083,9 +2177,10 @@ async function exportEntry(e, part, dest = null, stream = '',
   }
   const r = await api.post('export/file', {
     part: partOffset(part), entry: e,
-    node: e.mft ?? e.inode ?? e.oid ?? e.start_cluster,
+    node: nodeValue(e),
     name: e.name, path: e.path, size: e.size, dest, stream,
-    add_exhibit: addExhibit });
+    add_exhibit: addExhibit,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (r.error) return toast(r.error);
   if (r.exhibit) {
     if (r.exhibit.added) {
@@ -2106,12 +2201,14 @@ async function exportEntry(e, part, dest = null, stream = '',
 const COPY_MAX = 1 << 20;
 
 async function rangeBytes(start, length) {
+  const snap = S.scope.snap;
   const r = S.scope.entry
     ? await api.get('hex', { offset: start, length, part: S.scope.part,
                              entry: JSON.stringify(S.scope.entry),
-                             stream: S.scope.stream || undefined })
+                             stream: S.scope.stream || undefined,
+                             snap: snap ?? undefined })
     : await api.get('hex', { offset: start + (S.scope.part || 0),
-                             length, part: null });
+                             length, part: null, snap: snap ?? undefined });
   if (r.error) throw new Error(r.error);
   return b64ToBytes(r.data);
 }
@@ -2301,8 +2398,25 @@ function sniffZip(b) {
       return { ext: 'ooxml', kind: 'office', label };
     }
   }
+  // Word, Excel and PowerPoint write [Content_Types].xml first, so the first
+  // entry says nothing. The entries after it are named in their own local
+  // headers, which the bytes in hand usually reach.
+  const seen = new TextDecoder('latin1').decode(b);
+  for (const [re, label] of OOXML_PARTS) {
+    if (re.test(seen)) return { ext: 'ooxml', kind: 'office', label };
+  }
   return null;
 }
+
+const OOXML_PARTS = [
+  [/PK[^]{26}word\//, txt('ui.word_document_docx')],
+  [/PK[^]{26}ppt\//, txt('ui.powerpoint_presentation_pptx')],
+  [/PK[^]{26}xl\//, txt('ui.excel_workbook_xlsx')],
+];
+
+// A large first entry can push the rest past the bytes read, so the name is
+// the last word: these are the Office extensions that are zips inside.
+const OFFICE_ZIP_EXT = /\.(docx|docm|dotx|dotm|xlsx|xlsm|xltx|xltm|xlsb|pptx|pptm|ppsx|potx|odt|ods|odp|ott|ots|otp)$/i;
 
 function sniffIsoBmff(b) {
   if (b.length < 12 || String.fromCharCode(...b.slice(4, 8)) !== 'ftyp') return null;
@@ -2406,13 +2520,32 @@ function typedCard(kind, e, truncated) {
 
 function fileURL(entry, part) {
   const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  const snap = snapParam(part);
+  if (snap != null) q.set('snap', String(snap));
   return `/api/file?${q}`;
 }
 
+function thumbnailURL(entry, part) {
+  const q = new URLSearchParams({ part: part.offset, entry: JSON.stringify(entry) });
+  if (part.snap != null) q.set('snap', String(part.snap));
+  return `/api/thumbnail?${q}`;
+}
+
 function dirSet(name, meta, html) {
+  const snapBanner = S.snap
+    ? `<div class="notice snap-banner">${esc(
+        txt('ui.snaps.viewing', { name: S.snap.name }))}
+        <button class="ghost btn-snap-close">${esc(txt('ui.snaps.close'))}</button></div>`
+    : '';
   $('#dir-name').textContent = name;
   $('#dir-meta').textContent = meta || '';
+  const list = $('#dirlist');
+  const prev = list.previousElementSibling;
+  if (prev && prev.classList.contains('snap-banner')) prev.remove();
+  if (snapBanner) list.insertAdjacentHTML('beforebegin', snapBanner);
   $('#dirlist').innerHTML = html;
+  const btn = $('.btn-snap-close');
+  if (btn) btn.addEventListener('click', exitSnapshot);
 }
 
 function pvSet(title, kind, html) {
@@ -2445,7 +2578,16 @@ async function loadHashMap(part, force = false) {
   hashMap = { ev: S.activeId, part, map: (r && r.map) || {} };
 }
 
-const nodeOf = e => String(e.mft ?? e.inode ?? e.oid ?? e.start_cluster ?? '');
+// The handle a filesystem reader gives an entry: the MFT record (NTFS), inode
+// (ext), object ID (APFS, logical evidence), catalog node ID (HFS+) or first
+// cluster (FAT, exFAT). Kept in step with engine/nodes.py.
+const NODE_KEYS = ['mft', 'inode', 'oid', 'cnid', 'start_cluster'];
+function nodeValue(e) {
+  for (const k of NODE_KEYS) if (e[k] != null) return e[k];
+  return undefined;
+}
+
+const nodeOf = e => String(nodeValue(e) ?? '');
 
 const PAGE_ROWS = 400;
 
@@ -2474,6 +2616,7 @@ const dirView = {
   entries: [], name: '', part: null, id: undefined,
   self: null,
   trail: [],
+  columnsOpen: false,
 };
 
 function resetDirView() {
@@ -2488,6 +2631,7 @@ function resetDirView() {
   dirView.id = undefined;
   dirView.self = null;
   dirView.trail = [];
+  dirView.columnsOpen = false;
   dirView.recursive = false;
   dirView.rootPath = null;
   dirView.truncated = false;
@@ -2505,6 +2649,11 @@ function enterCase(next) {
 function hashOf(e, which = 'sha256') {
   const h = hashMap.map[nodeOf(e)];
   return h ? h[which] : null;
+}
+
+function matchOf(e) {
+  const h = hashMap.map[nodeOf(e)];
+  return h ? h.match_kind : null;
 }
 
 function glyphFor(e) {
@@ -2553,7 +2702,7 @@ function visibleEntries() {
 
 async function previewDir(entries, name, part, id = undefined, self = null,
                           parent = null, scope = null) {
-  await loadHashMap(partOffset(part));
+  if (part && part.snap == null) await loadHashMap(partOffset(part));
   if (scope) {
     dirView.trail = [];
   } else if (!parent) {
@@ -2604,7 +2753,7 @@ async function dirUp() {
 
 async function listAllBelow(part, e = null) {
   if (!await useOwner(part)) return;
-  const node = e ? (e.mft ?? e.inode ?? e.oid ?? e.start_cluster) : null;
+  const node = e ? nodeValue(e) : null;
   const root = e ? (e.path || '/') : '/';
   const label = e ? (e.name || root) : txt('ui.dir.at_root');
   const scopeName = txt('ui.dir.scope_below', { name: label });
@@ -2645,6 +2794,135 @@ async function listAllBelow(part, e = null) {
                      truncated: r.truncated, budget: r.budget });
 }
 
+// The columns of the folder listing, after the name. The case decides which
+// are shown and in what order (see loadCasePrefs); "path" only has a place in
+// a listing of everything below a folder.
+const FOLDER_COL_IDS = ['path', 'size', 'extension', 'signature', 'created',
+                        'modified', 'accessed', 'md5', 'sha'];
+
+const FOLDER_COLS = {
+  path: {
+    label: () => txt('ui.col.path'),
+    head: th => th('path', txt('ui.col.path'), 'c-path', txt('ui.dir.title_path')),
+    cell: e => `<td class="c-path" title="${esc(e.path || '')}">${
+      esc(folderOf(e))}</td>`,
+  },
+  size: {
+    label: () => txt('ui.kv.size'),
+    head: th => th('size', txt('ui.kv.size')),
+    cell: e => `<td class="sz">${e.is_dir ? '—' : fmt.bytes(e.size)}</td>`,
+  },
+  extension: {
+    label: () => txt('ui.render_dir_view.extension'),
+    head: () => `<th class="c-ty" title="${txt('ui.dir.title_extension')}">${
+      txt('ui.render_dir_view.extension')}</th>`,
+    cell: (e, t) => `<td class="ty2 c-ty">${
+      esc(t ? (t.extension_says || '—') : '')}</td>`,
+  },
+  signature: {
+    label: () => txt('ui.render_dir_view.signature'),
+    head: () => `<th class="c-ty" title="${txt('ui.dir.title_signature')}">${
+      txt('ui.render_dir_view.signature')}</th>`,
+    cell: (e, t, bad) => `<td class="ty2 c-ty${bad ? ' bad' : ''}">${
+      esc(t ? (t.content_is
+        || (t.verdict === 'no signature' ? 'no signature' : '—')) : '')}</td>`,
+  },
+  created: {
+    label: () => txt('ui.kv.created'),
+    head: th => th('created', txt('ui.kv.created')),
+    cell: e => `<td class="dt">${fmt.time(e.created)}</td>`,
+  },
+  modified: {
+    label: () => txt('ui.kv.modified'),
+    head: th => th('modified', txt('ui.kv.modified')),
+    cell: e => `<td class="dt">${fmt.time(e.modified)}</td>`,
+  },
+  accessed: {
+    label: () => txt('ui.kv.accessed'),
+    head: th => th('accessed', txt('ui.kv.accessed')),
+    cell: e => `<td class="dt">${fmt.time(e.accessed)}</td>`,
+  },
+  md5: {
+    label: () => txt('ui.render_dir_view.md5'),
+    head: () => `<th class="c-hash" title="${txt('ui.dir.title_md5')}">${
+      txt('ui.render_dir_view.md5')}</th>`,
+    cell: e => `<td class="ty2 mono c-hash" title="${esc(hashOf(e, 'md5') || '')}">${
+      e.is_dir ? '' : (hashOf(e, 'md5')
+        ? esc(hashOf(e, 'md5').slice(0, 12)) + '…' : '')}</td>`,
+  },
+  sha: {
+    label: () => txt('ui.render_dir_view.sha'),
+    head: () => `<th class="c-hash" title="${txt('ui.dir.title_sha256')}">${
+      txt('ui.render_dir_view.sha')}</th>`,
+    cell: e => `<td class="ty2 mono c-hash" title="${esc(hashOf(e) || '')}">${
+      e.is_dir ? '' : (hashOf(e) ? esc(hashOf(e).slice(0, 12)) + '…' : '')}</td>`,
+  },
+};
+
+// Which columns are drawn, in order. null means the case has not chosen.
+function folderColumnList() {
+  const chosen = S.folderColumns
+    || S.folderColumnsDefault
+    || FOLDER_COL_IDS;
+  return chosen.filter(c => FOLDER_COLS[c]);
+}
+
+function folderColumns() {
+  return folderColumnList().filter(c => c !== 'path' || dirView.recursive);
+}
+
+async function loadCasePrefs() {
+  S.folderColumns = null;
+  S.folderColumnsDefault = null;
+  if (!S.casePath) return;
+  const r = await api.get('case/prefs').catch(() => null);
+  if (!r || r.error) return;
+  S.folderColumns = Array.isArray(r.folder_columns) ? r.folder_columns : null;
+  S.folderColumnsDefault = Array.isArray(r.folder_columns_default)
+    ? r.folder_columns_default : null;
+  if (dirView.id !== undefined && $('#dirlist .dv-list')) renderDirView();
+}
+
+async function saveFolderColumns(list) {
+  S.folderColumns = list;
+  if (!S.casePath) return;
+  const r = await api.post('case/prefs', {
+    case: S.casePath, folder_columns: list,
+  }).catch(() => null);
+  if (!r || r.error) toast(r?.error || txt('messages.columns_not_saved'));
+}
+
+function columnsMenuHTML() {
+  const shown = folderColumnList();
+  const rest = FOLDER_COL_IDS.filter(c => !shown.includes(c));
+  const row = (c, on, i) => `
+    <div class="col-row" data-col="${c}"${c === 'path'
+      ? ` title="${esc(txt('ui.dir.columns_path_note'))}"` : ''}>
+      <label class="check"><input type="checkbox" data-on ${on ? 'checked' : ''}>
+        <span>${esc(FOLDER_COLS[c].label())}</span></label>
+      <span class="col-move">
+        <button class="ghost" data-up ${on && i > 0 ? '' : 'disabled'}
+          title="${esc(txt('ui.dir.columns_up'))}">↑</button>
+        <button class="ghost" data-down ${on && i < shown.length - 1 ? '' : 'disabled'}
+          title="${esc(txt('ui.dir.columns_down'))}">↓</button>
+      </span>
+    </div>`;
+  return `
+    <div class="col-menu" id="col-menu" role="dialog"
+         aria-label="${esc(txt('ui.dir.columns'))}">
+      <div class="col-row is-fixed"><span>${esc(txt('ui.col.name'))}</span>
+        <span class="dim">${esc(txt('ui.dir.columns_always'))}</span></div>
+      ${shown.map((c, i) => row(c, true, i)).join('')}
+      ${rest.map(c => row(c, false, -1)).join('')}
+      <div class="col-foot">
+        <span class="dim">${esc(S.casePath
+          ? txt('ui.dir.columns_saved_in_case')
+          : txt('ui.dir.columns_session_only'))}</span>
+        <button class="ghost" id="col-reset">${esc(txt('ui.dir.columns_reset'))}</button>
+      </div>
+    </div>`;
+}
+
 function renderDirView() {
   const { name, part } = dirView;
   const nav = navEntries();
@@ -2665,34 +2943,30 @@ function renderDirView() {
              value="${esc(dirView.filter)}">
       <span class="dv-count">${fmt.count(matched.length)}/${
         fmt.count(dirView.entries.length)}</span>
+      ${dirView.mode === 'gallery' ? '' : `<span class="col-wrap">
+        <button class="ghost" id="dv-columns" aria-haspopup="dialog"
+          aria-expanded="${dirView.columnsOpen ? 'true' : 'false'}"
+          title="${esc(txt('ui.dir.columns_title'))}">${esc(txt('ui.dir.columns'))}</button>
+        ${dirView.columnsOpen ? columnsMenuHTML() : ''}</span>`}
     </div>`;
 
   const wide = dirView.recursive;
+  const cols = folderColumns();
 
   const rowsHTML = (from, to) => entries.slice(from, to).map((e, n) => {
     const i = from + n;
     const t = e.type_check;
     const bad = t && t.mismatch;
+    const mk = matchOf(e);
     return `
         <tr data-i="${i}" class="${e._nav ? 'is-nav ' : ''}${
-      e.deleted ? 'is-del' : ''}${bad ? ' is-typemis' : ''}">
+      e.deleted ? 'is-del' : ''}${bad ? ' is-typemis' : ''}${
+      mk ? ' is-match-' + mk : ''}">
           <td class="nm"><span class="g">${e._nav ? '▲' : glyphFor(e)}</span>${
       esc(e.name)}${e._nav ? ` <span class="mis">${esc(e._label)}</span>` : ''}${
-      bad ? ` <span class="mis" title="${esc(t.why)}">renamed?</span>` : ''}</td>
-          ${wide ? `<td class="c-path" title="${esc(e.path || '')}">${
-        esc(folderOf(e))}</td>` : ''}
-          <td class="sz">${e.is_dir ? '—' : fmt.bytes(e.size)}</td>
-          <td class="ty2 c-ty">${esc(t ? (t.extension_says || '—') : '')}</td>
-          <td class="ty2 c-ty${bad ? ' bad' : ''}">${esc(t ? (t.content_is
-        || (t.verdict === 'no signature' ? 'no signature' : '—')) : '')}</td>
-          <td class="dt">${fmt.time(e.created)}</td>
-          <td class="dt">${fmt.time(e.modified)}</td>
-          <td class="dt">${fmt.time(e.accessed)}</td>
-          <td class="ty2 mono c-hash" title="${esc(hashOf(e, 'md5') || '')}">${
-      e.is_dir ? '' : (hashOf(e, 'md5')
-        ? esc(hashOf(e, 'md5').slice(0, 12)) + '…' : '')}</td>
-          <td class="ty2 mono c-hash" title="${esc(hashOf(e) || '')}">${
-      e.is_dir ? '' : (hashOf(e) ? esc(hashOf(e).slice(0, 12)) + '…' : '')}</td>
+      bad ? ` <span class="mis" title="${esc(t.why)}">renamed?</span>` : ''}${
+      mk ? ` <span class="hash-flag ${esc(mk)}">${esc(mk.replace('_', ' '))}</span>` : ''}</td>
+          ${cols.map(c => FOLDER_COLS[c].cell(e, t, bad)).join('')}
         </tr>`;
   }).join('');
 
@@ -2700,7 +2974,8 @@ function renderDirView() {
                        .filter(([e]) => !e.is_dir && IMG_RE.test(e.name));
   const shotsHTML = (from, to) => shots.slice(from, to).map(([e, i]) => `
         <figure class="dv-shot" data-i="${i}">
-          <img loading="lazy" alt="" src="${fileURL(e, part)}">
+          <img loading="lazy" alt="" src="${thumbnailURL(e, part)}"
+               data-full="${esc(fileURL(e, part))}">
           <figcaption class="${e.deleted ? 'is-del' : ''}"
             title="${esc(e.name)}">${esc(e.name)}</figcaption>
         </figure>`).join('');
@@ -2722,15 +2997,7 @@ function renderDirView() {
       }"${title ? ` title="${esc(title)}"` : ''}>${label}</th>`;
     body = `<table class="dv-list${wide ? ' is-flat' : ''}">
       <thead><tr>${th('name', txt('ui.col.name'))}${
-        wide ? th('path', txt('ui.col.path'), 'c-path',
-                  txt('ui.dir.title_path')) : ''}${th('size', txt('ui.kv.size'))}
-        <th class="c-ty" title="${txt('ui.dir.title_extension')}">${txt('ui.render_dir_view.extension')}</th>
-        <th class="c-ty" title="${txt('ui.dir.title_signature')}">${txt('ui.render_dir_view.signature')}</th>
-        ${th('created', txt('ui.kv.created'))}${th('modified', txt('ui.kv.modified'))}
-        ${th('accessed', txt('ui.kv.accessed'))}
-        <th class="c-hash" title="${txt('ui.dir.title_md5')}">${txt('ui.render_dir_view.md5')}</th>
-        <th class="c-hash" title="${txt('ui.dir.title_sha256')}"
-          >${txt('ui.render_dir_view.sha')}</th></tr></thead>
+        cols.map(c => FOLDER_COLS[c].head(th)).join('')}</tr></thead>
       <tbody>${rowsHTML(0, shown)}</tbody></table>`;
     if (!dirView.entries.length) {
       body += `<p class="empty">${txt('messages.empty_directory')}</p>`;
@@ -2778,6 +3045,17 @@ function renderDirView() {
     const el = rowUnder(ev.target);
     if (el) menu(el, ev);
   });
+  // Thumbnails try the (much cheaper) embedded EXIF thumbnail first; img
+  // error events don't bubble, so this listens on the capture phase to
+  // catch them from any <img> under bodyEl, including ones grow() adds
+  // later. data-retried guards against looping if the full image 404s too.
+  bodyEl?.addEventListener('error', ev => {
+    const img = ev.target;
+    if (img.tagName === 'IMG' && img.dataset.full && !img.dataset.retried) {
+      img.dataset.retried = '1';
+      img.src = img.dataset.full;
+    }
+  }, true);
 
   if (bodyEl && shown < total) {
     let drawn = shown;
@@ -2820,6 +3098,7 @@ function renderDirView() {
       dirView.shown = PAGE_ROWS;
       renderDirView();
     }));
+  wireColumnsMenu();
   const f = $('#dv-filter');
   if (f) {
     f.addEventListener('input', () => {
@@ -2833,6 +3112,62 @@ function renderDirView() {
     });
   }
 }
+
+function wireColumnsMenu() {
+  $('#dv-columns')?.addEventListener('click', ev => {
+    ev.stopPropagation();
+    dirView.columnsOpen = !dirView.columnsOpen;
+    renderDirView();
+    $(dirView.columnsOpen ? '#col-menu input' : '#dv-columns')?.focus();
+  });
+  const menu = $('#col-menu');
+  if (!menu) return;
+  // Fixed, from the button's own position: the listing pane is short and
+  // clips anything drawn inside it.
+  const at = $('#dv-columns').getBoundingClientRect();
+  menu.style.top = Math.round(at.bottom + 4) + 'px';
+  menu.style.right = Math.max(8, Math.round(window.innerWidth - at.right)) + 'px';
+  menu.style.maxHeight = Math.max(160, window.innerHeight - at.bottom - 24) + 'px';
+  menu.addEventListener('click', ev => ev.stopPropagation());
+  const change = async list => {
+    await saveFolderColumns(list);
+    renderDirView();
+  };
+  $$('#col-menu .col-row[data-col]').forEach(row => {
+    const c = row.dataset.col;
+    row.querySelector('[data-on]').addEventListener('change', ev => {
+      const now = folderColumnList().filter(x => x !== c);
+      change(ev.target.checked ? [...now, c] : now);
+    });
+    const move = by => {
+      const list = folderColumnList();
+      const i = list.indexOf(c);
+      const j = i + by;
+      if (i < 0 || j < 0 || j >= list.length) return;
+      [list[i], list[j]] = [list[j], list[i]];
+      change(list);
+    };
+    row.querySelector('[data-up]')?.addEventListener('click', () => move(-1));
+    row.querySelector('[data-down]')?.addEventListener('click', () => move(1));
+  });
+  $('#col-reset')?.addEventListener('click', async () => {
+    await saveFolderColumns(null);
+    renderDirView();
+  });
+}
+
+function closeColumnsMenu() {
+  if (!dirView.columnsOpen) return;
+  dirView.columnsOpen = false;
+  if ($('#col-menu')) renderDirView();
+}
+document.addEventListener('click', closeColumnsMenu);
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && dirView.columnsOpen) {
+    closeColumnsMenu();
+    $('#dv-columns')?.focus();
+  }
+});
 
 let pvToken = null;
 
@@ -2848,11 +3183,13 @@ async function previewEntry(e, part, from = null, stream = null) {
   if (e.is_dir) {
     pvSet(e.name || txt('ui.preview.preview_title'), '',
           `<p class="empty">${txt('messages.folder_has_a_listing_not_a_preview')}</p>`);
-    const nodeId = e.mft ?? e.inode ?? e.oid ?? e.start_cluster;
-    if (!dirCache.has(dirKey(part.offset, nodeId, part.ev_id))) {
+    const nodeId = nodeValue(e);
+    if (!dirCache.has(dirKey(part.offset, nodeId, part.ev_id,
+                       part.snap))) {
       dirSet(e.name, 'reading…', `<p class="empty">${txt('ui.reading_directory')}</p>`);
     }
-    const r = await fetchDir(part.offset, nodeId, e.path, part.ev_id);
+    const r = await fetchDir(part.offset, nodeId, e.path, part.ev_id,
+                             part.snap);
     if (pvToken !== token) return;
     if (r.error) return dirSet(e.name, 'error', `<p class="empty">${esc(r.error)}</p>`);
     return previewDir(r.entries, e.name, part, nodeId, e, from);
@@ -2871,7 +3208,8 @@ async function previewEntry(e, part, from = null, stream = null) {
   const want = Math.min(size, PV_MAX);
   const r = await api.get('preview', { part: part.offset,
                                        entry: JSON.stringify(e), length: want,
-                                       stream: stream ? stream.name : undefined });
+                                       stream: stream ? stream.name : undefined,
+                                       snap: snapParam(part) });
   if (pvToken !== token) return;
   if (r.error) return pvSet(label, 'error', `<p class="empty">${esc(r.error)}</p>`);
 
@@ -2917,6 +3255,9 @@ async function previewEntry(e, part, from = null, stream = null) {
   }
 
   if (kind?.kind === 'office') return openDocument(e, part);
+  if (kind?.ext === 'zip' && OFFICE_ZIP_EXT.test(e.name || '')) {
+    return openDocument(e, part);
+  }
   if (kind?.ext === 'zip' || (kind?.kind === 'archive' && kind.ext === 'zip')) {
     return openArchive(e, part);
   }
@@ -3262,6 +3603,8 @@ function switchTo(state, { keepTree = false } = {}) {
   }
   previewNone(txt('messages.select_partition_file'));
   loadMarks();
+  loadNotes();
+  loadTemplates();
   refreshIndexState();
   loadTimezone(false);
   const now = (state.evidence || [])
@@ -3281,15 +3624,22 @@ function tzLabel(mins) {
     String(Math.abs(mins) % 60).padStart(2, '0')}`;
 }
 
-async function loadTimezone(prompt = false) {
+// The zone already applied to the case, if any. Loading it never starts a
+// detection, so a page reload can restore it cheaply.
+async function loadAppliedTimezone() {
   let r;
-  try { r = await api.get('timezone'); } catch { return; }
+  try { r = await api.get('timezone'); } catch { return null; }
   if (r.applied) {
     S.tz = { ...r.applied, label: tzLabel(r.applied.offset_minutes) };
   }
   S.tzCandidates = r.candidates || [];
   renderTzStat();
-  if (r.applied) return;
+  return r;
+}
+
+async function loadTimezone(prompt = false) {
+  const r = await loadAppliedTimezone();
+  if (!r || r.applied) return;
 
   if (!r.detected) {
     const t = await api.post('timezone/detect', {});
@@ -3302,6 +3652,7 @@ async function loadTimezone(prompt = false) {
 }
 
 function renderTzStat() {
+  renderNotes();
   const el = $('#stat-tz');
   if (!el) return;
   if (!S.tz) {
@@ -3403,7 +3754,8 @@ function redrawDates() {
 
 async function openArchive(e, part) {
   const r = await api.get('archive', { part: partOffset(part),
-                                      entry: JSON.stringify(e) });
+                                       entry: JSON.stringify(e),
+                                       snap: snapParam(part) });
   if (r.error) {
     return pvSet(e.name, 'archive',
       `<p class="empty">${esc(r.error)}</p>` +
@@ -3447,7 +3799,8 @@ async function openArchiveEntry(i) {
   const item = a.info.items.filter(x => !x.is_dir)[i];
   if (!item) return;
   const r = await api.get('archive', {
-    part: a.part, entry: JSON.stringify(a.entry), inner: item.name });
+    part: a.part, entry: JSON.stringify(a.entry), inner: item.name,
+    snap: a.part && a.part.snap != null ? a.part.snap : undefined });
   if (r.error) return toast(r.error);
   const bytes = Uint8Array.from(atob(r.preview || ''), c => c.charCodeAt(0));
   const notes = (r.notes || []).map(n =>
@@ -3507,7 +3860,10 @@ function partIn(evId, offset) {
 function renderURL(e, part, as) {
   const q = new URLSearchParams({ part: String(partOffset(part)),
                                   entry: JSON.stringify(e) });
+  if (part && part.snap != null) q.set('snap', String(part.snap));
   if (as) q.set('as', as);
+  const snap = snapParam(part);
+  if (snap) q.set('snap', snap);
   return `/api/render?${q}`;
 }
 
@@ -3525,7 +3881,8 @@ function sanitisedNote(findings, what) {
 
 async function openPdf(e, part) {
   const info = await api.get('render', { part: partOffset(part),
-                                         entry: JSON.stringify(e) });
+                                         entry: JSON.stringify(e),
+                                         snap: snapParam(part) });
   if (info.error) return pvSet(e.name, 'pdf', `<p class="empty">${esc(info.error)}</p>`);
 
   const meta = [
@@ -3559,10 +3916,10 @@ async function openPdf(e, part) {
       (${info.active_content.length})</summary><ul>${active}</ul></details>` : ''}
     ${body}`);
 }
-
 async function openMarkup(e, part, kind) {
   const info = await api.get('render', { part: partOffset(part),
-                                         entry: JSON.stringify(e) });
+                                         entry: JSON.stringify(e),
+                                         snap: snapParam(part) });
   if (info.error) return pvSet(e.name, kind, `<p class="empty">${esc(info.error)}</p>`);
   if (!info.renderable) {
     return pvSet(e.name, kind,
@@ -3591,7 +3948,8 @@ async function openRegistry(entry, part, path = '') {
   reg.part = part; reg.entry = entry; reg.path = path;
   pvSet(entry.name, txt('ui.registry_hive'), `<p class="empty">${txt('ui.reading_hive')}</p>`);
   const r = await api.get('registry', {
-    part: part.offset, entry: JSON.stringify(entry), key: path });
+    part: part.offset, entry: JSON.stringify(entry), key: path,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (pvToken !== token) return;
   if (r.error) return pvSet(entry.name, 'registry', `<p class="empty">${esc(r.error)}</p>`);
   renderRegistry(r);
@@ -3616,7 +3974,11 @@ function renderRegistry(r) {
       <tbody>${r.values.map(v => `<tr class="${v.deleted ? 'is-del' : ''}">
         <td class="nm">${esc(v.name)}</td>
         <td class="ty">${esc(v.type)}</td>
-        <td class="dv" title="${esc(regValueText(v))}">${esc(regValueText(v))}</td>
+        <td class="dv"${v.truncated ? '' : ` title="${esc(regValueText(v))}"`}>${
+          v.truncated
+            ? `<button class="linkish reg-load-value" data-offset="${v.offset}">${
+                esc(regValueText(v))} — load</button>`
+            : esc(regValueText(v))}</td>
       </tr>`).join('')}</tbody>
     </table>` : `<p class="empty">${txt('ui.values_key')}</p>`;
 
@@ -3655,6 +4017,20 @@ function renderRegistry(r) {
   $$('#preview-body .crumb').forEach(el => el.addEventListener('click', () =>
     openRegistry(reg.entry, reg.part, el.dataset.p)));
   $('#reg-del')?.addEventListener('click', showRegistryDeleted);
+  $$('#preview-body .reg-load-value').forEach(el =>
+    el.addEventListener('click', () => loadRegistryValue(el)));
+}
+
+async function loadRegistryValue(el) {
+  const td = el.closest('td');
+  const offset = +el.dataset.offset;
+  td.textContent = txt('ui.render_registry.loading_value');
+  const v = await api.get('registry/value', {
+    part: reg.part.offset, entry: JSON.stringify(reg.entry), offset });
+  if (v.error) { td.textContent = v.error; return; }
+  const text = regValueText(v);
+  td.textContent = text;
+  td.title = text;
 }
 
 async function showRegistryDeleted() {
@@ -3693,10 +4069,11 @@ const EVTX_PAGE = 2000;
 async function openEventLog(entry, part, offset = 0) {
   const token = Symbol();
   pvToken = token;
+  const t = await api.post('evtx', {
+    part: part.offset, entry, limit: EVTX_PAGE, offset,
+    snap: part && part.snap != null ? part.snap : undefined });
   pvSet(entry.name, txt('ui.event_log'),
         `<p class="empty">${txt('ui.decoding_records_progress_task_tray')}</p>`);
-  const t = await api.post('evtx', {
-    part: part.offset, entry, limit: EVTX_PAGE, offset });
   const r = await awaitTask(t, txt('ui.decoding_events'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, txt('ui.event_log'),
@@ -3721,6 +4098,7 @@ async function openEventLog(entry, part, offset = 0) {
       <td class="sz">${x.event_id ?? '—'}</td>
       <td class="nm">${esc(x.level || '')}</td>
       <td class="nm">${esc(x.provider || '')}</td>
+      <td class="nm">${esc(x.description || '')}</td>
     </tr>`).join('');
 
   const total = r.total ?? recs.length;
@@ -3743,7 +4121,8 @@ async function openEventLog(entry, part, offset = 0) {
       <div class="dv-body">
         <table class="dv-list evtx">
           <thead><tr><th>${txt('ui.open_event_log.written')}</th><th>${txt('ui.open_event_log.event')}</th><th>${txt('ui.open_event_log.level')}</th>
-            <th>${txt('ui.open_event_log.provider')}</th></tr></thead>
+            <th>${txt('ui.open_event_log.provider')}</th>
+            <th title="${esc(txt('help.events.descriptions'))}">${txt('ui.open_event_log.description')}</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
@@ -3768,6 +4147,7 @@ async function openEventLog(entry, part, offset = 0) {
         <div class="reg-meta">Record ${x.record_id} · ${
           esc(fmt.time(x.written_at))}${x.computer
             ? ' · ' + esc(x.computer) : ''}</div>
+        ${x.description ? `<div class="reg-meta">${esc(x.description)}</div>` : ''}
         ${x.unsupported ? `<div class="notice">${esc(x.unsupported)}</div>` : ''}
         <table class="reg-vals"><tbody>${Object.entries(f).map(([k, v]) => `
           <tr><td class="nm">${esc(k.replace(/^Event\//, ''))}</td>
@@ -3782,9 +4162,9 @@ const sq = { entry: null, part: null, table: null, info: null, tables: [],
 async function openSqlite(entry, part, table = null, recover = false) {
   const token = Symbol();
   pvToken = token;
-  pvSet(entry.name, 'database', `<p class="empty">${txt('ui.reading_pages')}</p>`);
   const t = await api.post('sqlite', {
-    part: part.offset, entry, table, recover, limit: 5000 });
+    part: part.offset, entry, table, recover, limit: 5000,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, txt('ui.reading_database'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'database',
@@ -3884,8 +4264,9 @@ const eseView = { entry: null, part: null, table: null };
 async function openEse(entry, part, table = null) {
   const token = Symbol();
   pvToken = token;
-  pvSet(entry.name, 'database', `<p class="empty">${txt('ui.reading_pages')}</p>`);
-  const t = await api.post('ese', { part: part.offset, entry, table, limit: 2000 });
+  const t = await api.post('ese', {
+    part: part.offset, entry, table, limit: 2000,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, txt('ui.reading_database'));
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'database',
@@ -3958,7 +4339,9 @@ async function openLevelDb(entry, part) {
   const token = Symbol();
   pvToken = token;
   pvSet(entry.name, 'leveldb', `<p class="empty">${txt('ui.decompressing_blocks')}</p>`);
-  const t = await api.post('leveldb', { part: part.offset, entry });
+  const t = await api.post('leveldb', {
+    part: part.offset, entry,
+    snap: part && part.snap != null ? part.snap : undefined });
   const r = await awaitTask(t, 'Reading LevelDB');
   if (pvToken !== token) return;
   if (!r) return pvSet(entry.name, 'leveldb', `<p class="empty">${txt('ui.open_sqlite.cancelled')}</p>`);
@@ -4026,18 +4409,25 @@ async function maybeUnlock(part) {
     }).join('');
 
   const canTry = !!enc.recoverable;
-  $('#unlock-field').hidden = !canTry;
+  const wantsSecret = kinds.includes('password') || kinds.includes('recovery');
+  const wantsKeyfile = kinds.includes('keyfile');
+  $('#unlock-field').hidden = !canTry || !wantsSecret;
+  $('#unlock-keyfile-field').hidden = !canTry || !wantsKeyfile;
   $('#unlock-go').hidden = !canTry;
   $('#unlock-label').textContent = kinds.includes('recovery')
     ? (kinds.includes('password') ? txt('ui.unlock.unlock_label') : txt('ui.recovery_key'))
     : 'Password';
   $('#unlock-cancel').textContent = canTry ? 'Not now' : 'Close';
+  // A clear-key protector's own advice (info()'s findings, via _advice())
+  // already says no secret is needed whenever one is present, so there is
+  // no separate client-side case to cover here.
   $('#unlock-note').textContent = (enc.findings || []).join(' ')
     || (canTry ? txt('help.key_held_session_only_never_written_case') : '');
   $('#unlock-error').hidden = true;
   $('#unlock-secret').value = '';
   $('#unlock-secret').type = 'password';
   $('#unlock-show').checked = false;
+  $('#unlock-keyfile').value = '';
 
   previewNone(canTry
     ? txt('help.volume_encrypted_unlock_list_contents')
@@ -4045,15 +4435,15 @@ async function maybeUnlock(part) {
 
   dlg.returnValue = '';
   dlg.showModal();
-  if (canTry) setTimeout(() => $('#unlock-secret').focus(), 30);
+  if (canTry && wantsSecret) setTimeout(() => $('#unlock-secret').focus(), 30);
 
   return await new Promise(resolve => {
     const done = async () => {
       dlg.removeEventListener('close', done);
       if (dlg.returnValue !== 'ok') return resolve(true);
       const secret = $('#unlock-secret').value;
-      if (!secret) return resolve(true);
-      const t = await api.post('unlock', { part: part.offset, secret });
+      const keyfile = $('#unlock-keyfile').value.trim();
+      const t = await api.post('unlock', { part: part.offset, secret, keyfile });
       const r = await awaitTask(t, 'Unlocking', {
         modal: { title: txt('ui.unlocking_volume'),
                  detail: txt('help.deriving_key_entered_format_specifies_about_million') },
@@ -4075,7 +4465,7 @@ async function maybeUnlock(part) {
       $('#unlock-secret').value = '';
       dlg.returnValue = '';
       dlg.showModal();
-      setTimeout(() => $('#unlock-secret').focus(), 30);
+      if (wantsSecret) setTimeout(() => $('#unlock-secret').focus(), 30);
     };
     dlg.addEventListener('close', done);
   });
@@ -4088,12 +4478,12 @@ $('#unlock-show')?.addEventListener('change', e => {
 async function previewRoot(part) {
   const token = Symbol();
   pvToken = token;
-  const label = partName(part);
-  if (!dirCache.has(dirKey(part.offset, null, part.ev_id))) {
+  const label = S.snapLabel || partName(part);
+  if (!dirCache.has(dirKey(part.offset, null, part.ev_id, part.snap))) {
     dirSet(label + ' · /', 'reading…',
            `<p class="empty">${txt('ui.reading_root_directory')}</p>`);
   }
-  const r = await fetchDir(part.offset, null, '/', part.ev_id);
+  const r = await fetchDir(part.offset, null, '/', part.ev_id, part.snap);
   if (pvToken !== token) return;
   if (r.error) {
     return dirSet(label + ' · /', 'error', `<p class="empty">${esc(r.error)}</p>`);
@@ -4220,7 +4610,7 @@ document.addEventListener('scroll', closeMenu, true);
 
 function entryMenu(e, part) {
   const dir = !!e.is_dir;
-  return [
+  const items = [
     { label: dir ? 'Open' : txt('ui.show_bytes'), action: () => showEntry(e, part) },
     dir ? null
         : { label: 'Preview',
@@ -4234,17 +4624,18 @@ function entryMenu(e, part) {
     { label: dir ? txt('ui.hash_everything_here') : 'Hash',
       action: () => hashScope(partOffset(part), dir ? 'folder' : 'item', e,
                               e.name || (dir ? 'folder' : 'file')) },
-    dir ? { label: txt('ui.export_folder'), action: () => exportFolder(e, part) }
-        : { label: 'Export', action: () => exportEntry(e, part) },
-    dir ? null : { label: txt('ui.export'), action: () => exportEntryAs(e, part) },
+    dir ? { label: txt('ui.export_folder'), action: () => exportFolder(e, part), exportOnly: true }
+        : { label: 'Export', action: () => exportEntry(e, part), exportOnly: true },
+    dir ? null : { label: txt('ui.export'), action: () => exportEntryAs(e, part), exportOnly: true },
     dir ? { label: txt('ui.export_folder_and_add'),
-            action: () => exportFolder(e, part, { addExhibit: true }) }
+            action: () => exportFolder(e, part, { addExhibit: true }), exportOnly: true }
         : { label: txt('ui.export_and_add'),
-            action: () => exportEntryAs(e, part, '', { addExhibit: true }) },
+            action: () => exportEntryAs(e, part, '', { addExhibit: true }), exportOnly: true },
     { sep: true },
     { label: txt('ui.copy_path'), action: () => copyText(e.path || e.name) },
     { label: txt('ui.copy_name'), action: () => copyText(e.name || '') },
   ];
+  return S.readOnly ? items.filter(it => !it || !it.exportOnly) : items;
 }
 
 async function exportFolder(e, part, { addExhibit = false } = {}) {
@@ -4253,7 +4644,8 @@ async function exportFolder(e, part, { addExhibit = false } = {}) {
   if (dest === '') return;
   const t = await api.post('export/folder', {
     part: partOffset(part), entry: e, dest: dest || null,
-    add_exhibit: addExhibit });
+    add_exhibit: addExhibit,
+    snap: part && part.snap != null ? part.snap : undefined });
   if (t.error) return toast(t.error);
   const r = await awaitTask(t, 'Exporting ' + (e.name || 'folder'), {
     modal: { title: 'Exporting ' + (e.name || 'folder'),
@@ -4278,24 +4670,28 @@ async function pickPath({ mode = 'open', title = '', dir = '', file = '',
   return r.path || '';
 }
 
-function rangeMenu({ offset, length, part = null, label = 'range', ext = '' }) {
+function rangeMenu({ offset, length, part = null, label = 'range', ext = '',
+                     fragments = null }) {
   const len = Math.max(1, length || 1);
-  return [
+  const items = [
     { label: txt('ui.show_bytes'), action: () => jumpTo(part, offset, len) },
     { sep: true },
     { label: 'Mark…',
       action: () => saveMark(offset + (part || 0), len, label, 'result') },
-    { label: txt('ui.export_bytes'), action: () => exportRange({ offset, length: len, part, ext }) },
-    { label: txt('ui.export_bytes_2'),
-      action: () => exportRangeAs({ offset, length: len, part, ext, label }) },
+    { label: txt('ui.export_bytes'), exportOnly: true,
+      action: () => exportRange({ offset, length: len, part, ext, fragments }) },
+    { label: txt('ui.export_bytes_2'), exportOnly: true,
+      action: () => exportRangeAs({ offset, length: len, part, ext, label, fragments }) },
     { sep: true },
     { label: txt('ui.copy_offset'), action: () => copyText('0x' + fmt.hex(offset, 8)) },
   ];
+  return S.readOnly ? items.filter(it => !it || !it.exportOnly) : items;
 }
 
-async function exportRange({ offset, length, part = null, ext = '', dest = null }) {
+async function exportRange({ offset, length, part = null, ext = '', dest = null,
+                             fragments = null }) {
   const r = await api.post('export', { part: part ?? undefined, offset, length,
-                                       ext: ext || undefined, dest });
+                                       ext: ext || undefined, dest, fragments });
   if (r.error) return toast(r.error);
   toast(txt('messages.toast.exported_with_digest', { size: fmt.bytes(r.bytes), digest: (r.sha256 || '').slice(0, 16) }), 'action');
 }
@@ -4330,8 +4726,8 @@ async function loadAttack(suggestFor = null) {
   return r;
 }
 
-function fillAttackPicker(suggested) {
-  const sel = $('#tag-attack');
+function fillAttackPicker(suggested, selId = 'tag-attack', noteId = 'tag-attack-note') {
+  const sel = $('#' + selId);
   if (!sel || !attackState.catalogue) return;
   const cat = attackState.catalogue;
   const byTactic = new Map();
@@ -4354,7 +4750,7 @@ function fillAttackPicker(suggested) {
   }
   sel.innerHTML = html;
 
-  const note = $('#tag-attack-note');
+  const note = $('#' + noteId);
   if (note) {
     note.hidden = false;
     note.textContent = cat.complete
@@ -4463,7 +4859,7 @@ $('#btn-attack-import')?.addEventListener('click', async () => {
   toast(txt('help.techniques_techniques_imported_attributions_already_made_unchanged', { techniques: r.techniques.toLocaleString() }));
 });
 
-const nodeIdOf = e => String(e.mft ?? e.inode ?? e.oid ?? e.start_cluster);
+const nodeIdOf = e => String(nodeValue(e));
 
 function tagsFor(entry) {
   const id = nodeIdOf(entry);
@@ -4504,6 +4900,41 @@ async function tagDialog(entry, part) {
   fillAttackPicker(r && r.suggestions);
   $('#dlg-tag').showModal();
 }
+
+async function attackArtefactDialog(kind, index, label, part) {
+  $('#attack-artefact-item').textContent = label || `${kind} #${index}`;
+  const dlg = $('#dlg-attack-artefact');
+  dlg.dataset.kind = kind;
+  dlg.dataset.index = index;
+  dlg.dataset.part = part ?? 0;
+  $('#attack-artefact-technique').value = '';
+  $('#attack-artefact-text').value = '';
+  const r = await loadAttack(kind);
+  fillAttackPicker(r && r.suggestions, 'attack-artefact-technique',
+                   'attack-artefact-note');
+  dlg.showModal();
+}
+
+$('#dlg-attack-artefact').addEventListener('close', async () => {
+  const dlg = $('#dlg-attack-artefact');
+  if (dlg.returnValue !== 'ok') return;
+  const tech = $('#attack-artefact-technique').value;
+  if (!tech) return toast(txt('messages.toast.pick_a_technique'));
+  const t = (attackState.catalogue?.techniques || []).find(x => x.id === tech);
+  const a = await api.post('attack/tag', {
+    part: +dlg.dataset.part,
+    target_kind: 'artefact',
+    target_ref: `${dlg.dataset.kind}:${dlg.dataset.index}`,
+    technique: tech, technique_name: t?.name, tactic: t?.tactic,
+    note: $('#attack-artefact-text').value.trim(), asserted: true,
+    catalogue: attackState.catalogue?.version,
+  });
+  if (a.error) return toast(a.error);
+  attackState.tags = a.tags || [];
+  attackState.summary = a.summary || [];
+  renderAttackTactics();
+  renderAttackList();
+});
 
 async function loadTags() {
   const r = await api.get('tags');
@@ -4550,7 +4981,8 @@ async function openTagged(t) {
   const part = partIn(t.evidence_id, t.part);
   if (!part) return toast(txt('messages.toast.partition_evidence'));
   const entry = { name: t.name, path: t.path, size: t.size,
-                  is_dir: !!t.is_dir, deleted: !!t.deleted };
+                  is_dir: !!t.is_dir, deleted: !!t.deleted,
+                  contiguous: !!t.contiguous };
   const n = t.node === 'null' ? null : Number(t.node);
   const fsName = (part.detected || '').toUpperCase();
   Object.assign(entry, nodeEntry(fsName, n));
@@ -4774,7 +5206,7 @@ const profileKey = (part, scope = S.scope) => {
   const base = `${S.activeId ?? '?'}:${part ?? 'image'}`;
   if (!scope || !scope.file || !scope.entry) return base;
   const e = scope.entry;
-  const node = e.oid ?? e.mft ?? e.inode ?? e.start_cluster ?? e.path;
+  const node = nodeValue(e) ?? e.path;
   return `${base}:file:${node}${scope.stream ? ':' + scope.stream : ''}`;
 };
 let profileToken = null;
@@ -4820,28 +5252,60 @@ async function runProfile() {
   }
 }
 
+function coverageLabel(p) {
+  if (!p || p.coverage == null) return '';
+  const pct = p.coverage >= 1 ? null
+    : p.coverage < 0.01 ? (100 * p.coverage).toPrecision(2) + '%'
+    : (100 * p.coverage).toFixed(1) + '%';
+  const short = pct === null ? txt('ui.core.read_all')
+    : txt('ui.core.read_part', { pct });
+  return `<span class="core-coverage" title="${esc(p.note || '')}">${
+    esc(short)}</span>`;
+}
+
 function renderLegend() {
   const seen = new Set((S.profile?.buckets || []).map(b => b[0]));
   $('#core-legend').innerHTML = [...seen].sort().map(c =>
     `<span title="${CLASS_LABELS[c]}"><i style="background:var(${
-      CLASS_COLOURS[c]})"></i>${CLASS_LABELS[c]}</span>`).join('');
+      CLASS_COLOURS[c]})"></i>${CLASS_LABELS[c]}</span>`).join('')
+    + coverageLabel(S.profile);
+}
+
+// The hash badge for one exhibit, from what the case has on record: a
+// verification outlives the session that ran it.
+function showIntegrity(ev) {
+  const badge = $('#integrity');
+  badge.hidden = false;
+  const ran = ev && ev.verified_at;
+  if (!ran) {
+    badge.dataset.state = 'unchecked';
+    badge.textContent = txt('ui.hashes_unchecked');
+  } else if (ev.stored_md5 && ev.verified_md5 === ev.stored_md5) {
+    badge.dataset.state = 'verified';
+    badge.textContent = txt('ui.hashes_verified');
+  } else if (ev.stored_md5) {
+    badge.dataset.state = 'failed';
+    badge.textContent = txt('ui.hash_mismatch');
+  } else {
+    badge.dataset.state = 'unchecked';
+    badge.textContent = txt('ui.stored_hash');
+  }
 }
 
 async function runVerify() {
   const t = await api.post('verify');
   const r = await awaitTask(t, 'Verifying');
   if (!r) return;
-  const badge = $('#integrity');
-  badge.hidden = false;
-  if (r.md5_match === true) {
-    badge.dataset.state = 'verified';
-    badge.textContent = txt('ui.hashes_verified');
-  } else if (r.stored_md5) {
-    badge.dataset.state = 'failed';
-    badge.textContent = txt('ui.hash_mismatch');
+  const ev = S.caseInfo?.evidence?.find(e => e.id === S.activeId);
+  if (ev) {
+    ev.verified_md5 = r.computed_md5;
+    ev.verified_sha1 = r.computed_sha1;
+    ev.verified_at = new Date().toISOString();
+    if (!ev.stored_md5 && r.stored_md5) ev.stored_md5 = r.stored_md5;
+    showIntegrity(ev);
   } else {
-    badge.dataset.state = 'unchecked';
-    badge.textContent = txt('ui.stored_hash');
+    showIntegrity({ verified_at: 'now', stored_md5: r.stored_md5,
+                    verified_md5: r.computed_md5 });
   }
   toast(r.md5_match ? txt('messages.acquisition_hashes_match_media')
     : `Recomputed MD5 ${r.computed_md5}`);
@@ -4927,6 +5391,7 @@ function renderCarve(part) {
         <span class="kind">${esc(h.ext.toUpperCase())}</span>
         <span>${fmt.bytes(h.length)}</span>
         ${h.bounded ? '' : `<span class="flag warn">${txt('ui.carve.estimated')}</span>`}
+        ${h.fragments ? `<span class="flag warn">${txt('ui.carve.fragmented')}</span>` : ''}
         ${h.custom ? `<span class="flag">${txt('ui.carve.custom_flag')}</span>` : ''}
         <span class="off">0x${fmt.hex(h.offset, 8)}</span>
       </div>
@@ -4942,6 +5407,7 @@ function renderCarve(part) {
     const h = S.carveHits[+el.dataset.i];
     return h && rangeMenu({ offset: h.offset, length: h.length,
                             part: carvePart(el), ext: h.ext,
+                            fragments: h.fragments,
                             label: `Carved ${(h.ext || '').toUpperCase()}` });
   });
   core.draw();
@@ -4957,15 +5423,18 @@ function showCarveHit(h, part) {
       [txt('ui.kv.extension'), h.ext],
       [txt('ui.kv.length_from'), carveMethod(h.method)],
       h.entropy != null && [txt('ui.kv.entropy'), h.entropy + ' bits/byte'],
+      h.gap && [txt('ui.kv.gap'), fmt.bytes(h.gap.length)],
     ])}
     ${h.bounded ? '' : `<div class="notice">${txt('help.carve.estimated_notice')}</div>`}
+    ${h.gap ? `<div class="notice">${txt('help.carve.fragmented_notice',
+      { bytes: fmt.bytes(h.gap.length) })}</div>` : ''}
     <div class="actions">
-      <button class="ghost" id="btn-carve-export">${txt('ui.show_entry.export')}</button>
+      <button class="ghost" id="btn-carve-export"${S.readOnly ? ' disabled' : ''}>${txt('ui.show_entry.export')}</button>
       <button class="ghost" id="btn-carve-mark">${txt('ui.show_carve_hit.mark')}</button>
     </div>`;
   $('#btn-carve-export').addEventListener('click', async () => {
     const r = await api.post('export', { part, offset: h.offset,
-      length: h.length, ext: h.ext });
+      length: h.length, ext: h.ext, fragments: h.fragments });
     toast(txt('messages.toast.exported_with_digest', { size: fmt.bytes(r.bytes), digest: r.sha256.slice(0, 16) }), 'action');
   });
   $('#btn-carve-mark').addEventListener('click', () =>
@@ -5221,19 +5690,34 @@ function parseSize(s) {
 function currentFilters() {
   const exts = $('#f-ext').value.split(',').map(s => s.trim().replace(/^\./, '')
     .toLowerCase()).filter(Boolean);
+  const dayEnd = id => $(id).value ? $(id).value + 'T23:59:59Z' : null;
   const f = {
+    name: $('#f-name').value.trim() || null,
     extensions: exts.length ? exts : null,
     min_size: parseSize($('#f-min').value),
     max_size: parseSize($('#f-max').value),
     modified_after: $('#f-mod-after').value || null,
-    modified_before: $('#f-mod-before').value
-      ? $('#f-mod-before').value + 'T23:59:59Z' : null,
+    modified_before: dayEnd('#f-mod-before'),
+    created_after: $('#f-cr-after').value || null,
+    created_before: dayEnd('#f-cr-before'),
+    accessed_after: $('#f-ac-after').value || null,
+    accessed_before: dayEnd('#f-ac-before'),
     deleted_only: $('#f-deleted').checked,
+    hide_deleted: $('#f-hide-deleted').checked,
     files_only: $('#f-files').checked,
   };
   return Object.fromEntries(Object.entries(f).filter(([, v]) =>
     v !== null && v !== false));
 }
+
+// "Deleted only" and "hide deleted" contradict each other, so switching one on
+// switches the other off.
+$('#f-deleted')?.addEventListener('change', () => {
+  if ($('#f-deleted').checked) $('#f-hide-deleted').checked = false;
+});
+$('#f-hide-deleted')?.addEventListener('change', () => {
+  if ($('#f-hide-deleted').checked) $('#f-deleted').checked = false;
+});
 
 async function doFind() {
   const partVal = $('#find-scope').value;
@@ -5264,7 +5748,12 @@ async function doFind() {
     box.innerHTML = `<p class="empty">${txt('help.matches_windows_stores_most_text_utf_16le')}</p>`;
     return;
   }
-  box.innerHTML = r.hits.map((h, i) => {
+  const limit = r.truncated
+    ? `<p class="empty">${esc(txt('ui.find.hit_limit', {
+        n: r.hits.length.toLocaleString(),
+        offset: '0x' + fmt.hex(r.complete_to, 8) }))}</p>`
+    : '';
+  box.innerHTML = limit + r.hits.map((h, i) => {
     const pre = esc(h.context.slice(0, h.match_at));
     const mid = esc(h.context.slice(h.match_at, h.match_at + h.length));
     const post = esc(h.context.slice(h.match_at + h.length));
@@ -5494,7 +5983,7 @@ function renderFileHits(hits, part, headline, prefix = '') {
   }
   box.innerHTML = prefix + `<div class="results-head">${esc(headline)}</div>` +
     hits.map((h, i) => `
-      <div class="result" data-i="${i}">
+      <div class="result ${h.match_kind ? 'match-' + h.match_kind : ''}" data-i="${i}">
         <div class="top">
           <span class="kind">${esc(
             h.kind === 'usn' ? 'change journal'
@@ -5507,7 +5996,9 @@ function renderFileHits(hits, part, headline, prefix = '') {
             : h.file_offset != null
             ? '+0x' + fmt.hex(h.file_offset, 6) : ''}</span>
         </div>
-        <div class="name ${h.deleted ? 'is-del' : ''}">${esc(h.name || '')}</div>
+        <div class="name ${h.deleted ? 'is-del' : ''}">${esc(h.name || '')}${
+          h.match_kind ? ` <span class="hash-flag ${esc(h.match_kind)}">${
+            esc(h.match_kind.replace('_', ' '))}</span>` : ''}</div>
         <div class="path">${esc(h.path || '')}</div>
         <div class="sub">${esc(h.context || '')}</div>
         <div class="meta">${fmt.bytes(h.size)} · ${fmt.time(h.modified)}${
@@ -5570,11 +6061,27 @@ async function hashScope(part, scope, entry, label) {
   }
 }
 
+function hashFailures(r) {
+  const failed = r.failures || [];
+  if (!r.failed) return '';
+  return `<div class="results-head">${esc(txt('ui.hash.failed', {
+      n: r.failed.toLocaleString() }))}</div>` +
+    failed.map(f => `
+      <div class="result hash-failed">
+        <div class="top"><span class="kind">not hashed</span>
+          <span class="off">${fmt.bytes(f.size)}</span></div>
+        <div class="name">${esc(f.name || '')}</div>
+        <div class="path">${esc(f.path || '')}</div>
+        <div class="sub">${esc(f.error || '')}</div>
+      </div>`).join('');
+}
+
 function renderHashes(r, part) {
   const box = $('#hash-results');
   const rows = r.rows || [];
   if (!rows.length) {
-    box.innerHTML = `<p class="empty">${txt('ui.nothing_hashed')}</p>`;
+    box.innerHTML = hashFailures(r)
+      || `<p class="empty">${txt('ui.nothing_hashed')}</p>`;
     tabCount('hash', 0);
     return;
   }
@@ -5584,10 +6091,11 @@ function renderHashes(r, part) {
     mc.known_bad ? txt('ui.known_bad_known_bad', { known_bad: mc.known_bad }) : null,
     mc.known_good ? txt('ui.known_good_known_good', { known_good: mc.known_good }) : null,
     mc.notable ? `${mc.notable} notable` : null,
+    r.failed ? txt('ui.hash.failed_short', { n: r.failed.toLocaleString() }) : null,
     r.truncated ? txt('ui.list_truncated') : null,
   ].filter(Boolean).join(' · ');
 
-  box.innerHTML = `<div class="results-head">${summary}</div>` +
+  box.innerHTML = hashFailures(r) + `<div class="results-head">${summary}</div>` +
     rows.map((h, i) => `
       <div class="result ${h.match_kind ? 'match-' + h.match_kind : ''}" data-i="${i}">
         <div class="top">
@@ -5607,6 +6115,74 @@ function renderHashes(r, part) {
     openHit({ ...h, node: h.node }, part);
   });
   tabCount('hash', r.hashed);
+}
+
+async function doDuplicates() {
+  const box = $('#hash-results');
+  box.innerHTML = `<p class="empty">${txt('ui.preview_entry.reading')}</p>`;
+  const r = await api.get('hashes/duplicates');
+  renderDuplicates(r);
+}
+
+function renderDuplicates(r) {
+  const box = $('#hash-results');
+  const groups = r.groups || [];
+  if (!groups.length) {
+    box.innerHTML = `<p class="empty">${txt('ui.render_duplicates.none_found')}</p>`;
+    tabCount('hash', 0);
+    return;
+  }
+  const totalFiles = groups.reduce((n, g) => n + g.items.length, 0);
+  const summary = txt('ui.render_duplicates.summary',
+    { sets: groups.length, files: totalFiles });
+  box.innerHTML = `<div class="results-head">${esc(summary)}</div>` +
+    groups.map(g => `
+      <div class="result">
+        <div class="top">
+          <span class="kind">${txt('ui.render_duplicates.copies',
+            { count: g.items.length })}</span>
+          <span class="off">${fmt.bytes(g.items[0].size)}</span>
+        </div>
+        <div class="sub mono">${esc(g.sha256.slice(0, 32))}</div>
+        ${g.items.map(it => `<div class="path">${
+          esc(it.exhibit || '?')} — ${esc(it.path || it.name || '')}${
+          it.deleted ? ' <span class="mis">deleted</span>' : ''}</div>`).join('')}
+      </div>`).join('');
+  tabCount('hash', totalFiles);
+}
+
+async function doSimilar() {
+  const box = $('#hash-results');
+  box.innerHTML = `<p class="empty">${txt('ui.preview_entry.reading')}</p>`;
+  const r = await api.get('hashes/similar');
+  renderSimilar(r);
+}
+
+function renderSimilar(r) {
+  const box = $('#hash-results');
+  const pairs = r.pairs || [];
+  if (!pairs.length) {
+    box.innerHTML = `<p class="empty">${txt('ui.render_similar.none_found')}</p>`;
+    tabCount('hash', 0);
+    return;
+  }
+  const summary = txt('ui.render_similar.summary', { pairs: pairs.length });
+  box.innerHTML = `<div class="results-head">${esc(summary)}</div>` +
+    pairs.map(p => `
+      <div class="result">
+        <div class="top">
+          <span class="kind">${esc(txt('ui.render_similar.score',
+            { score: p.score }))}</span>
+          <span class="off">${fmt.bytes(p.a.size)}</span>
+        </div>
+        <div class="path">${esc(p.a.exhibit || '?')} — ${
+          esc(p.a.path || p.a.name || '')}${p.a.deleted
+            ? ' <span class="mis">deleted</span>' : ''}</div>
+        <div class="path">${esc(p.b.exhibit || '?')} — ${
+          esc(p.b.path || p.b.name || '')}${p.b.deleted
+            ? ' <span class="mis">deleted</span>' : ''}</div>
+      </div>`).join('');
+  tabCount('hash', pairs.length);
 }
 
 async function loadHashSets() {
@@ -5635,17 +6211,22 @@ const artKey = (mode, part) => `${mode}:${part}`;
 const ART_RENDER = {
   vss: renderVss, browser: renderBrowser, appcompat: renderAppcompat,
   prefetch: renderPrefetch, shellbags: renderShellbags, mail: renderMail,
+  evtx: renderEvents,
   leveldb: renderLevelDbSweep, lnk: renderLnk, recyclebin: renderRecycleBin,
   wallets: renderWallets,
+  snapshots: renderSnapshots,
 };
 
 const ART_ORDER = ['recyclebin', 'lnk', 'browser', 'appcompat', 'prefetch',
-                   'usn', 'shellbags', 'mail', 'leveldb', 'vss', 'wallets'];
+                   'evtx', 'usn', 'logfile', 'shellbags', 'mail', 'leveldb', 'vss', 'snapshots',
+                   'wallets'];
 const ART_LABEL = {
   recyclebin: 'Recycle Bin', lnk: 'Shortcuts', browser: 'Browsing',
-  appcompat: 'Programs', prefetch: 'Execution', usn: txt('ui.change_journal'),
+  appcompat: 'Programs', prefetch: 'Execution', evtx: txt('ui.tree.events'),
+  usn: txt('ui.change_journal'), logfile: txt('ui.tree.logfile'),
   shellbags: 'Folders', mail: 'Mail', leveldb: 'LevelDB',
-  vss: txt('ui.tree.shadow_copies'), wallets: 'Crypto',
+  vss: txt('ui.tree.shadow_copies'), snapshots: txt('ui.tree.apfs_snapshots'),
+  wallets: 'Crypto',
 };
 
 let artPick = null;
@@ -5658,13 +6239,13 @@ function artCount(mode, r) {
   }
   if (mode === 'browser') {
     return (r.history || []).length + (r.downloads || []).length
-         + (r.cookies || []).length;
+         + (r.cookies || []).length + (r.cache || []).length;
   }
   if (mode === 'lnk') {
     return (r.items || []).length + (r.jumplists || []).reduce(
       (n, l) => n + (l.entries || []).length, 0);
   }
-  for (const k of ['items', 'entries', 'rows', 'hits', 'programs', 'bags',
+  for (const k of ['items', 'events', 'entries', 'rows', 'hits', 'programs', 'bags',
                    'messages', 'stores', 'copies', 'files']) {
     if (Array.isArray(r[k])) return r[k].length;
   }
@@ -5681,6 +6262,7 @@ function browserBranches(r) {
   for (const h of r.history || []) add(h.product, h.deleted ? 'Recovered' : 'History', 1);
   for (const d of r.downloads || []) add(d.product, 'Downloads', 1);
   for (const c of r.cookies || []) add(c.product, 'Cookies', 1);
+  for (const c of r.cache || []) add(c.product, 'Cache', 1);
   return [...by.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
@@ -5751,6 +6333,10 @@ function showArtPick(part) {
     usnPage = 0; usnQuery = ''; usnReason = '';
     return loadUsn(part);
   }
+  if (artPick.mode === 'logfile') {
+    logPage = 0; logQuery = ''; logOp = '';
+    return loadLogfile(part);
+  }
   const draw = ART_RENDER[artPick.mode];
   if (draw) draw(r, part);
 }
@@ -5760,9 +6346,12 @@ function renderBrowserSlice(r, part, product, kind) {
   const hist = (r.history || []).filter(wanted);
   const dl = (r.downloads || []).filter(wanted);
   const ck = (r.cookies || []).filter(wanted);
-  let items, what;
+  const ca = (r.cache || []).filter(wanted);
   if (kind === 'Cookies') {
     return drawCookieList($('#art-results'), ck, product);
+  }
+  if (kind === 'Cache') {
+    return drawCacheList($('#art-results'), ca, product);
   }
   if (kind === 'Downloads') {
     items = dl;
@@ -5839,10 +6428,36 @@ function drawBrowserList(box, items, product, what, asDownloads) {
       </div>`).join('');
 }
 
+function drawCacheList(box, items, product) {
+  if (!items.length) {
+    box.innerHTML = `<p class="empty">${txt('ui.artefacts.none_for', {
+      what: txt('ui.browser.cache_entries', { count: 0 }),
+      product: esc(product) })}</p>`;
+    return;
+  }
+  box.innerHTML = `<div class="results-head">${esc(product)} · ${
+      txt('ui.browser.cache_entries', { count: items.length })}</div>` +
+    items.slice(0, 5000).map((h, i) => `
+      <div class="result" data-i="${i}">
+        <div class="top">
+          <span class="kind">${esc(h.source || '')}</span>
+          <span class="off">${h.size ? fmt.bytes(h.size) : ''}</span>
+        </div>
+        <div class="name">${esc(h.url || '')}</div>
+        <div class="path">${esc(h.path || '')}</div>
+        <div class="meta">${h.last_modified || h.last_fetched
+          ? fmt.time(h.last_modified || h.last_fetched) : 'no timestamp'}${
+          h.status ? ' · HTTP ' + h.status : ''}${
+          h.content_type ? ' · ' + esc(h.content_type) : ''}${
+          h.note ? ' · ' + esc(h.note) : ''}</div>
+      </div>`).join('');
+}
+
 function showCachedArtefact(mode, part) {
   const hit = artCache.get(artKey(mode, part));
   if (!hit) return false;
   if (mode === 'usn') { usnPage = 0; usnQuery = ''; usnReason = ''; loadUsn(part); return true; }
+  if (mode === 'logfile') { logPage = 0; logQuery = ''; logOp = ''; loadLogfile(part); return true; }
   const draw = ART_RENDER[mode];
   if (!draw) return false;
   draw(hit, part);
@@ -5860,10 +6475,26 @@ function cacheArtefact(mode, part, r) {
   return r;
 }
 
+function confirmRerunArtefact(label) {
+  return new Promise(resolve => {
+    const dlg = $('#dlg-rerun-artefact');
+    $('#rerun-artefact-text').textContent =
+      txt('help.rerun_artefact.replaces_named', { name: label });
+    dlg.returnValue = '';
+    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'),
+                         { once: true });
+    dlg.showModal();
+  });
+}
+
 async function doArtifacts(force = false) {
   const partVal = $('#art-scope').value;
   if (partVal === '') return toast(txt('messages.toast.pick_filesystem'));
   const part = +partVal;
+  if (force && artCache.has(artKey(artMode, part))) {
+    const ok = await confirmRerunArtefact(ART_LABEL[artMode] || artMode);
+    if (!ok) return;
+  }
   const box = $('#art-results');
   $('#triage-results').hidden = true;
   $('#art-results').hidden = false;
@@ -5871,6 +6502,10 @@ async function doArtifacts(force = false) {
   box.innerHTML = `<p class="empty">${txt('ui.preview_entry.reading')}</p>`;
   if (artMode === 'vss') {
     return renderVss(cacheArtefact('vss', part, await api.get('vss', { part })), part);
+  }
+  if (artMode === 'snapshots') {
+    return renderSnapshots(cacheArtefact('snapshots', part,
+      await api.get('snapshots', { part })), part);
   }
   if (artMode === 'browser') {
     const t = await api.post('browser', { part, recover: true });
@@ -5895,6 +6530,14 @@ async function doArtifacts(force = false) {
                detail: txt('help.ran_how_often_files_each_program_opened') },
     });
     return r ? renderPrefetch(cacheArtefact('prefetch', part, r), part) : null;
+  }
+  if (artMode === 'evtx') {
+    const t = await api.post('evtx', { part });
+    const r = await awaitTask(t, txt('ui.tree.events'), {
+      modal: { title: txt('ui.tree.events'),
+               detail: txt('help.events.sweep') },
+    });
+    return r ? renderEvents(cacheArtefact('evtx', part, r), part) : null;
   }
   if (artMode === 'wallets') {
     const t = await api.post('wallets', { part });
@@ -5922,6 +6565,24 @@ async function doArtifacts(force = false) {
     usnPage = 0; usnQuery = ''; usnReason = '';
     artCache.set(artKey('usn', part), true);
     return loadUsn(part);
+  }
+  if (artMode === 'logfile') {
+    const have = await api.get('logfile', { limit: 1 });
+    if (!(have.loaded && have.part === part)) {
+      const t = await api.post('logfile', { part });
+      const r = await awaitTask(t, txt('ui.tree.logfile'), {
+        modal: { title: txt('ui.reading_logfile'), detail: txt('ui.logfile.caveat') },
+      });
+      if (!r) return null;
+      if (!r.present || r.error) {
+        $('#art-results').innerHTML =
+          `<p class="empty">${esc(r.note || r.error)}</p>`;
+        return null;
+      }
+    }
+    logPage = 0; logQuery = ''; logOp = '';
+    artCache.set(artKey('logfile', part), true);
+    return loadLogfile(part);
   }
   if (artMode === 'shellbags') {
     const t = await api.post('shellbags', { part });
@@ -5958,6 +6619,149 @@ async function doArtifacts(force = false) {
   renderRecycleBin(cacheArtefact('recyclebin', part,
                                  await api.get('recyclebin', { part })), part);
 }
+
+// ---- Diff (issue #74): two exhibits, or live volume vs one of its VSS
+// snapshots. Server walks both trees and compares per path.
+
+let diffPartsLoaded = false;
+
+function renderDiffPanel() {
+  const box = $('#diff-results');
+  if (!S.open) {
+    box.innerHTML = `<p class="empty">${txt('ui.open_image_see_volume_structure')}</p>`;
+    return;
+  }
+  if (diffPartsLoaded) return;
+  diffPartsLoaded = true;
+
+  const items = (S.exhibits && S.exhibits.length)
+    ? S.exhibits
+    : [{ evidence_id: S.evidenceId ?? null, label: S.image.segments[0] }];
+  const fill = (sel) => {
+    const el = $(sel);
+    el.innerHTML = '';
+    for (const ev of items) {
+      const parts = partsOf(ev);
+      for (const p of parts) {
+        if (p.allocated === false || (!p.detected && !logicalRegion(p))) continue;
+        const o = document.createElement('option');
+        o.value = JSON.stringify({ ev: ev.evidence_id ?? null, part: p.offset });
+        o.textContent = `${ev.label || ev.path} — ${partLabel(p, parts)}`;
+        el.appendChild(o);
+      }
+    }
+    el.addEventListener('change', () => loadDiffSnaps(sel));
+  };
+  fill('#diff-a');
+  fill('#diff-b');
+  if ($('#diff-b').options.length > 1) $('#diff-b').selectedIndex = 1;
+  loadDiffSnaps('#diff-a');
+  loadDiffSnaps('#diff-b');
+}
+
+async function loadDiffSnaps(sel) {
+  const spec = $(sel).value;
+  const snapSel = $(sel === '#diff-a' ? '#diff-a-snap' : '#diff-b-snap');
+  snapSel.innerHTML = `<option value="">${txt('ui.diff.current')}</option>`;
+  if (!spec) return;
+  let v;
+  try { v = JSON.parse(spec); } catch { return; }
+  const r = await api.get('vss', { part: v.part, ev: v.ev ?? undefined });
+  const snaps = (r && r.snapshots) || [];
+  snaps.forEach((s, i) => {
+    if (!s.block_list_offset) return;
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = `#${i} · ${s.created_at || s.id}`;
+    snapSel.appendChild(o);
+  });
+}
+
+async function runDiff() {
+  const box = $('#diff-results');
+  const a = $('#diff-a').value, b = $('#diff-b').value;
+  if (!a || !b) return toast(txt('ui.diff.pick_two'));
+  const spec = sel => {
+    const v = JSON.parse($(sel).value);
+    const snap = $(sel === '#diff-a' ? '#diff-a-snap' : '#diff-b-snap').value;
+    return { ev: v.ev, part: v.part, snap: snap === '' ? null : +snap };
+  };
+  box.innerHTML = `<p class="empty">${txt('ui.diff.running')}</p>`;
+  const t = await api.post('diff', { a: spec('#diff-a'), b: spec('#diff-b') });
+  if (r_encrypted(t)) return;
+  if (t.building) {
+    await awaitTask(t.task, txt('ui.diff.running'));
+    return runDiff();
+  }
+  const r = await awaitTask(t, txt('ui.diff.running'), {
+    modal: { title: txt('ui.diff.running'),
+             detail: txt('help.diff.walks_both_trees') },
+  });
+  if (!r) return;
+  renderDiffResult(r);
+}
+
+function r_encrypted(r) {
+  if (r.encrypted) { toast(r.error || r.kind); return true; }
+  return false;
+}
+
+function renderDiffResult(r) {
+  const box = $('#diff-results');
+  const d = r.diff || {};
+  const cap = 500;
+  const side = x => x == null ? '' : `#${x}`;
+  const head = `<div class="results-head">${
+    txt('ui.diff.added', { n: (d.added || []).length }) } · ${
+    txt('ui.diff.removed', { n: (d.removed || []).length }) } · ${
+    txt('ui.diff.changed', { n: (d.changed || []).length }) } · ${
+    txt('ui.diff.unchanged', { n: d.unchanged_count || 0 })}</div>`;
+  if (!(d.added || []).length && !(d.removed || []).length
+      && !(d.changed || []).length) {
+    box.innerHTML = head + `<p class="empty">${txt('ui.diff.no_changes')}</p>`;
+    return;
+  }
+  const row = (cls, path, a, b) =>
+    `<tr class="${cls}"><td>${esc(path)}</td><td>${a}</td><td>${b}</td></tr>`;
+  const field = (f, name) => f == null ? '' : esc(String(f));
+  const size = f => f && f.size != null ? fmt.bytes(f.size) : '';
+  const mod = f => f && f.modified ? esc(String(f.modified)) : '';
+  const del = f => f && f.deleted ? '✓' : '';
+  const table = (title, rows, columns) => `
+    <div class="results-head">${esc(title)}</div>
+    <table class="diff-table"><thead><tr>${columns.map(c =>
+      `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${
+      rows.join('')}</tbody></table>`;
+  const added = (d.added || []).slice(0, cap).map(x =>
+    row('add', x.path, '', `${size(x.b)}${del(x.b)}`));
+  const removed = (d.removed || []).slice(0, cap).map(x =>
+    row('rm', x.path, `${size(x.a)}${del(x.a)}`, ''));
+  const changed = (d.changed || []).slice(0, cap).map(x =>
+    row('ch', x.path,
+        `${size(x.a)} · ${mod(x.a)}${del(x.a)}`,
+        `${size(x.b)} · ${mod(x.b)}${del(x.b)}`));
+  const listed = [d.added, d.removed, d.changed]
+    .reduce((n, l) => n + (l || []).length, 0);
+  const foot = [d.added, d.removed, d.changed]
+    .some(l => (l || []).length > cap)
+    ? `<p class="hint">${txt('ui.diff.showing_n_of_m', { n: cap, m: listed })}</p>`
+    : '';
+  const trunc = [r.a && r.a.truncated, r.b && r.b.truncated]
+    .some(Boolean)
+    ? `<p class="hint">${txt('help.diff.truncated_budget')}</p>`
+    : '';
+  box.innerHTML = head + trunc
+    + (added.length ? table(txt('ui.diff.added', { n: (d.added || []).length }),
+        added, ['Path', 'Size', '']) : '')
+    + (removed.length ? table(txt('ui.diff.removed', { n: (d.removed || []).length }),
+        removed, ['Path', 'Size', '']) : '')
+    + (changed.length ? table(txt('ui.diff.changed', { n: (d.changed || []).length }),
+        changed, ['Path', 'A', 'B']) : '')
+    + foot
+    + (!added.length && !removed.length && !changed.length
+        ? `<p class="empty">${txt('ui.diff.no_changes')}</p>` : '');
+}
+
 
 function jumpRows(lists) {
   const rows = [];
@@ -6119,15 +6923,90 @@ function renderVss(r, part) {
       <div class="path">${esc(s.id || '')}</div>
       ${s.unsupported ? `<div class="meta">${esc(s.unsupported)}</div>` : ''}
     </div>`).join('');
+  [...box.querySelectorAll('.result')].forEach((el, i) => {
+    const s = snaps[i];
+    if (!s || s.unsupported) return;
+    const btn = document.createElement('button');
+    btn.className = 'ghost';
+    btn.textContent = txt('ui.snaps.open');
+    btn.addEventListener('click', () => openSnapshot(part, i, s));
+    el.querySelector('.top').appendChild(btn);
+  });
   tabCount('triage', snaps.length);
+}
+
+function renderSnapshots(r, part) {
+  const box = $('#art-results');
+  if (r.error) return box.innerHTML = `<p class="empty">${esc(r.error)}</p>`;
+  const snaps = r.snapshots || [];
+  const notes = (r.findings || []).map(f =>
+    `<div class="notice">${esc(f)}</div>`).join('');
+  if (!snaps.length) {
+    box.innerHTML = notes + `<p class="empty">${esc(r.note
+      || txt('ui.snaps.none'))}</p>`;
+    tabCount('triage', 0);
+    return;
+  }
+  box.innerHTML = notes + `<div class="results-head">${
+    txt('ui.snaps.apfs_newest_first', { snaps: snaps.length })}</div>` +
+    snaps.map((s, i) => `
+    <div class="result" data-i="${i}">
+      <div class="top">
+        <span class="kind">snapshot</span>
+        <span class="off">${s.snapshot_xid ? 'xid ' + s.snapshot_xid : ''}</span>
+      </div>
+      <div class="name">${esc(s.name || '')}</div>
+      <div class="meta">${s.created_at ? fmt.time(s.created_at) : ''}${
+        s.inum ? ' · inode ' + s.inum : ''}</div>
+      ${s.dataless ? `<div class="meta">${esc(txt('ui.snaps.dataless'))}</div>` : ''}
+      <div class="path">${esc(txt('ui.snaps.browse'))} →</div>
+    </div>`).join('');
+  bindResults(box, el => {
+    const s = snaps[+el.dataset.i];
+    if (s) enterSnapshot(part, s.name);
+  });
+  tabCount('triage', snaps.length);
+}
+
+async function enterSnapshot(part, name) {
+  S.snap = { part: partOffset(part), name };
+  dirCache.clear();
+  toast(txt('ui.snaps.viewing', { name }));
+  const p = (S.volumes?.partitions || [])
+    .find(x => x.offset === partOffset(part)) || part;
+  await previewRoot(p);
+}
+
+function exitSnapshot() {
+  const was = S.snap;
+  S.snap = null;
+  dirCache.clear();
+  if (!was) return;
+  const p = (S.volumes?.partitions || [])
+    .find(x => x.offset === was.part) || null;
+  if (p) previewRoot(p);
+}
+
+async function openSnapshot(part, i, s) {
+  const po = partObj(part);
+  if (!po) return toast(txt('messages.toast.pick_filesystem'));
+  const pseudo = { ...po, offset: po.offset, snap: i, ev_id: S.activeId };
+  S.lastPick = { kind: 'entry', e: null, part: pseudo, from: null, stream: null };
+  S.snapLabel = txt('ui.snaps.snapshot_view',
+                    { created: fmt.time(s.created_at) });
+  await previewRoot(pseudo);
 }
 
 function renderBrowser(r, part) {
   const box = $('#art-results');
   const hist = r.history || [];
   const dbs = r.databases || [];
-  if (!hist.length) {
-    box.innerHTML = `<p class="empty">${txt('ui.browser_history_found_dbs_databases_examined', { dbs: dbs.length })}</p>`;
+  const cache = r.cache || [];
+  const notes = (r.findings || []).map(f =>
+    `<div class="notice">${esc(f)}</div>`).join('');
+  if (!hist.length && !cache.length) {
+    box.innerHTML = notes +
+      `<p class="empty">${txt('ui.browser_history_found_dbs_databases_examined', { dbs: dbs.length })}</p>`;
     tabCount('triage', 0);
     return;
   }
@@ -6138,7 +7017,9 @@ function renderBrowser(r, part) {
       databases: dbs.length.toLocaleString() })}${
       products.length ? ' · ' + products.join(', ') : ''}${
       deleted ? ' · ' + deleted + ' recovered from deleted rows' : ''}${
-      r.downloads?.length ? ' · ' + r.downloads.length + ' downloads' : ''}</div>` +
+      r.downloads?.length ? ' · ' + r.downloads.length + ' downloads' : ''}${
+      cache.length ? ' · ' + txt('ui.browser.cache_entries', { count: cache.length }) : ''}</div>` +
+    notes +
     hist.slice(0, 3000).map((h, i) => `
       <div class="result ${h.deleted ? 'match-notable' : ''}" data-i="${i}">
         <div class="top">
@@ -6179,7 +7060,8 @@ function renderAppcompat(r, part) {
   ].filter(Boolean).join(' · ');
 
   const rows = shim.map((e, i) => `
-    <div class="result" data-k="shim" data-i="${i}">
+    <div class="result" data-k="shim" data-i="${i}"
+         data-label="${esc((e.path || '').split('\\').pop())}">
       <div class="top"><span class="kind">shimcache #${e.order}</span>
         <span class="off">${esc(e.control_set || '')}</span></div>
       <div class="name">${esc((e.path || '').split('\\').pop())}</div>
@@ -6199,6 +7081,11 @@ function renderAppcompat(r, part) {
     </div>`)).join('');
 
   box.innerHTML = notes + `<div class="results-head">${esc(head)}</div>` + rows;
+  bindResults(box, () => {}, el => el.dataset.k === 'shim'
+    ? [{ label: txt('ui.attack_artefact.attribute_menu'),
+         action: () => attackArtefactDialog('appcompat', +el.dataset.i,
+                                            el.dataset.label, part) }]
+    : null);
   tabCount('triage', shim.length + files.length);
 }
 
@@ -6356,6 +7243,95 @@ function renderPrefetch(r, part) {
   tabCount('triage', items.length);
 }
 
+const EVENTS_SHOWN = 1500;
+
+function renderEvents(r, part) {
+  const box = $('#art-results');
+  const logs = r.logs || [];
+  const events = r.events || [];
+  const notes = [
+    r.note,
+    r.truncated ? txt('ui.events.truncated', {
+      total: fmt.count(r.total_events), kept: fmt.count(events.length) }) : null,
+    logs.some(l => l.deleted) ? txt('ui.events.deleted_note', {
+      n: logs.filter(l => l.deleted).length }) : null,
+    ...logs.filter(l => l.error).map(l => txt(
+      l.deleted ? 'ui.events.log_error_deleted' : 'ui.events.log_error',
+      { name: l.source || l.name, error: l.error })),
+    ...logs.flatMap(l => (l.findings || []).map(f => `${l.name}: ${f}`)),
+  ].filter(Boolean).map(n => `<div class="notice">${esc(n)}</div>`).join('');
+  if (!events.length) {
+    box.innerHTML = notes + `<p class="empty">${txt('ui.events.none')}</p>`;
+    tabCount('triage', 0);
+    return;
+  }
+  const withRecords = logs.map((l, i) => ({ ...l, i }))
+    .filter(l => l.records);
+  box.innerHTML = notes + `
+    <div class="results-head">${esc(txt('ui.events.summary', {
+      events: fmt.count(events.length), logs: withRecords.length }))}</div>
+    <div class="events-controls">
+      <input type="text" id="ev-q" class="dv-filter"
+             placeholder="${esc(txt('ui.events.filter'))}">
+      <select id="ev-log"><option value="">${txt('ui.events.all_logs')}</option>${
+        withRecords.map(l => `<option value="${l.i}">${esc(l.name)}${
+          l.deleted ? ' ' + esc(txt('ui.events.deleted_tag')) : ''} (${
+          fmt.count(l.records)})</option>`).join('')}</select>
+      <label class="row"><input type="checkbox" id="ev-hide-deleted">
+        <span>${txt('ui.events.hide_deleted')}</span></label>
+      <label class="row"><input type="checkbox" id="ev-described">
+        <span>${txt('ui.events.described_only')}</span></label>
+    </div>
+    <div id="ev-list"></div>`;
+  const draw = () => {
+    const q = ($('#ev-q').value || '').trim().toLowerCase();
+    const log = $('#ev-log').value;
+    const described = $('#ev-described').checked;
+    const hideDeleted = $('#ev-hide-deleted').checked;
+    const hits = [];
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (log !== '' && e.log !== +log) continue;
+      if (hideDeleted && e.deleted) continue;
+      if (described && !e.description) continue;
+      if (q && ![e.event_id, e.provider, e.description, e.computer, e.channel]
+          .some(v => v != null && String(v).toLowerCase().includes(q))) continue;
+      hits.push(i);
+    }
+    const shown = hits.slice(0, EVENTS_SHOWN);
+    $('#ev-list').innerHTML = (hits.length > shown.length
+      ? `<p class="hint">${esc(txt('ui.events.showing', {
+          shown: fmt.count(shown.length), matched: fmt.count(hits.length) }))}</p>`
+      : '') + shown.map(i => {
+        const e = events[i];
+        const l = logs[e.log] || {};
+        return `<div class="result" data-i="${i}">
+          <div class="top"><span class="kind">${esc(e.event_id ?? '—')}${
+            e.level ? ' · ' + esc(e.level) : ''}</span>${
+            e.deleted ? ` <span class="flag warn" title="${esc(
+              txt('ui.events.deleted_title'))}">${
+              txt('ui.events.deleted_flag')}</span>` : ''}
+            <span class="off">${esc(fmt.time(e.time))}</span></div>
+          <div class="name">${e.description ? esc(e.description)
+            : `<span class="dim">${txt('ui.events.no_description')}</span>`}</div>
+          <div class="path">${esc(e.provider || '')} · ${esc(l.name || '')}${
+            e.computer ? ' · ' + esc(e.computer) : ''}</div>
+        </div>`;
+      }).join('');
+    bindResults($('#ev-list'), el => {
+      const e = events[+el.dataset.i];
+      const l = logs[e.log];
+      if (l && l.entry) openHit({ ...l.entry, entry: l.entry }, part);
+    });
+  };
+  $('#ev-q').addEventListener('input', draw);
+  $('#ev-log').addEventListener('change', draw);
+  $('#ev-described').addEventListener('change', draw);
+  $('#ev-hide-deleted').addEventListener('change', draw);
+  draw();
+  tabCount('triage', events.length);
+}
+
 function renderShellbags(r, part) {
   const box = $('#art-results');
   const users = r.users || [];
@@ -6387,6 +7363,100 @@ function renderShellbags(r, part) {
   tabCount('triage', all.length);
 }
 
+function mailAddr(v) {
+  // mbox gives a list of addresses; PST gives one already-formatted
+  // display string (or nothing). Normalised to a single string either way.
+  if (!v) return '';
+  return Array.isArray(v) ? v.join(', ') : String(v);
+}
+
+function mailBody(m) {
+  // What to show for a message's content, in the order this codebase's own
+  // rule prefers: decoded plain text, then visible text lifted out of an
+  // HTML-only part (never the markup itself, never rendered as HTML), then
+  // an honest note that there is nothing readable to show.
+  const LIMIT = 20000;
+  const cut = s => s.length > LIMIT
+    ? s.slice(0, LIMIT) + '\n\n[truncated]' : s;
+  if (m.text) return { kind: 'text', text: cut(m.text) };
+  if (m.body) return { kind: 'text', text: cut(m.body) };       // PST
+  if (m.html_text) return { kind: 'html_text', text: cut(m.html_text) };
+  if (m.html_bytes) return { kind: 'html_only', text: null };
+  if (m.unparsed) return { kind: 'unparsed', text: null };
+  return { kind: 'none', text: null };
+}
+
+function mailDetailHtml(m) {
+  const rows = [
+    ['From', mailAddr(m.from)], ['To', mailAddr(m.to)],
+    ['Cc', mailAddr(m.cc)], ['Date', m.date_raw || m.date],
+  ].filter(([, v]) => v);
+  const body = mailBody(m);
+  const bodyHtml = {
+    text: `<pre class="mail-body">${escText(body.text)}</pre>`,
+    html_text: `<div class="notice">This message has no plain-text part; ` +
+      `tags have been stripped from its HTML part to show the text ` +
+      `below, which is not rendered as HTML.</div>` +
+      `<pre class="mail-body">${escText(body.text)}</pre>`,
+    html_only: `<p class="empty">HTML-only message; no readable text ` +
+      `could be lifted out of it.</p>`,
+    unparsed: `<p class="empty">This message could not be parsed.</p>`,
+    none: `<p class="empty">No body text recorded for this message.</p>`,
+  }[body.kind];
+  const atts = (m.attachments || []).map((a, i) => {
+    const label = `${esc(a.filename || a.name || '(unnamed)')}${
+      a.content_type ? ' · ' + esc(a.content_type) : ''}${
+      (a.bytes ?? a.size) ? ' · ' + fmt.bytes(a.bytes ?? a.size) : ''}`;
+    if (a.nid == null) return `<div class="mail-att">${label}</div>`;
+    return `<div class="mail-att">
+      <button class="linkish mail-load-att" data-i="${i}">${label} — view</button>
+    </div>`;
+  }).join('');
+  return `<div class="mail-detail">
+    <div class="mail-headers">${rows.map(([k, v]) =>
+      `<div><strong>${k}:</strong> ${esc(v)}</div>`).join('')}</div>
+    ${bodyHtml}
+    ${atts ? `<div class="mail-attachments">${atts}</div>` : ''}
+  </div>`;
+}
+
+async function loadMailAttachment(btn, m, part) {
+  const a = (m.attachments || [])[+btn.dataset.i];
+  const holder = btn.closest('.mail-att');
+  btn.disabled = true;
+  btn.textContent = txt('ui.render_registry.loading_value');
+  const r = await api.get('mail/attachment', {
+    part, entry: JSON.stringify(m.store_entry), msg: m.nid, att: a.nid,
+  });
+  btn.remove();
+  if (r.error) {
+    holder.insertAdjacentHTML('beforeend',
+      `<p class="hint warn">${esc(r.error)}</p>`);
+    return;
+  }
+  const bytes = Uint8Array.from(atob(r.preview || ''), c => c.charCodeAt(0));
+  if (!bytes.length) {
+    holder.insertAdjacentHTML('beforeend',
+      `<p class="empty">${txt('ui.content_show')}</p>`);
+    return;
+  }
+  const kind = sniff(bytes);
+  let body;
+  if (kind?.raster || (kind?.kind === 'image' && kind.mime)) {
+    body = `<div class="pv-image"><img alt="" src="data:${
+      kind.mime};base64,${r.preview}"></div>`;
+  } else if (looksTextual(bytes)) {
+    body = `<pre class="pv-text">${escText(decodeText(bytes).slice(0, 20000))}</pre>`;
+  } else {
+    body = `<p class="pv-note">${txt('help.mail_attachment_no_inline_viewer', {
+      content_type: esc(r.content_type || 'application/octet-stream'),
+      size: fmt.bytes(r.bytes) })}${
+      r.truncated ? ' (preview truncated)' : ''}</p>`;
+  }
+  holder.insertAdjacentHTML('beforeend',
+    `<div class="mail-att-preview">${body}</div>`);
+}
+
 function renderMail(r, part) {
   const box = $('#art-results');
   const msgs = r.messages || [];
@@ -6415,11 +7485,23 @@ function renderMail(r, part) {
           <span class="off">${fmt.bytes(m.bytes)}</span>
         </div>
         <div class="name">${esc(m.subject || '(no subject)')}</div>
-        <div class="path">${esc((m.from || []).join(', '))} →
-          ${esc((m.to || []).join(', ').slice(0, 80))}</div>
+        <div class="path">${esc(mailAddr(m.from))} →
+          ${esc(mailAddr(m.to).slice(0, 80))}</div>
         <div class="meta">${esc(m.date || m.date_raw || 'no date')}${
           m.store ? ' · ' + esc(m.store.split('/').pop()) : ''}</div>
       </div>`).join('');
+  bindResults(box, (el, ev) => {
+    if (ev.target.closest('.mail-detail')) return;
+    const open = el.querySelector('.mail-detail');
+    if (open) { open.remove(); return; }
+    $$('.mail-detail', box).forEach(n => n.remove());
+    const m = msgs[+el.dataset.i];
+    el.insertAdjacentHTML('beforeend', mailDetailHtml(m));
+    $$('.mail-load-att', el).forEach(btn => btn.addEventListener('click', ev2 => {
+      ev2.stopPropagation();
+      loadMailAttachment(btn, m, part);
+    }));
+  });
   tabCount('triage', msgs.length);
 }
 
@@ -6466,10 +7548,10 @@ const escText = s => (s === null || s === undefined ? '' : String(s))
 
 function bindResults(box, fn, menuFor = null) {
   $$('.result', box).forEach(el => {
-    el.addEventListener('click', () => {
+    el.addEventListener('click', ev => {
       $$('.result.is-on', box).forEach(n => n.classList.remove('is-on'));
       el.classList.add('is-on');
-      fn(el);
+      fn(el, ev);
     });
     if (!menuFor) return;
     el.addEventListener('contextmenu', ev => {
@@ -6485,7 +7567,7 @@ function tabCount(view, n) {
   const tab = $(`.tab[data-view="${view}"]`);
   const base = { carve: 'Carved', find: 'Search', marks: 'Marks',
                  time: 'Timeline', tags: 'Tagged', hash: 'Hashes',
-                 triage: 'Triage', attack: 'ATT&CK' }[view];
+                 triage: 'Triage', attack: 'ATT&CK', diff: 'Diff', notes: 'Notes' }[view];
   if (!base) return;
   tab.innerHTML = n == null ? base : `${base} <span class="count">${n}</span>`;
 }
@@ -7336,7 +8418,8 @@ async function showEventBytes(e) {
                   ...nodeEntry(part.detected, n) };
   const st = n == null ? null
     : await api.get('stat', { part: partOffset(part),
-                              entry: JSON.stringify(entry) }).catch(() => null);
+                              entry: JSON.stringify(entry),
+                              snap: snapParam(part) }).catch(() => null);
   if (seq !== eventBytesSeq) return;
   if (!scopedTo(part)) {
     setScope(partOffset(part), part.size ?? S.image.size, scopeLabel(part), null);
@@ -7477,7 +8560,8 @@ async function openMark(d) {
   Object.assign(entry, nodeEntry(fsName, n));
   const st = await api.get('stat', { part: partOffset(p),
                                      entry: JSON.stringify(entry),
-                                     stream: d.stream || undefined });
+                                     stream: d.stream || undefined,
+                                     snap: snapParam(p) });
   if (!st || st.error) return toast(txt('messages.mark_file_not_readable'));
   const bytes = st.size != null ? st.size : null;
   if (!bytes) return toast(txt('messages.mark_file_not_readable'));
@@ -7504,13 +8588,545 @@ async function loadMarks() {
   hex.draw();
 }
 
+// Case notes: each version names who wrote it. An edit is a new version and
+// a withdrawal is a flag; nothing is changed in place, so the record keeps
+// what was said, by whom, and when.
+// The same formatter as every other timestamp, so notes follow the case's
+// time zone and the UTC / local / both setting, as the report does.
+const noteTime = t => fmt.time(t);
+
+async function loadNotes() {
+  const box = $('#note-results');
+  if (!S.casePath) {
+    S.notes = [];
+    S.notesCase = null;
+    S.noteEdit = null;
+    if (box) box.innerHTML = `<p class="empty">${txt('ui.notes.no_case')}</p>`;
+    tabCount('notes', null);
+    return;
+  }
+  const r = await api.get('notes', {
+    retracted: $('#note-show-retracted')?.checked ? 1 : undefined,
+  }).catch(() => null);
+  if (!r || r.error) {
+    // Not "no notes": the case's notes could not be read.
+    S.notes = [];
+    S.notesCase = null;
+    if (box) box.innerHTML = `<p class="empty">${esc(r?.error || '')}</p>`;
+    return;
+  }
+  if ((r.case || null) !== (S.notesCase || null)) S.noteEdit = null;
+  S.notes = r.notes || [];
+  S.notesCase = r.case || null;
+  renderNotes();
+}
+
+function renderNotes() {
+  const box = $('#note-results');
+  if (!box) return;
+  const live = S.notes.filter(n => !n.retracted_at);
+  tabCount('notes', live.length || null);
+  if (!S.notes.length) {
+    box.innerHTML = `<p class="empty">${txt('ui.notes.none')}</p>`;
+    return;
+  }
+  box.innerHTML = S.notes.map((n, i) => {
+    const hist = n.history || [];
+    const edited = n.examiner !== n.author || hist.length
+      ? `<div class="meta">${esc(txt('ui.notes.edited_by',
+          { who: n.examiner || '—', when: noteTime(n.at) }))}</div>` : '';
+    const gone = n.retracted_at
+      ? `<div class="meta">${esc(txt('ui.notes.withdrawn_by',
+          { who: n.retracted_by || '—', when: noteTime(n.retracted_at) }))}</div>`
+      : '';
+    const older = hist.length ? `<details class="note-history"><summary>${
+        esc(txt('ui.notes.history', { count: hist.length }))}</summary>${
+        hist.map(h => `<div class="note-version"><div class="meta">${
+          esc(h.examiner || '—')} · ${esc(noteTime(h.at))}</div>
+          <div class="note-body">${escText(h.body)}</div></div>`).join('')}
+      </details>` : '';
+    const actions = n.retracted_at ? '' : `<div class="note-actions">
+        <button class="ghost" data-note-edit="${i}">${txt('ui.notes.edit')}</button>
+        <button class="ghost" data-note-withdraw="${i}">${txt('ui.notes.withdraw')}</button>
+      </div>`;
+    return `<div class="result note${n.retracted_at ? ' is-withdrawn' : ''}"
+        data-i="${i}">
+      <div class="top"><span class="kind">${esc(n.author || '—')}</span>
+        <span class="off">${esc(noteTime(n.created_at))}</span></div>
+      <div class="note-body">${escText(n.body)}</div>
+      ${edited}${gone}${older}${actions}
+    </div>`;
+  }).join('');
+  box.querySelectorAll('[data-note-edit]').forEach(b =>
+    b.addEventListener('click', () => editNote(+b.dataset.noteEdit)));
+  box.querySelectorAll('[data-note-withdraw]').forEach(b =>
+    b.addEventListener('click', () => withdrawNote(+b.dataset.noteWithdraw)));
+  // A refresh (a colleague's note arriving, or this examiner's own add)
+  // must not throw away an edit in progress.
+  const open = S.noteEdit;
+  if (open) {
+    const i = S.notes.findIndex(n => n.id === open.id && !n.retracted_at);
+    if (i >= 0) {
+      editNote(i, open.draft);
+    } else {
+      S.noteEdit = null;
+      const box2 = $('#note-body');
+      if (box2 && !box2.value.trim()) box2.value = open.draft;
+      toast(txt('ui.notes.changed_while_editing'));
+    }
+  }
+}
+
+async function noteResult(r) {
+  if (!r || r.error) {
+    toast(r?.error || txt('ui.notes.none'));
+    await loadNotes();
+    return false;
+  }
+  S.notes = r.notes || [];
+  if ($('#note-show-retracted')?.checked) await loadNotes();
+  else renderNotes();
+  return true;
+}
+
+async function addNote() {
+  const el = $('#note-body');
+  const body = (el.value || '').trim();
+  if (!body) return el.focus();
+  if (await noteResult(await api.post('note', { body, case: S.notesCase }))) {
+    el.value = '';
+  }
+}
+
+function editNote(i, draft = null) {
+  const n = S.notes[i];
+  const card = $(`#note-results .note[data-i="${i}"]`);
+  if (!n || !card) return;
+  const body = card.querySelector(':scope > .note-body');
+  const actions = card.querySelector('.note-actions');
+  if (!body || !actions) return;
+  const area = document.createElement('textarea');
+  area.value = draft ?? n.body;
+  area.rows = Math.min(12, Math.max(3, area.value.split('\n').length + 1));
+  S.noteEdit = { id: n.id, draft: area.value };
+  area.addEventListener('input', () => { S.noteEdit.draft = area.value; });
+  body.replaceWith(area);
+  actions.innerHTML = `<button class="solid" data-save>${txt('ui.notes.save')}</button>
+    <button class="ghost" data-cancel>${txt('ui.notes.cancel')}</button>`;
+  actions.querySelector('[data-cancel]').addEventListener('click', () => {
+    S.noteEdit = null;
+    renderNotes();
+  });
+  actions.querySelector('[data-save]').addEventListener('click', async () => {
+    const text = area.value.trim();
+    if (!text) return area.focus();
+    const r = await api.post('note/edit',
+                             { id: n.id, body: text, case: S.notesCase });
+    if (r && !r.error) S.noteEdit = null;
+    await noteResult(r);
+  });
+  if (draft === null) area.focus();
+}
+
+async function withdrawNote(i) {
+  const n = S.notes[i];
+  if (!n || !window.confirm(txt('ui.notes.confirm_withdraw'))) return;
+  await noteResult(await api.post('note/retract',
+                                  { id: n.id, case: S.notesCase }));
+}
+
+$('#btn-note-add')?.addEventListener('click', addNote);
+$('#note-body')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addNote();
+});
+$('#note-show-retracted')?.addEventListener('change', loadNotes);
+
+// Structure templates: rows of (offset, size, name, kind, note) an examiner
+// writes in the interface and keeps in the case. The server validates every
+// field again; this only shapes the form and shows what it sends back.
+const TPL = {
+  case: null, list: [], kinds: [], limits: {},
+  sel: null,          // a saved template's id, 'new', or null
+  draft: null,        // {name, description, fields: [{offset, size, ...}]}
+  revision: null,     // the saved revision the draft started from
+  dirty: false, error: '', preview: null, previewAt: '', previewBase: 0,
+};
+
+const TPL_FIXED = { u8: 1, u16: 2, u32: 4, u64: 8, i8: 1, i16: 2, i32: 4,
+                    i64: 8, guid: 16 };
+
+const tplBlankField = () => ({ offset: '', size: '', name: '', kind: 'u32',
+                               note: '' });
+
+function tplDraftFrom(t) {
+  return {
+    name: t.name, description: t.description || '',
+    fields: t.fields.map(f => ({ offset: String(f.offset),
+                                 size: String(f.size), name: f.name,
+                                 kind: f.kind, note: f.note || '' })),
+  };
+}
+
+// "28", "0x1C" or "1C" (with an 0x) as a whole number; anything else is null,
+// which the server answers with a message naming the field.
+function tplNumber(text) {
+  const t = String(text ?? '').trim();
+  if (/^0x[0-9a-f]+$/i.test(t)) return parseInt(t, 16);
+  if (/^\d+$/.test(t)) return parseInt(t, 10);
+  return null;
+}
+
+function tplBody() {
+  const d = TPL.draft;
+  return {
+    name: d.name, description: d.description,
+    fields: d.fields.map(f => ({ offset: tplNumber(f.offset),
+                                 size: tplNumber(f.size), name: f.name,
+                                 kind: f.kind, note: f.note })),
+  };
+}
+
+const tplSelected = () => TPL.list.find(t => t.id === TPL.sel) || null;
+
+async function loadTemplates() {
+  if (!S.casePath) {
+    Object.assign(TPL, { case: null, list: [], sel: null, draft: null,
+                         revision: null, dirty: false, error: '',
+                         preview: null });
+    return renderTemplates();
+  }
+  const r = await api.get('case/templates').catch(() => null);
+  if (!r || r.error) {
+    TPL.error = r?.error || '';
+    return renderTemplates();
+  }
+  if (TPL.case && TPL.case !== r.case) {
+    Object.assign(TPL, { sel: null, draft: null, revision: null,
+                         dirty: false, preview: null });
+  }
+  TPL.case = r.case;
+  TPL.list = r.templates || [];
+  TPL.kinds = r.kinds || [];
+  TPL.limits = r.limits || {};
+  TPL.error = '';
+  // What is being edited was deleted elsewhere: keep the form so the work
+  // is not lost, but it can only be saved as a new template.
+  if (TPL.sel !== null && TPL.sel !== 'new' && !tplSelected()) {
+    TPL.sel = 'new';
+    TPL.revision = null;
+  }
+  renderTemplates();
+}
+
+function tplDiscardOk() {
+  return !TPL.dirty || window.confirm(txt('ui.templates.confirm_discard'));
+}
+
+function tplChoose(id) {
+  if (id === TPL.sel && TPL.draft) return;
+  if (!tplDiscardOk()) return;
+  const t = id === 'new' ? null : TPL.list.find(x => x.id === id);
+  TPL.sel = t ? t.id : 'new';
+  TPL.draft = t ? tplDraftFrom(t)
+    : { name: '', description: '', fields: [tplBlankField()] };
+  TPL.revision = t ? t.revision : null;
+  TPL.dirty = false;
+  TPL.preview = null;
+  renderTemplates();
+}
+
+function tplKindOptions(cur) {
+  const ints = TPL.kinds.filter(k => k in TPL_FIXED && k !== 'guid');
+  const rest = TPL.kinds.filter(k => !ints.includes(k));
+  const opt = k => `<option value="${esc(k)}"${k === cur ? ' selected' : ''}>${
+    esc(k)}</option>`;
+  return `<optgroup label="${esc(txt('ui.templates.kind_group_int'))}">${
+    ints.map(opt).join('')}</optgroup><optgroup label="${
+    esc(txt('ui.templates.kind_group_other'))}">${rest.map(opt).join('')}</optgroup>`;
+}
+
+function renderTemplates() {
+  const list = $('#tpl-list');
+  const ed = $('#tpl-editor');
+  const out = $('#tpl-results');
+  if (!list || !ed || !out) return;
+  $('#btn-tpl-new').disabled = !S.casePath;
+  if (!S.casePath) {
+    list.innerHTML = '';
+    ed.innerHTML = `<p class="empty">${esc(txt('ui.templates.no_case'))}</p>`;
+    out.innerHTML = '';
+    return;
+  }
+  if (TPL.error) {
+    ed.innerHTML = `<p class="empty">${esc(TPL.error)}</p>`;
+    return;
+  }
+  list.innerHTML = TPL.list.length
+    ? `<div class="tpl-items" role="listbox" aria-label="${
+        esc(txt('ui.templates.list_label'))}">${TPL.list.map(t => `
+        <button class="tpl-item${t.id === TPL.sel ? ' is-on' : ''}${
+          t.damaged ? ' is-bad' : ''}" data-id="${t.id}" role="option"
+          aria-selected="${t.id === TPL.sel}">${esc(t.name)}${
+          t.damaged ? ' ⚠' : ''}</button>`).join('')}</div>`
+    : `<p class="empty">${esc(txt('ui.templates.none'))}</p>`;
+  $$('#tpl-list .tpl-item').forEach(b =>
+    b.addEventListener('click', () => tplChoose(+b.dataset.id)));
+
+  const d = TPL.draft;
+  if (!d) {
+    ed.innerHTML = '';
+    out.innerHTML = `<p class="empty">${esc(txt('ui.templates.preview_empty'))}</p>`;
+    return;
+  }
+  const saved = tplSelected();
+  const max = TPL.limits;
+  const meta = saved
+    ? `<p class="hint">${esc(txt('ui.templates.saved_by', {
+        who: saved.examiner || '—', when: fmt.time(saved.updated_at),
+        revision: saved.revision }))}</p>` : '';
+  const damaged = saved?.damaged
+    ? `<p class="hint is-warn">${esc(txt('ui.templates.damaged',
+        { why: saved.damaged }))}</p>` : '';
+  ed.innerHTML = `
+    ${meta}${damaged}
+    <label class="field"><span>${esc(txt('ui.templates.name'))}</span>
+      <input type="text" id="tpl-name" maxlength="${max.name || 80}"
+             value="${esc(d.name)}"></label>
+    <label class="field"><span>${esc(txt('ui.templates.description'))}</span>
+      <textarea id="tpl-desc" rows="2"
+        maxlength="${max.description || 500}">${esc(d.description)}</textarea></label>
+    <table class="tpl-fields">
+      <thead><tr>
+        <th>${esc(txt('ui.templates.col_offset'))}</th>
+        <th>${esc(txt('ui.templates.col_size'))}</th>
+        <th>${esc(txt('ui.templates.col_name'))}</th>
+        <th>${esc(txt('ui.templates.col_kind'))}</th>
+        <th>${esc(txt('ui.templates.col_note'))}</th><th></th></tr></thead>
+      <tbody>${d.fields.map((f, i) => `
+        <tr data-i="${i}">
+          <td><input type="text" data-k="offset" value="${esc(f.offset)}"
+               placeholder="${esc(txt('ui.templates.offset_hint'))}"
+               inputmode="text"></td>
+          <td><input type="text" data-k="size" value="${esc(f.size)}"
+               ${f.kind in TPL_FIXED ? 'readonly' : ''}></td>
+          <td><input type="text" data-k="name" value="${esc(f.name)}"
+               maxlength="${max.name || 80}"></td>
+          <td><select data-k="kind">${tplKindOptions(f.kind)}</select></td>
+          <td><input type="text" data-k="note" value="${esc(f.note)}"
+               maxlength="${max.note || 200}"></td>
+          <td><button class="ghost" data-remove
+               title="${esc(txt('ui.templates.remove_field'))}"
+               aria-label="${esc(txt('ui.templates.remove_field'))}">✕</button></td>
+        </tr>`).join('')}</tbody></table>
+    <div class="row">
+      <button class="ghost" id="tpl-add-field">${esc(txt('ui.templates.add_field'))}</button>
+      <span class="hint">${d.fields.length}/${max.fields || 512}</span>
+    </div>
+    <div class="row tpl-actions">
+      <button class="solid" id="tpl-save">${esc(txt('ui.templates.save'))}</button>
+      ${saved ? `<button class="ghost" id="tpl-copy">${
+        esc(txt('ui.templates.save_copy'))}</button>
+        <button class="ghost" id="tpl-delete">${
+        esc(txt('ui.templates.delete'))}</button>` : ''}
+      <button class="ghost" id="tpl-revert"${TPL.dirty ? '' : ' disabled'}>${
+        esc(txt('ui.templates.revert'))}</button>
+      <span class="hint" id="tpl-dirty">${
+        TPL.dirty ? esc(txt('ui.templates.unsaved')) : ''}</span>
+    </div>
+    <div class="tpl-try">
+      <h4>${esc(txt('ui.templates.preview_heading'))}</h4>
+      <div class="row">
+        <label class="row"><span>${esc(txt('ui.templates.preview_from'))}</span>
+          <select id="tpl-base">${tplBaseOptions()}</select></label>
+        <label class="row"><span>${esc(txt('ui.templates.preview_at'))}</span>
+          <input type="text" id="tpl-at" value="${esc(TPL.previewAt)}"
+                 placeholder="${esc(txt('ui.templates.preview_offset_hint'))}"></label>
+        <button class="solid" id="tpl-preview">${esc(txt('ui.templates.preview'))}</button>
+      </div>
+    </div>`;
+  wireTemplateEditor();
+  renderTemplatePreview();
+}
+
+// Where an offset is counted from: the start of the image, or the start of
+// one of its partitions.
+function tplBaseOptions() {
+  const parts = (S.volumes?.partitions || []);
+  return [`<option value="0"${TPL.previewBase === 0 ? ' selected' : ''}>${
+    esc(txt('ui.templates.from_image'))}</option>`].concat(parts.map((p, i) =>
+    `<option value="${p.offset}"${TPL.previewBase === p.offset ? ' selected' : ''}>${
+      esc(txt('ui.templates.from_partition', {
+        name: p.slot || `#${i + 1}`, offset: '0x' + fmt.hex(p.offset, 8) }))
+    }</option>`)).join('');
+}
+
+function tplMarkDirty() {
+  TPL.dirty = true;
+  const el = $('#tpl-dirty');
+  if (el) el.textContent = txt('ui.templates.unsaved');
+  const rv = $('#tpl-revert');
+  if (rv) rv.disabled = false;
+}
+
+function wireTemplateEditor() {
+  $('#tpl-name').addEventListener('input', e => {
+    TPL.draft.name = e.target.value; tplMarkDirty();
+  });
+  $('#tpl-desc').addEventListener('input', e => {
+    TPL.draft.description = e.target.value; tplMarkDirty();
+  });
+  $$('#tpl-editor .tpl-fields tbody tr').forEach(tr => {
+    const f = TPL.draft.fields[+tr.dataset.i];
+    tr.querySelectorAll('[data-k]').forEach(inp => {
+      const k = inp.dataset.k;
+      inp.addEventListener(k === 'kind' ? 'change' : 'input', () => {
+        f[k] = inp.value;
+        tplMarkDirty();
+        if (k === 'kind') {
+          // A kind with a fixed width sets the size, so it cannot disagree.
+          if (f.kind in TPL_FIXED) f.size = String(TPL_FIXED[f.kind]);
+          renderTemplates();
+        }
+      });
+    });
+    tr.querySelector('[data-remove]').addEventListener('click', () => {
+      TPL.draft.fields.splice(+tr.dataset.i, 1);
+      if (!TPL.draft.fields.length) TPL.draft.fields.push(tplBlankField());
+      tplMarkDirty();
+      renderTemplates();
+    });
+  });
+  $('#tpl-add-field').addEventListener('click', () => {
+    TPL.draft.fields.push(tplBlankField());
+    tplMarkDirty();
+    renderTemplates();
+    const rows = $$('#tpl-editor .tpl-fields tbody tr');
+    rows[rows.length - 1]?.querySelector('[data-k="offset"]')?.focus();
+  });
+  $('#tpl-save').addEventListener('click', () => saveTemplate(false));
+  $('#tpl-copy')?.addEventListener('click', () => saveTemplate(true));
+  $('#tpl-delete')?.addEventListener('click', deleteTemplate);
+  $('#tpl-revert').addEventListener('click', () => {
+    if (!window.confirm(txt('ui.templates.confirm_discard'))) return;
+    // The current saved version, which after a conflict is the other
+    // examiner's, so the revision moves with it.
+    const t = tplSelected();
+    TPL.draft = t ? tplDraftFrom(t)
+      : { name: '', description: '', fields: [tplBlankField()] };
+    TPL.revision = t ? t.revision : null;
+    TPL.dirty = false;
+    $('#tpl-results').innerHTML = '';
+    renderTemplates();
+  });
+  $('#tpl-base').addEventListener('change', e => { TPL.previewBase = +e.target.value; });
+  $('#tpl-at').addEventListener('input', e => { TPL.previewAt = e.target.value; });
+  $('#tpl-at').addEventListener('keydown', e => {
+    if (e.key === 'Enter') previewTemplate();
+  });
+  $('#tpl-preview').addEventListener('click', previewTemplate);
+}
+
+async function saveTemplate(asCopy) {
+  const editing = !asCopy && TPL.sel !== 'new' && tplSelected();
+  const body = { case: TPL.case, template: tplBody() };
+  if (asCopy) {
+    // A copy is a new template: it keeps the fields, and needs its own name.
+    body.template.name = (TPL.draft.name || '').trim()
+      + txt('ui.templates.copy_suffix');
+  } else if (editing) {
+    body.id = TPL.sel;
+    body.revision = TPL.revision;
+  }
+  const r = await api.post('case/template', body).catch(() => null);
+  if (!r) return toast(txt('messages.templates_conflict'));
+  if (r.templates) TPL.list = r.templates;
+  if (r.error) {
+    // The form stays as it was, so nothing typed is lost.
+    if (r.templates) toast(txt('messages.templates_conflict'));
+    TPL.error = '';
+    renderTemplates();
+    $('#tpl-results').innerHTML = `<p class="empty is-warn">${esc(r.error)}</p>`;
+    return;
+  }
+  TPL.sel = r.id;
+  TPL.draft = tplDraftFrom(r.template);
+  TPL.revision = r.template.revision;
+  TPL.dirty = false;
+  renderTemplates();
+  toast(txt('messages.templates_saved'), 'action');
+  if (TPL.previewAt.trim()) previewTemplate();
+}
+
+async function deleteTemplate() {
+  const t = tplSelected();
+  if (!t || !window.confirm(txt('ui.templates.confirm_delete', { name: t.name }))) return;
+  const r = await api.post('case/template/delete',
+                           { case: TPL.case, id: t.id,
+                             revision: TPL.revision }).catch(() => null);
+  if (r?.templates) TPL.list = r.templates;
+  if (!r || r.error) {
+    toast(r?.error || txt('messages.templates_conflict'));
+    return renderTemplates();
+  }
+  Object.assign(TPL, { sel: null, draft: null, revision: null,
+                       dirty: false, preview: null });
+  renderTemplates();
+  toast(txt('messages.templates_deleted'), 'action');
+}
+
+async function previewTemplate() {
+  if (!S.open) return toast(txt('messages.templates_need_evidence'));
+  const at = tplNumber(TPL.previewAt);
+  const r = await api.post('structure/preview', {
+    template: tplBody(), offset: at === null ? -1 : at,
+    part: TPL.previewBase || undefined,
+  }).catch(() => null);
+  TPL.preview = r && !r.error ? r : { error: r?.error || '' };
+  renderTemplatePreview();
+}
+
+function renderTemplatePreview() {
+  const out = $('#tpl-results');
+  if (!out) return;
+  const p = TPL.preview;
+  if (!p) {
+    out.innerHTML = `<p class="empty">${esc(txt('ui.templates.preview_empty'))}</p>`;
+    return;
+  }
+  if (p.error !== undefined) {
+    out.innerHTML = `<p class="empty is-warn">${esc(p.error)}</p>`;
+    return;
+  }
+  const total = p.fields.length + p.skipped;
+  out.innerHTML = `
+    <div class="results-head">${esc(txt('ui.templates.preview_title', {
+      name: TPL.draft?.name || '', offset: fmt.hex(p.offset, 8) }))}</div>
+    ${p.skipped ? `<p class="hint is-warn">${esc(txt('ui.templates.preview_short',
+      { skipped: p.skipped, total }))}</p>` : ''}
+    <table class="tpl-out">
+      <thead><tr><th>${esc(txt('ui.templates.col_name'))}</th>
+        <th>${esc(txt('ui.templates.col_value'))}</th>
+        <th>${esc(txt('ui.templates.col_raw'))}</th>
+        <th>${esc(txt('ui.templates.col_at'))}</th>
+        <th>${esc(txt('ui.templates.col_note'))}</th></tr></thead>
+      <tbody>${p.fields.map((f, i) => `
+        <tr data-i="${i}" title="${esc(f.note || '')}">
+          <td>${esc(f.name)}</td>
+          <td class="mono">${esc(String(f.value))}</td>
+          <td class="mono dim">${esc(f.raw)}</td>
+          <td class="mono dim">0x${fmt.hex(f.offset, 8)} · ${f.size}B</td>
+          <td class="dim">${esc(f.note || '')}</td></tr>`).join('')}</tbody></table>`;
+}
+
+$('#btn-tpl-new')?.addEventListener('click', () => tplChoose('new'));
+
 function markFrame() {
   if (!S.scope.file || !S.scope.entry) return { frame: 'media' };
   const e = S.scope.entry;
   return {
     frame: 'file',
     part: S.scope.part,
-    node: String(e.oid ?? e.mft ?? e.inode ?? e.start_cluster ?? e.path ?? ''),
+    node: String(nodeValue(e) ?? e.path ?? ''),
     stream: S.scope.stream || null,
     name: e.name || '',
   };
@@ -7538,7 +9154,8 @@ async function openDocument(e, part) {
   const token = (pvToken = Symbol());
   pvSet(e.name, 'document', `<p class="empty">${txt('ui.preview_entry.reading')}</p>`);
   const d = await api.get('document', { part: partOffset(part),
-                                       entry: JSON.stringify(e) });
+                                       entry: JSON.stringify(e),
+                                       snap: snapParam(part) });
   if (pvToken !== token) return;
   if (d.error) return pvSet(e.name, 'document',
     `<div class="notice bad">${esc(d.error)}</div>`);
@@ -7575,6 +9192,14 @@ function bindDocZip(e, part) {
   $('#doc-as-zip')?.addEventListener('click', () => openArchive(e, part));
 }
 
+function applyReadOnly() {
+  // Server-side is authoritative (engine.server refuses these routes
+  // regardless of what the UI shows); this only keeps read-only examiners
+  // from reaching for a control that would just be refused.
+  const btn = $('#btn-tag-export');
+  if (btn) btn.disabled = S.readOnly;
+}
+
 function applyEmptyCase(r) {
   const next = r.case_path || r.case?.path || null;
   enterCase(next);
@@ -7583,6 +9208,7 @@ function applyEmptyCase(r) {
   S.volumes = null;
   S.caseInfo = r.case;
   S.casePath = next;
+  loadCasePrefs();
   S.exhibits = [];
   S.activeId = null;
   startPulse();
@@ -7596,7 +9222,7 @@ function applyEmptyCase(r) {
   $('#btn-add').addEventListener('click', () => openDialog({ add: true }));
   $('#btn-case').addEventListener('click', () => caseDialog());
   $('#btn-audit').hidden = false;
-  $('#btn-report').hidden = false;
+  $('#btn-report').hidden = S.readOnly;
   $('#integrity').hidden = true;
   if ($('.view[data-view="cases"]')?.classList.contains('is-on')) {
     renderCases();
@@ -7607,6 +9233,9 @@ function applyEmptyCase(r) {
     + 'audit trail are still here.</p>';
   previewNone(txt('messages.case_evidence_yet'));
   setEmptyScope(caseFile || r.case?.name || txt('ui.cases.no_case'), null);
+  S.noteEdit = null;
+  loadNotes();
+  loadTemplates();
 }
 
 function examinerName() {
@@ -7627,6 +9256,7 @@ async function setWho(name) {
   const r = await api.post('whoami', { name });
   if (r.error) return toast(r.error);
   await loadWho();
+  if ($('.view[data-view="cases"]')?.classList.contains('is-on')) renderCases();
   toast(txt('messages.toast.work_now_recorded_name', { name: name }));
 }
 
@@ -7654,10 +9284,14 @@ const picked = new Set();
 
 const COST_RANK = { instant: 0, quick: 1, minutes: 2, long: 3 };
 
+let pickerPresence = {};
+
 async function openPicker() {
   if (!S.open) return toast(txt('messages.toast.open_evidence_first'));
-  const r = await api.get('artifacts');
+  const [r, presence] = await Promise.all([
+    api.get('artifacts'), api.get('artifacts/presence')]);
   pickerRows = r.artifacts || [];
+  pickerPresence = presence || {};
   if (!picked.size) {
     const ok = new Set(pickerRows.filter(a => a.available !== false)
                                  .map(a => a.id));
@@ -7665,6 +9299,20 @@ async function openPicker() {
   }
   renderPicker();
   $('#dlg-picker').showModal();
+}
+
+function presenceHint(id) {
+  const p = pickerPresence;
+  if (id === 'recyclebin' && p.recyclebin?.found) {
+    return txt('ui.presence.recyclebin_found', { count: p.recyclebin.count });
+  }
+  if (id === 'prefetch' && p.prefetch?.found) {
+    return txt('ui.presence.prefetch_found', { count: p.prefetch.count });
+  }
+  if (id === 'browser' && p.browser?.found) {
+    return txt('ui.presence.browser_found', { count: p.browser.profiles.length });
+  }
+  return null;
 }
 
 function renderPicker() {
@@ -7678,6 +9326,7 @@ function renderPicker() {
         <span class="pick-costnote">${esc(groups[cost][0].cost_note)}</span></div>
       ${groups[cost].map(a => {
         const off = a.available === false;
+        const hint = !off && presenceHint(a.id);
         return `
         <label class="pick${off ? ' is-off' : ''}">
           <input type="checkbox" data-id="${esc(a.id)}"
@@ -7686,6 +9335,7 @@ function renderPicker() {
           <span class="pick-body">
             <span class="pick-label">${esc(a.label)}</span>
             <span class="pick-answers">${esc(a.answers)}</span>
+            ${hint ? `<span class="pick-presence">${esc(hint)}</span>` : ''}
             ${off ? `<span class="pick-why">${
               esc(a.unavailable_because || 'Not available for this image.')
             }</span>` : ''}
@@ -7892,6 +9542,107 @@ function renderUsn(r, part) {
   initColumnResize();
 }
 
+let logPage = 0, logQuery = '', logOp = '';
+const LOG_PER_PAGE = 200;
+
+async function loadLogfile(part) {
+  const r = await api.get('logfile', {
+    offset: logPage * LOG_PER_PAGE, limit: LOG_PER_PAGE,
+    q: logQuery || undefined, op: logOp || undefined,
+  });
+  if (!r.loaded) {
+    $('#art-results').innerHTML =
+      `<p class="empty">${txt('ui.logfile.not_read_yet')}</p>`;
+    return;
+  }
+  renderLogfile(r, part);
+}
+
+function renderLogfile(r, part) {
+  const rep = r.report || {}, st = rep.stats || {};
+  const newest = (rep.restart || []).find(x => x.page === rep.newest_restart) || {};
+  const pages = Math.max(1, Math.ceil(r.total / LOG_PER_PAGE));
+  const yesno = v => txt(v ? 'ui.logfile.yes' : 'ui.logfile.no');
+  const notes = [
+    `<p class="hint">${esc(txt('ui.logfile.summary', {
+      restarts: st.restart_pages, records: (st.records || 0).toLocaleString(),
+      pages: (st.log_pages || 0).toLocaleString(),
+      clean: yesno(newest.clean_shutdown), version: newest.version,
+      size: (rep.size || 0).toLocaleString() }))}</p>`,
+    `<p class="hint">${esc(txt('ui.logfile.caveat'))}</p>`,
+  ];
+  for (const f of rep.findings || []) {
+    notes.push(`<p class="notice bad">${esc(f)}</p>`);
+  }
+  const rows = (r.records || []).map(x => {
+    const ops = x.redo_name
+      ? `${esc(x.redo_name)} <small>(0x${x.redo_op.toString(16)})</small> / ${
+          esc(x.undo_name)} <small>(0x${x.undo_op.toString(16)})</small>`
+      : esc(x.type);
+    const tgt = x.redo_name
+      ? `attr ${x.target_attribute}, vcn ${x.target_vcn}${
+          (x.lcns || []).length ? ', lcn ' + x.lcns.join(',') : ''}`
+      : '—';
+    const names = (x.names || []).map(n => {
+      const t = n.times || {};
+      const tip = ['created', 'modified', 'mft_modified', 'accessed']
+        .map(k => `${k}: ${t[k] ? fmt.time(t[k]) : '—'}`).join('\n');
+      return `<span title="${esc(tip)}">${esc(n.name)}</span> <small>(${
+        esc(n.from)} ${esc(n.source)}${
+        n.file_reference != null ? ', file ' + n.file_reference : ''}, parent ${
+        n.parent_reference})</small>`;
+    }).join('<br>');
+    return `<tr>
+      <td class="dv">${x.lsn.toLocaleString()}</td>
+      <td class="dv">${x.transaction || '—'}</td>
+      <td class="dv">${ops}</td>
+      <td class="dv">${esc(tgt)}</td>
+      <td class="dv">${names || '—'}</td>
+      <td class="dv">${x.offset.toLocaleString()}</td>
+    </tr>`;
+  }).join('');
+  $('#art-results').innerHTML = `
+    ${notes.join('')}
+    <div class="runbar">
+      <input type="text" id="log-q" class="dv-filter"
+             placeholder="${esc(txt('ui.logfile.name_placeholder'))}" value="${esc(logQuery)}">
+      <select id="log-op">
+        <option value="">${txt('ui.logfile.every_operation')}</option>
+        ${(r.operations || []).map(x =>
+          `<option value="${esc(x)}"${x === logOp ? ' selected' : ''}>${esc(x)}</option>`
+        ).join('')}
+      </select>
+      <button class="ghost" id="log-prev"${logPage ? '' : ' disabled'}>${txt('ui.logfile.prev')}</button>
+      <span class="len">${esc(txt('ui.logfile.pager', {
+        page: (logPage + 1).toLocaleString(), pages: pages.toLocaleString(),
+        n: r.total.toLocaleString() }))}</span>
+      <button class="ghost" id="log-next"${
+        logPage + 1 >= pages ? ' disabled' : ''}>${txt('ui.logfile.next')}</button>
+    </div>
+    <table class="dv-list">
+      <thead><tr><th>${txt('ui.logfile.lsn')}</th><th>${txt('ui.logfile.transaction')}</th>
+        <th>${txt('ui.logfile.operation')}</th><th>${txt('ui.logfile.target')}</th>
+        <th>${txt('ui.logfile.name')}</th><th>${txt('ui.logfile.position')}</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  $('#log-prev').addEventListener('click', () => {
+    if (logPage) { logPage--; loadLogfile(part); }
+  });
+  $('#log-next').addEventListener('click', () => {
+    if (logPage + 1 < pages) { logPage++; loadLogfile(part); }
+  });
+  $('#log-op').addEventListener('change', e => {
+    logOp = e.target.value; logPage = 0; loadLogfile(part);
+  });
+  let t;
+  $('#log-q').addEventListener('input', e => {
+    clearTimeout(t);
+    const v = e.target.value;
+    t = setTimeout(() => { logQuery = v; logPage = 0; loadLogfile(part); }, 250);
+  });
+  initColumnResize();
+}
+
 let toastTimer;
 function noticeWanted(channel) {
   if (!channel || channel === 'problem') return true;
@@ -7909,6 +9660,8 @@ function toast(msg, channel = 'problem') {
 
 const OPEN_STAGES = [
   ['bookmarks…', () => loadMarks()],
+  [txt('ui.app.notes'), () => loadNotes()],
+  [txt('ui.app.templates'), () => loadTemplates()],
   [txt('ui.tagged_items_2'), () => loadTags()],
   [txt('ui.saved_searches_2'), () => loadSavedSearches()],
   [txt('ui.hash_sets'), () => loadHashSets()],
@@ -7960,6 +9713,7 @@ function applyOpened(r, { tree = true } = {}) {
   S.volumes = r.volumes;
   S.caseInfo = r.case;
   S.casePath = r.case_path || null;
+  loadCasePrefs();
   S.exhibits = r.evidence || [];
   S.activeId = r.active_id ?? null;
   S.evidenceId = r.evidence_id ?? null;
@@ -7985,10 +9739,8 @@ function applyOpened(r, { tree = true } = {}) {
   $('#btn-add').addEventListener('click', () => openDialog({ add: true }));
   $('#btn-case').addEventListener('click', () => caseDialog());
   $('#btn-audit').hidden = false;
-  $('#btn-report').hidden = false;
-  $('#integrity').hidden = false;
-  $('#integrity').dataset.state = 'unchecked';
-  $('#integrity').textContent = txt('ui.hashes_unchecked');
+  $('#btn-report').hidden = S.readOnly;
+  showIntegrity(S.caseInfo?.evidence?.find(e => e.id === S.activeId));
   scopeOptions();
   if ($('.view[data-view="cases"]')?.classList.contains('is-on')) {
     renderCases();
@@ -8020,6 +9772,258 @@ async function browse(path, { into = '#browser', target = '#open-path',
     } else { $(target).value = el.dataset.path; onPick?.(el.dataset.path); }
   }));
 }
+
+// -- Assembling a RAID set -----------------------------------------------------
+// The definition is typed here, checked by the engine, and stored in the case;
+// the members are picked from the same file browser the Open dialog uses.
+const RAID_CHUNKS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
+                     1048576];
+const RAID_LAYOUTS = ['left-symmetric', 'left-asymmetric', 'right-symmetric',
+                      'right-asymmetric'];
+const RAID = { members: [], focus: 0, primary: 0, dir: '/', add: false };
+
+const raidBlank = () => ({ path: '', offset: '', missing: false });
+const raidLevel = () => +$('#raid-level').value;
+const raidMin = level => (level === 5 ? 3 : 2);
+
+function raidDialog() {
+  const dlg = $('#dlg-raid');
+  RAID.add = !!S.casePath;
+  RAID.dir = (S.casePath || '').replace(/[\\/][^\\/]*$/, '') || '/';
+  RAID.members = [raidBlank(), raidBlank(), raidBlank()];
+  RAID.focus = 0;
+  RAID.primary = 0;
+  $('#raid-name').value = '';
+  $('#raid-level').value = '5';
+  $('#raid-chunk').innerHTML = RAID_CHUNKS.map(c =>
+    `<option value="${c}"${c === 65536 ? ' selected' : ''}>${
+      fmt.bytes(c)}</option>`).join('')
+    + `<option value="other">${esc(txt('ui.raid.chunk_other'))}</option>`;
+  $('#raid-chunk-custom').value = '';
+  $('#raid-layout').innerHTML = RAID_LAYOUTS.map(l =>
+    `<option value="${l}">${esc(txt('ui.raid.layout_' + l))}</option>`).join('');
+  $('#raid-check').innerHTML = '';
+  const known = examinerName();
+  $('#raid-examiner').value = known || '';
+  $('#raid-examiner-field').hidden = RAID.add && !!known;
+  $('#raid-case-field').hidden = RAID.add;
+  $('#raid-case').value = '';
+  $('#raid-add-note').hidden = !RAID.add;
+  if (RAID.add) {
+    $('#raid-add-note').textContent = txt('ui.raid.add_note', {
+      case: S.casePath.replace(/^.*[\\/]/, ''), exhibits: S.exhibits.length });
+  }
+  raidSync();
+  renderRaidMembers();
+  browse(RAID.dir, { into: '#raid-browser', target: '#raid-pick',
+                     kind: 'any', onPick: raidPicked,
+                     onDir: d => { RAID.dir = d; } });
+  dlg.showModal();
+}
+
+// What applies to the chosen level: mirrors have no chunk or layout, only
+// RAID 5 has a layout, and a set needs enough members for its level.
+function raidSync() {
+  const level = raidLevel();
+  $('#raid-chunk-field').hidden = level === 1;
+  $('#raid-layout-field').hidden = level !== 5;
+  $('#raid-chunk-custom').hidden = $('#raid-chunk').value !== 'other';
+  $('#raid-layout-hint').textContent = txt('ui.raid.layout_hint_' + level);
+  while (RAID.members.length < raidMin(level)) RAID.members.push(raidBlank());
+  if (level === 0) RAID.members.forEach(m => { m.missing = false; });
+}
+
+function raidPicked(path) {
+  const m = RAID.members[RAID.focus];
+  if (!m) return;
+  m.path = path;
+  m.missing = false;
+  if (!$('#raid-name').value.trim()) {
+    $('#raid-name').value = path.replace(/^.*[\\/]/, '').replace(/\.[^.]*$/, '')
+      .replace(/[-_ ]*\d+$/, '') || path.replace(/^.*[\\/]/, '');
+  }
+  const next = RAID.members.findIndex((x, i) => i > RAID.focus && !x.path
+                                                 && !x.missing);
+  if (next >= 0) RAID.focus = next;
+  renderRaidMembers();
+}
+
+function renderRaidMembers() {
+  const level = raidLevel();
+  const box = $('#raid-members');
+  const n = RAID.members.length;
+  box.innerHTML = RAID.members.map((m, i) => `
+    <div class="raid-row${i === RAID.focus ? ' is-focus' : ''}" data-i="${i}">
+      <span class="raid-slot">${esc(txt('ui.raid.member', { n: i + 1 }))}</span>
+      <input type="text" data-k="path" value="${esc(m.path)}"
+        aria-label="${esc(txt('ui.raid.member_path'))}"
+        ${m.missing ? 'disabled' : ''}>
+      <input type="text" data-k="offset" size="9" value="${esc(m.offset)}"
+        placeholder="0" title="${esc(txt('ui.raid.member_offset_title'))}"
+        aria-label="${esc(txt('ui.raid.member_offset'))}">
+      ${level !== 0 ? `<label class="check" title="${
+        esc(txt('ui.raid.missing_title'))}"><input type="checkbox"
+        data-k="missing" ${m.missing ? 'checked' : ''}><span>${
+        esc(txt('ui.raid.missing'))}</span></label>` : ''}
+      ${level === 1 ? `<label class="check" title="${
+        esc(txt('ui.raid.read_from_title'))}"><input type="radio"
+        name="raid-primary" data-k="primary" ${i === RAID.primary ? 'checked' : ''}
+        ${m.missing ? 'disabled' : ''}><span>${
+        esc(txt('ui.raid.read_from'))}</span></label>` : ''}
+      <span class="raid-move">
+        <button type="button" class="ghost" data-up ${i ? '' : 'disabled'}
+          title="${esc(txt('ui.raid.up'))}">↑</button>
+        <button type="button" class="ghost" data-down ${i < n - 1 ? '' : 'disabled'}
+          title="${esc(txt('ui.raid.down'))}">↓</button>
+        <button type="button" class="ghost" data-remove
+          ${n > raidMin(level) ? '' : 'disabled'}
+          title="${esc(txt('ui.raid.remove'))}">✕</button>
+      </span>
+    </div>`).join('');
+  $$('#raid-members .raid-row').forEach(row => {
+    const i = +row.dataset.i;
+    const m = RAID.members[i];
+    const focus = () => {
+      RAID.focus = i;
+      $$('#raid-members .raid-row').forEach(r =>
+        r.classList.toggle('is-focus', +r.dataset.i === i));
+    };
+    row.addEventListener('focusin', focus);
+    row.addEventListener('click', focus);
+    row.querySelector('[data-k="path"]').addEventListener('input', e => {
+      m.path = e.target.value;
+    });
+    row.querySelector('[data-k="offset"]').addEventListener('input', e => {
+      m.offset = e.target.value;
+    });
+    row.querySelector('[data-k="missing"]')?.addEventListener('change', e => {
+      m.missing = e.target.checked;
+      if (m.missing && RAID.primary === i) {
+        RAID.primary = RAID.members.findIndex(x => !x.missing);
+      }
+      renderRaidMembers();
+    });
+    row.querySelector('[data-k="primary"]')?.addEventListener('change', () => {
+      RAID.primary = i;
+    });
+    const move = by => {
+      const j = i + by;
+      if (j < 0 || j >= RAID.members.length) return;
+      [RAID.members[i], RAID.members[j]] = [RAID.members[j], RAID.members[i]];
+      if (RAID.primary === i) RAID.primary = j;
+      else if (RAID.primary === j) RAID.primary = i;
+      RAID.focus = j;
+      renderRaidMembers();
+    };
+    row.querySelector('[data-up]').addEventListener('click', () => move(-1));
+    row.querySelector('[data-down]').addEventListener('click', () => move(1));
+    row.querySelector('[data-remove]').addEventListener('click', () => {
+      RAID.members.splice(i, 1);
+      RAID.focus = Math.min(RAID.focus, RAID.members.length - 1);
+      RAID.primary = Math.min(RAID.primary, RAID.members.length - 1);
+      renderRaidMembers();
+    });
+  });
+}
+
+// The definition as the form has it, or an error naming what is missing; the
+// engine checks the rest and answers with a message for anything it refuses.
+function raidDefinition() {
+  const level = raidLevel();
+  const members = [];
+  for (const [i, m] of RAID.members.entries()) {
+    const path = m.missing ? null : m.path.trim();
+    if (!m.missing && !path) {
+      return { error: txt('ui.raid.member_no_path', { n: i + 1 }) };
+    }
+    const off = m.offset.trim() ? tplNumber(m.offset) : 0;
+    members.push({ path: path || null, offset: off });
+  }
+  const d = { name: $('#raid-name').value, level, members };
+  if (level !== 1) {
+    d.chunk = $('#raid-chunk').value === 'other'
+      ? tplNumber($('#raid-chunk-custom').value) : +$('#raid-chunk').value;
+  }
+  if (level === 5) d.layout = $('#raid-layout').value;
+  if (level === 1) d.primary = RAID.primary;
+  return { definition: d };
+}
+
+async function raidCheck() {
+  const box = $('#raid-check');
+  const got = raidDefinition();
+  if (got.error) { box.innerHTML = `<p class="is-warn">${esc(got.error)}</p>`; return null; }
+  box.innerHTML = `<p class="hint">${esc(txt('ui.raid.checking'))}</p>`;
+  const r = await api.post('raid/check', { definition: got.definition })
+    .catch(() => null);
+  if (!r || r.error) {
+    box.innerHTML = `<p class="is-warn">${esc(r?.error || '')}${
+      r?.advice ? ' ' + esc(r.advice) : ''}</p>`;
+    return null;
+  }
+  const scheme = ['MBR', 'GPT'].includes(r.scheme) ? r.scheme : null;
+  const found = r.recognised || !!scheme;
+  const what = [scheme, ...r.volumes.filter(v => v.fs).map(v =>
+    `${v.fs} at 0x${fmt.hex(v.offset, 8)}`)].filter(Boolean).join(', ');
+  box.innerHTML = `
+    <div class="results-head">${esc(txt('ui.raid.result_heading', {
+      format: r.info.format, size: fmt.bytes(r.info.size) }))}</div>
+    ${(r.info.findings || []).map(f => `<p class="hint is-warn">${esc(f)}</p>`).join('')}
+    <p class="hint${found ? '' : ' is-warn'}">${esc(
+      found ? txt('ui.raid.recognised', { what })
+            : txt('ui.raid.not_recognised'))}</p>`;
+  return got.definition;
+}
+
+async function raidAssemble() {
+  const def = await raidCheck();
+  if (!def) return;
+  let casePath = null;
+  if (!RAID.add) {
+    casePath = $('#raid-case').value.trim();
+    if (!casePath) {
+      const first = def.members.find(m => m.path);
+      casePath = first.path.replace(/[\\/][^\\/]*$/, '') + '/'
+        + (def.name.replace(/[^\w.-]+/g, '_') || 'raid') + '.strata';
+      $('#raid-case').value = casePath;
+    }
+  }
+  const examiner = $('#raid-examiner').value.trim() || examinerName();
+  $('#dlg-raid').close();
+  busy.open(txt('ui.raid.assembling'), def.name);
+  busy.waiting(txt('ui.raid.assembling_detail'));
+  let r;
+  try {
+    r = await api.post('raid/open', { definition: def, examiner,
+                                      case: casePath, add: RAID.add });
+    if (r.error) return toast(r.error);
+    adoptOpened(r);
+    for (const [label, fn] of OPEN_STAGES) {
+      busy.waiting(label);
+      await fn();
+    }
+  } finally {
+    busy.close();
+  }
+  pollTasks();
+  loadSavedArtefacts();
+  loadTimezone(true);
+}
+
+$('#open-raid')?.addEventListener('click', () => {
+  $('#dlg-open').close();
+  raidDialog();
+});
+$('#raid-level')?.addEventListener('change', () => { raidSync(); renderRaidMembers(); });
+$('#raid-chunk')?.addEventListener('change', raidSync);
+$('#raid-add-member')?.addEventListener('click', () => {
+  RAID.members.push(raidBlank());
+  RAID.focus = RAID.members.length - 1;
+  renderRaidMembers();
+});
+$('#raid-cancel')?.addEventListener('click', () => $('#dlg-raid').close());
+$('#raid-test')?.addEventListener('click', raidCheck);
+$('#raid-open')?.addEventListener('click', raidAssemble);
 
 function openDialog({ add = false, kind = 'image' } = {}) {
   const dlg = $('#dlg-open');
@@ -8115,7 +10119,8 @@ async function peekCase(path) {
     <div class="notice ${r.audit_integrity?.intact ? '' : 'bad'}">
       ${r.audit_integrity?.intact
         ? 'Audit chain intact.'
-        : `Audit chain broken at entry ${r.audit_integrity?.broken_at}.`}
+        : `Audit chain broken at entry ${r.audit_integrity?.broken_at}.${
+            r.audit_integrity?.detail ? ' ' + esc(r.audit_integrity.detail) : ''}`}
     </div>`;
 }
 
@@ -8172,6 +10177,14 @@ function recentFlag(c) {
   return '';
 }
 
+// A RAID set has no file of its own: the case row shows the files it is made
+// of, in the order they are in the set.
+function raidMembersLine(e) {
+  let list = [];
+  try { list = JSON.parse(e.parents || '[]'); } catch { /* shown as none */ }
+  return txt('ui.raid.made_of', { members: list.join(' · ') || '—' });
+}
+
 function evidenceRow(e, openIds) {
   const isActive = e.id === S.activeId;
   const isOpen = openIds.has(e.id);
@@ -8189,7 +10202,7 @@ function evidenceRow(e, openIds) {
         ${state}${verified}
         <span class="off">${fmt.bytes(e.size)}</span>
       </div>
-      <div class="sub">${esc(e.path)}</div>
+      <div class="sub">${esc(e.kind === 'raid' ? raidMembersLine(e) : e.path)}</div>
       <button class="linkish" data-remove="${e.id}">${txt('ui.cases.remove')}</button>
     </div>`;
 }
@@ -8383,12 +10396,18 @@ function applyNoCase() {
   S.volumes = null;
   S.caseInfo = null;
   S.casePath = null;
+  S.folderColumns = null;
+  S.folderColumnsDefault = null;
   S.exhibits = [];
   S.activeId = null;
   S.evidenceId = null;
   S.scope = null;
+  S.snapLabel = null;
   S.marks = [];
   S.tags = [];
+  S.notes = [];
+  loadNotes();
+  loadTemplates();
   $('#evidence-bar').innerHTML = `
     <button class="ghost" id="btn-open">${txt('ui.app.open')}</button>
     <button class="ghost" id="btn-case">${txt('ui.app.case')}</button>`;
@@ -8407,6 +10426,7 @@ $('#btn-new-case')?.addEventListener('click', newCaseDialog);
 $('#btn-open-case')?.addEventListener('click', () => caseDialog());
 $('#btn-case-add')?.addEventListener('click', () => openDialog({ add: !!S.casePath }));
 $('#btn-close-case')?.addEventListener('click', closeCaseDialog);
+$('#btn-compact-case')?.addEventListener('click', compactCase);
 $('#newcase-name')?.addEventListener('input', pathHint);
 $('#newcase-path')?.addEventListener('input', pathHint);
 $('#dlg-new-case')?.addEventListener('close', () => {
@@ -8573,7 +10593,8 @@ let pulseTimer = null;
 let lastPulse = null;
 
 function markPulse(p) {
-  if (p) lastPulse = { bookmarks: p.bookmarks, tags: p.tags, audit: p.audit };
+  if (p) lastPulse = { bookmarks: p.bookmarks, tags: p.tags, notes: p.notes,
+                       notes_rev: p.notes_rev, audit: p.audit };
 }
 
 async function pulse() {
@@ -8583,17 +10604,21 @@ async function pulse() {
   const changed = !lastPulse
     || p.bookmarks !== lastPulse.bookmarks
     || p.tags !== lastPulse.tags
+    || p.notes_rev !== lastPulse.notes_rev
     || p.audit !== lastPulse.audit;
   if (!changed) return;
 
   const first = lastPulse === null;
   const added = first ? 0
-    : (p.bookmarks - lastPulse.bookmarks) + (p.tags - lastPulse.tags);
+    : (p.bookmarks - lastPulse.bookmarks) + (p.tags - lastPulse.tags)
+      + (p.notes - lastPulse.notes);
+  const notesChanged = !first && p.notes_rev !== lastPulse.notes_rev;
   markPulse(p);
   if (first) return;
 
   await loadTags();
   await loadMarks();
+  if (notesChanged) await loadNotes();
 
   const mine = (examinerName() || '').toLowerCase();
   const who = (p.latest || '').trim();
@@ -8621,9 +10646,29 @@ async function relocateIndex(pending) {
   const t = await api.post('index/relocate', {}).catch(() => null);
   if (!t || t.error || t.nothing_to_do) return;
   const r = await awaitTask(t, txt('ui.index.moving'));
-  if (r && r.moved) {
+  if (r && r.moved && r.converted) {
+    toast(txt('messages.index_converted', {
+      before: fmt.bytes(r.before), after: fmt.bytes(r.after) }), 'task');
+  } else if (r && r.moved) {
     toast(txt('messages.index_moved', { count: r.moved }), 'task');
+  } else if (r && r.deferred) {
+    toast(txt('messages.index_move_deferred', {
+      need: fmt.bytes(r.need), free: fmt.bytes(r.free) }));
+  } else if (r && r.error) {
+    toast(txt('messages.index_move_failed', { error: r.error }));
   }
+}
+
+async function compactCase() {
+  if (!S.casePath) return toast(txt('messages.cases.none_open'));
+  const t = await api.post('case/compact', {}).catch(() => null);
+  if (!t) return;
+  if (t.error) return toast(t.tasks?.length ? `${t.error} ${t.advice}` : t.error);
+  const r = await awaitTask(t, txt('ui.cases.compacting'));
+  if (!r) return;
+  if (!r.compacted) return toast(r.error || txt('messages.cases.compact_failed'));
+  toast(txt('messages.cases.compacted', {
+    before: fmt.bytes(r.before), after: fmt.bytes(r.after) }), 'task');
 }
 
 async function loadVersion() {
@@ -9003,8 +11048,7 @@ $('#dlg-tag').addEventListener('close', async () => {
     const a = await api.post('attack/tag', {
       part: +$('#dlg-tag').dataset.part,
       target_kind: 'file',
-      target_ref: String(entry.mft ?? entry.inode ?? entry.oid
-                         ?? entry.start_cluster ?? entry.path ?? entry.name),
+      target_ref: String(nodeValue(entry) ?? entry.path ?? entry.name),
       technique: tech, technique_name: t?.name, tactic: t?.tactic,
       note: $('#tag-note').value.trim(), asserted: true,
       catalogue: attackState.catalogue?.version,
@@ -9042,6 +11086,17 @@ $('#btn-index-clear').addEventListener('click', async () => {
 $('#find-scope').addEventListener('change', refreshIndexState);
 $('#btn-save-search').addEventListener('click', saveCurrentSearch);
 $('#btn-hash').addEventListener('click', doHash);
+$('#btn-duplicates').addEventListener('click', doDuplicates);
+$('#btn-diff').addEventListener('click', runDiff);
+$('#btn-similar').addEventListener('click', doSimilar);
+// Enter in a dialog's text field presses the form's first submit button. The
+// Cancel button comes first in each menu, so Enter used to cancel the dialog
+// instead of submitting it. Cancel buttons are plain buttons (type="button" in
+// the markup) that close their dialog themselves, leaving the confirm button
+// the form's default.
+$$('dialog button[value="cancel"]').forEach(b =>
+  b.addEventListener('click', () => b.closest('dialog').close('cancel')));
+
 $('#btn-artifacts').addEventListener('click', () => doArtifacts(true));
 $('#art-scope')?.addEventListener('change', () => { artPick = null; renderArtTree(); });
 
@@ -9075,7 +11130,12 @@ $('#btn-tag-export').addEventListener('click', async () => {
       const t = items[i];
       if (t.is_dir) continue;
       const r = await api.post('export/file', { part: t.part, node: t.node,
-                                                name: t.name, path: t.path });
+                                                name: t.name, path: t.path,
+                                                size: t.size, deleted: !!t.deleted,
+                                                contiguous: !!t.contiguous,
+                                                modified: t.modified,
+                                                accessed: t.accessed,
+                                                created: t.file_created });
       if (r.error) failed++; else ok++;
     }
   } finally { busy.close(); }
@@ -9202,8 +11262,9 @@ $('#btn-audit').addEventListener('click', async () => {
   const r = await api.get('audit');
   $('#audit-state').innerHTML = r.integrity.intact
     ? txt('messages.hash_chain_intact_across_all_entries')
-    : `<strong style="color:var(--alarm)">${txt('ui.chain_broken_entry_broken', { broken_at: r.integrity.broken_at })}</strong> The log has been altered since it
-        was written.`;
+    : `<strong style="color:var(--alarm)">${txt('ui.chain_broken_entry_broken', { broken_at: r.integrity.broken_at })}</strong> ${
+        r.integrity.detail ? esc(r.integrity.detail)
+          : 'The log has been altered since it was written.'}`;
   $('#audit-body').innerHTML = r.entries.map(e => `
     <div class="entry">
       <span class="when">${e.at}</span>
@@ -9287,6 +11348,9 @@ function setModule(view) {
   if (view === 'sources') core.draw();
   if (view === 'cases') renderCases();
   if (view === 'time') loadStoredTimeline();
+  if (view === 'diff') renderDiffPanel();
+  if (view === 'notes') loadNotes();
+  if (view === 'templates') loadTemplates();
   hex.resize();
 }
 
@@ -9300,11 +11364,15 @@ $$('.modules .tab').forEach(tab =>
   hex.resize();
   loadWho();
   const st = await api.get('state');
+  S.readOnly = !!st.read_only;
+  applyReadOnly();
   if (st.open) {
     applyOpened(st);
     if (p.split_hex) toggleSplit(true);
+    await loadAppliedTimezone();
     await loadMarks();
     await loadTags();
+    await loadNotes();
     await loadSavedSearches();
     await loadHashSets();
     await refreshIndexState();

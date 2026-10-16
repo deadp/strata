@@ -10,8 +10,15 @@ ENTRY_STREAM = 0xC0
 ENTRY_NAME = 0xC1
 
 IN_USE = 0x80
+MAX_DIR_BYTES = 256 << 20       # the largest directory exFAT allows
 
 def _ts(packed, tenths=0, tz=0):
+    """Decode a DOS-style timestamp. ``tz`` is the entry's UtcOffset byte
+    (spec 7.4.10): bit 7 OffsetValid, bits 0-6 a signed offset in 15-minute
+    units, signed-decimal per Table 31 (0x01 = +00:15, 0x7F = -00:15).  The
+    timestamp is local time; the honest UTC rendering subtracts it. With no
+    valid offset the zone is unknown, so the time is returned as recorded,
+    without a "Z": whether it is UTC or local is for the examiner to judge."""
     if not packed:
         return None
     try:
@@ -21,7 +28,12 @@ def _ts(packed, tenths=0, tz=0):
         h = (packed >> 11) & 0x1F
         mi = (packed >> 5) & 0x3F
         s = (packed & 0x1F) * 2 + tenths // 100
-        return datetime.datetime(y, mo, d, h, mi, min(s, 59)).isoformat() + "Z"
+        dt = datetime.datetime(y, mo, d, h, mi, min(s, 59))
+        if not tz & 0x80:
+            return dt.isoformat()
+        dt -= datetime.timedelta(minutes=(tz & 0x40 and (tz & 0x3F) - 64
+                                          or (tz & 0x3F)) * 15)
+        return dt.isoformat() + "Z"
     except ValueError:
         return None
 
@@ -60,6 +72,18 @@ class ExfatFS:
         self.label = ""
         self._bitmap_start = None
         self._bitmap_size = 0
+        self.findings = []
+        self._dir_streams = {}     # first cluster -> (contiguous, length)
+        src_size = getattr(source, "size", 0) or 0
+        if src_size and self.cluster_size:
+            held = max(0, (src_size - self.data_offset) // self.cluster_size)
+            if self.cluster_count > held:
+                msg = ("Boot sector claims %d clusters but the image only "
+                       "holds %d; trusting the image."
+                       % (self.cluster_count, held))
+                if msg not in self.findings:
+                    self.findings.append(msg)
+                self.cluster_count = held
         self._scan_root_metadata()
 
     def cluster_offset(self, n):
@@ -83,7 +107,18 @@ class ExfatFS:
         if contiguous:
             n = max(1, (size + self.cluster_size - 1) // self.cluster_size) \
                 if size else 1
-            return list(range(start, start + n))
+            limit = max(0, self.cluster_count + 2 - start)
+            if n > limit:
+                msg = ("Contiguous run from cluster %d truncated at "
+                       "cluster heap end." % start)
+                if msg not in self.findings:
+                    self.findings.append(msg)
+                n = limit
+            # A range, not a list: a contiguous stream is exactly one run,
+            # known analytically from its length, so nothing here should
+            # cost memory proportional to the number of clusters. Slicing,
+            # indexing, len() and iteration all still work for callers.
+            return range(start, start + n)
         out, seen, c = [], set(), start
         while 2 <= c < self.cluster_count + 2 and c not in seen:
             seen.add(c)
@@ -121,17 +156,52 @@ class ExfatFS:
         return self._bitmap or b""
 
     def _read_dir_bytes(self, cluster, contiguous=False, limit=None):
+        if limit:
+            limit = min(limit, MAX_DIR_BYTES)
         clusters = self.chain(cluster, contiguous, limit)
         buf = bytearray()
-        for c in clusters:
-            buf += self.source.read_at(self.cluster_offset(c), self.cluster_size)
+        for c in clusters[:MAX_DIR_BYTES // self.cluster_size]:
+            block = self.source.read_at(self.cluster_offset(c),
+                                        self.cluster_size)
+            buf += block
             if limit and len(buf) >= limit:
                 break
+            if any(block[k] == 0 for k in range(0, len(block), 32)):
+                break          # end-of-directory marker: nothing follows
         return bytes(buf)
+
+    def _dir_stream(self, cluster):
+        """How a directory's clusters are found: (contiguous, length) from
+        its stream extension, or None to walk the FAT. The stream lives in
+        the parent, so a directory not reached through its parent yet is
+        looked for from the root down."""
+        if cluster == self.root_cluster:
+            return None
+        if cluster not in self._dir_streams:
+            stack, seen = [self.root_cluster], set()
+            while stack and cluster not in self._dir_streams:
+                c = stack.pop()
+                if c in seen:
+                    continue
+                seen.add(c)
+                try:
+                    found = self._list(c, "/", self._dir_streams.get(c))
+                except Exception:
+                    continue
+                stack.extend(e["start_cluster"] for e in found
+                             if e["is_dir"] and not e["deleted"]
+                             and e["start_cluster"])
+        return self._dir_streams.get(cluster)
 
     def listdir(self, cluster=0, path="/"):
         cluster = cluster or self.root_cluster
-        data = self._read_dir_bytes(cluster)
+        return self._list(cluster, path, self._dir_stream(cluster))
+
+    def _list(self, cluster, path, dir_stream):
+        if dir_stream and dir_stream[0]:
+            data = self._read_dir_bytes(cluster, True, dir_stream[1])
+        else:
+            data = self._read_dir_bytes(cluster)
         base = self.cluster_offset(cluster)
         entries = []
         i = 0
@@ -146,9 +216,9 @@ class ExfatFS:
             deleted = not (t & IN_USE)
             secondary = e[1]
             attrs = struct.unpack("<H", e[4:6])[0]
-            created = _ts(struct.unpack("<I", e[8:12])[0], e[20])
-            modified = _ts(struct.unpack("<I", e[12:16])[0], e[21])
-            accessed = _ts(struct.unpack("<I", e[16:20])[0])
+            created = _ts(struct.unpack("<I", e[8:12])[0], e[20], e[22])
+            modified = _ts(struct.unpack("<I", e[12:16])[0], e[21], e[23])
+            accessed = _ts(struct.unpack("<I", e[16:20])[0], tz=e[24])
 
             stream = None
             name_parts = []
@@ -175,6 +245,11 @@ class ExfatFS:
 
             name = "".join(name_parts)[:stream["name_length"]].rstrip("\x00")
             is_dir = bool(attrs & 0x10)
+            first = stream["first_cluster"]
+            if is_dir and first and (not deleted
+                                     or first not in self._dir_streams):
+                self._dir_streams[first] = (bool(stream["flags"] & 0x02),
+                                            stream["length"])
             entries.append({
                 "name": name or "<unnamed>",
                 "path": path.rstrip("/") + "/" + name,
@@ -205,22 +280,40 @@ class ExfatFS:
         clusters = self.chain(start, entry.get("contiguous"), entry["size"])
         if not clusters:
             return []
-        runs, rs, rl = [], clusters[0], 1
-        for prev, cur in zip(clusters, clusters[1:]):
-            if cur == prev + 1:
-                rl += 1
-            else:
-                runs.append((rs, rl))
-                rs, rl = cur, 1
-        runs.append((rs, rl))
+        if isinstance(clusters, range):
+            # Already one run end to end; nothing to walk cluster by
+            # cluster to discover that.
+            groups = [(clusters[0], len(clusters))]
+        else:
+            groups, rs, rl = [], clusters[0], 1
+            for prev, cur in zip(clusters, clusters[1:]):
+                if cur == prev + 1:
+                    rl += 1
+                else:
+                    groups.append((rs, rl))
+                    rs, rl = cur, 1
+            groups.append((rs, rl))
         out, remaining = [], entry["size"]
-        for c, n in runs:
+        for c, n in groups:
             length = n * self.cluster_size
             out.append({"offset": self.cluster_offset(c), "length": length,
                         "used": max(0, min(length, remaining)),
                         "cluster": c, "clusters": n, "sparse": False})
             remaining -= length
         return out
+
+    @staticmethod
+    def _past_valid_data(entry, off, data):
+        """data (read from `off`) with every byte at or past the stream's
+        valid data length replaced by zeros, as the driver returns them."""
+        valid = entry.get("valid_size")
+        if valid is None or entry.get("is_dir"):
+            return data
+        cut = valid - off
+        if cut >= len(data):
+            return data
+        cut = max(0, cut)
+        return data[:cut] + bytes(len(data) - cut)
 
     def read_file(self, entry, max_bytes=None, stream=""):
         if stream:
@@ -235,7 +328,7 @@ class ExfatFS:
                 break
             out += self.source.read_at(r["offset"],
                                        min(r["length"], limit - len(out)))
-        return bytes(out[:limit])
+        return self._past_valid_data(entry, 0, bytes(out[:limit]))
 
     def read_range(self, entry, off, length, stream=""):
         if stream:
@@ -243,8 +336,9 @@ class ExfatFS:
         size = entry["size"]
         if not entry.get("start_cluster") or not size:
             return b""
-        return read_runs(self.source, self.runs(entry), off,
-                         min(length, max(0, size - off)))
+        return self._past_valid_data(
+            entry, off, read_runs(self.source, self.runs(entry), off,
+                                  min(length, max(0, size - off))))
 
     def slack(self, entry):
         if entry["is_dir"] or not entry["size"]:
@@ -272,8 +366,10 @@ class ExfatFS:
                     entry["valid_size"] < entry["size"]:
                 info["note"] = (
                     "Valid data length (%d) is shorter than the file size (%d). "
-                    "The bytes between are stale content the allocator never "
-                    "cleared." % (entry["valid_size"], entry["size"]))
+                    "Bytes after it were never written by this file and read "
+                    "as zeros, as the driver returns them; the clusters there "
+                    "still hold whatever was on disk before, which the runs "
+                    "below point at." % (entry["valid_size"], entry["size"]))
             if entry.get("deleted"):
                 info["recovery"] = (
                     "Directory entry deleted. This file was flagged contiguous, "
@@ -300,6 +396,7 @@ class ExfatFS:
             "revision": "%d.%d" % (self.revision >> 8, self.revision & 0xFF),
             "percent_in_use": self.percent_in_use,
             "volume_dirty": self.dirty,
+            "findings": self.findings,
         }
 
     def allocated_extents(self):

@@ -1,0 +1,298 @@
+# Roadmap
+
+What Strata does not do yet, kept as a working list of features and known
+work. What it already does is in the [README](../README.md), and what changed
+in each release is in the [CHANGELOG](../CHANGELOG.md).
+
+This is a plan, not a promise. An item is ticked only once it has been
+exercised against real evidence, not just a synthetic image.
+
+Legend — `[ ]` not started · `[~]` partly there
+
+---
+
+## Correctness
+
+A forensic tool's worst failure is a confident wrong answer, so this comes
+before anything new.
+
+- [x] Previewing a genuine case can still upgrade its schema or create its
+      `cache/` folder. It writes only to Strata's own record, never to
+      evidence, but a preview should not write at all.
+
+---
+
+## Evidence formats
+
+Roughly in order of how often an examiner meets them. Everything below is
+recognised and refused by name today; these entries are about *reading* it.
+
+- [~] **Ex01** (EWF v2) — read: zlib-compressed, stored and pattern-fill
+      chunks, device/case metadata, MD5/SHA1 verification. Not the same
+      lineage as E01 in the way it first looked -- sections are read
+      back-to-front (each one's descriptor sits at its own end and points
+      to the previous section, not the next), and metadata is a different
+      text format. Built from libyal's EWF2 specification and
+      cross-checked line-for-line against libewf's own C source for the
+      one detail the prose doesn't pin down; the resulting reader was also
+      verified against pyewf (libewf's reference Python bindings), which
+      reads this project's synthetic test files identically. Encrypted
+      volumes and bzip2-compressed chunks are refused -- EnCase 7 has never
+      exposed bzip2 as an option, and Ex01 encryption is undisclosed by
+      Guidance Software. Tested on synthetic images only; a real Ex01 from
+      EnCase itself still needs checking. Lx01 (logical evidence: files and
+      folders, not a disk image) is a different, adjacent format and is
+      not read.
+- [~] **Split raw sets** (`.001`, `.0000`, `.aa`, …) — the set shapes real
+      acquisition tools write are joined into one exhibit: FTK Imager's
+      three-digit `.001`, Guymager's zero-based numbering at whatever width
+      the disk needs, and `dd` with `split`, both its default alphabetic
+      suffixes and `-d` numeric ones. A missing, wrongly sized or mixed-width
+      piece raises a finding naming the piece in the set's own numbering.
+      Verified against genuine `split` and `dd` output; FTK Imager and
+      Guymager naming was reconstructed from their documentation and source,
+      so sets written by those tools themselves still need checking.
+- [~] **VHD** (the older `conectix` format, not VHDX) — fixed, dynamic and
+      differencing disks are read. A differencing disk reads through its
+      parent, looked for only beside it under the file name the disk
+      records (locator paths are never followed elsewhere), and is refused
+      if the parent's identifier is not the one it was made from. Verified only against synthetic images built from the published
+      specification; disks written by Virtual PC, Hyper-V and Disk2vhd still
+      need checking.
+- [~] **QCOW2** (versions 2 and 3, including zlib-compressed clusters) and
+      **VDI** (dynamic and fixed) — read, and verified only against synthetic
+      images built from the published layouts; disks written by QEMU and
+      VirtualBox themselves still need checking. A disk that holds only a
+      change from another (a QCOW2 with a backing file, a differencing or
+      undo VDI) is refused rather than shown alone, as are encrypted
+      QCOW2, external data files, subcluster (extended L2) tables and
+      zstd-compressed clusters. Reading through a backing chain is not done.
+- [~] **DMG** (Apple UDIF) — read, with raw, zero-fill, zlib, bzip2, LZMA
+      and LZFSE chunks. Verified only against synthetic images built from the
+      published layout (plus a real LZFSE stream from Apple's encoder);
+      images written by Apple's tools still need checking. Encrypted,
+      segmented and sparse images, and images with ADC chunks, are refused
+      with a reason; reading a sparse bundle (a folder) is not done.
+- [~] **AFF4** — a Map over one or more ImageStreams, or a bare ImageStream,
+      is read; zlib/Deflate-compressed or stored chunks, a damaged chunk or
+      bevy index reading as zeros and reported rather than failing the
+      image. Deliberately not matched by signature (it is ZIP-based; the
+      interior AFF4 markers are checked instead), since refusing every
+      ordinary archive to catch one image format would be wrong far more
+      often than right. A striped or segmented multi-volume set, and any
+      compression method other than Deflate, are refused. The published AFF4
+      Standard's own prose does not match real files in two places (the
+      ImageStream bevy index layout, and the Deflate method's URI); read
+      against bytes observed in real pyaff4 output instead. Tested on
+      synthetic images only; a real AFF4 imaging tool's output still needs
+      checking. The older AFF (not AFF4) format is not read.
+- [~] **RAID** reassembly (0 / 1 / 5) from member images. An "Assemble RAID
+      set" dialog takes the level, chunk size, RAID 5 layout (Linux md's four),
+      the members in slot order and each member's data offset; the definition
+      is stored in the case and the set is assembled again from it. RAID 5 is
+      read with one member missing (rebuilt by XOR, and said so); mirrors and
+      RAID 5 parity are compared on Verify and reported as observed, not as a
+      verdict. Verified only against synthetic sets built from the layout
+      diagrams; sets written by real controllers and by mdadm still need
+      checking. Not done: reading the parameters from mdadm or controller
+      metadata, suggesting parameters for an unknown set, RAID 6 / 10 /
+      concatenation, nested sets, and LVM or dynamic disks.
+
+### Shadow copies
+
+- [~] **Read a Volume Shadow Copy.** Snapshots are found and listed, and a
+      snapshot can now be opened: a block-redirect overlay over the volume plus
+      the differential-area store types let Strata browse a snapshot's tree as a
+      filesystem in its own right. Tested on synthetic images only so far.
+
+### Filesystems
+
+- [~] **HFS+ and APFS compression, HFS+ hard links** — `com.apple.decmpfs`
+      files compressed with zlib or LZVN (in the attribute or the resource
+      fork) are decompressed on HFS+ and APFS; HFS+ file hard links read as
+      the file they stand for, and directory hard links are listed with
+      their target. Tested on synthetic volumes (an independent reader,
+      libfshfs, confirmed the builder's hard-link layout). LZFSE is read too,
+      checked against Apple's reference encoder. Not done: files stored raw
+      (types 9 and 10), APFS hard links, and **HFS** (the original, not
+      HFS+).
+- [~] **APFS snapshots** — snapshots are listed and can be opened as a
+      read-only view of the volume. Tested on synthetic images only so far.
+
+### Encryption
+
+- [ ] **BitLocker startup keys (`.BEK`) and clear-key volumes** — implemented
+      and verified against synthetic FVE volumes built to the published
+      format spec (including cross-checking the protector-type values
+      against an independent tool); a real `.BEK` file and a real
+      clear-key volume from actual Windows-run BitLocker still need to be
+      confirmed before this can be called done.
+- [~] **BitLocker with the Elephant diffuser** — Vista and Windows 7 volumes
+      (encryption methods 0x8000/0x8001) are decrypted, implemented against
+      Niels Ferguson's "AES-CBC + Elephant diffuser" whitepaper and
+      cross-checked against dislocker's independent implementation; a real
+      diffuser-encrypted volume from actual Windows-run BitLocker still
+      needs to be confirmed before this can be called done.
+- [ ] **LUKS2 with Argon2 against real cryptsetup images** — implemented and
+      verified against synthetic images built to cryptsetup's layout; real
+      cryptsetup-written volumes still need to be confirmed before this can
+      be called done.
+- [ ] **FileVault 2** (APFS and Core Storage).
+
+---
+
+## Artefacts
+
+- [~] **`$LogFile`** — the log NTFS keeps for crash recovery. Restart areas
+      and log records are read and shown as recorded: LSN, transaction,
+      redo/undo operation (name and code), target attribute, and a file name
+      with its timestamps where the payload of an add/delete-index-entry or
+      update-file-name record is a plain `$FILE_NAME` that passes sanity
+      checks. Built from third-party format descriptions and tested on
+      synthetic logs only — no real `$LogFile` has been checked. Not done:
+      deriving the target MFT record number, names from
+      InitializeFileRecordSegment (whole MFT records) or other operations,
+      and any reconstruction of what happened in order (deliberately left
+      out: the log is a ring and an inferred story could mislead).
+- [x] **Browser disk cache** — Chromium blockfile (what Chrome and Edge on
+      Windows write for web content), Chromium Simple Cache and Firefox cache2
+      entries are read (URL, status, content type, times), separate from the
+      history databases. Blockfile entries come from the cache files rather
+      than the index, so dropped entries are found and marked. Bodies are not
+      read. Checked against real Chrome and Edge caches (blockfile) and Chrome's
+      service worker script cache. Not yet checked on real data: Firefox
+      cache2 (synthetic only), and doomed, evicted or freed-block blockfile
+      entries (synthetic tests only, no real cache that had entries evicted).
+- [~] **Event ID descriptions**, and timelining across logs — a bundled
+      table describes well-known IDs by provider (Strata's own summaries,
+      not the providers' message text, which is not read), and every
+      `.evtx` on a volume merges into one timeline in Triage → Events.
+      Rendering the providers' own messages from their manifests is still
+      open, and neither has been checked against logs from real machines.
+- [~] **PST:** ANSI (32-bit) files are read, from the layouts in [MS-PST]
+      and synthetic files built from them; no real ANSI file has been
+      checked yet. OST's 64-bit 4k-page format and block compression
+      (Outlook 2013+) are also read, but [MS-PST] doesn't document either
+      at all -- this is built against libyal/libpff's reverse-engineered
+      documentation instead, and no real OST file has been checked yet.
+- [~] **Legacy Office body text** — Word's piece table, Excel's BIFF stream
+      and PowerPoint's records are decoded, and whatever cannot be proven from
+      the file is a finding rather than a guess. Checked against nearly 400
+      files written by real Office; Excel formula, boolean and error cells
+      are not read yet, and Word 6/95 files are refused.
+
+---
+
+## Memory
+
+A memory image is not a disk. It has no partition table, no filesystem and no
+directory, so almost nothing above the container layer applies: the volume
+tree, the file listing, signature carving and the timeline all assume
+structures that are not there. What it has instead is the operating system's
+live data structures, scattered across physical pages in an order the image
+does not record.
+
+That makes this a second product sharing a shell, not a feature. It is listed
+in full so its size is on the page, and so a partial implementation is never
+mistaken for the thing itself.
+
+**Why it is worth doing anyway.** Everything that never touches the disk lives
+only here: the key for the volume that will not open, a chat window, a process
+running from a file deleted before imaging, the command line of something that
+ran once. On a full-disk-encrypted machine seized running, memory is most of
+the evidence.
+
+In the order each step depends on the last:
+
+- [ ] **Containers.** Raw first; then Microsoft crash dumps (`PAGEDU64` /
+      `PAGEDUMP`, which carry the physical run list in their header and are
+      easier than raw), LiME, and AFF4-imager output. Hibernation files are
+      Xpress-compressed — a decompression problem before a memory one, and the
+      same family as the LZXPRESS already written for prefetch.
+- [ ] **Physical to virtual** — find and walk the page tables per
+      architecture: x64 four-level paging, PAE, and ARM64.
+- [ ] **Identify the operating system from the image itself**, not from what
+      the examiner was told. A near-miss profile yields process lists that look
+      plausible and are wrong in detail; refuse an image whose kernel cannot be
+      identified rather than analyse it against a neighbour.
+- [ ] **Structure definitions without a dependency** — ship a compact table
+      generated from public symbol data, or derive offsets from the image by
+      pattern. The whole feature turns on this choice; make it deliberately.
+- [ ] **Processes** — the active list and a pool-scan cross-check, reported
+      separately, since a process hidden from one but present in the other is
+      a finding. Command lines, environment, handles, modules, and parent/child
+      with the caveat that PIDs are reused.
+- [ ] **Injected and unbacked code** — executable regions with no file behind
+      them, and permissions that disagree with the on-disk image. Reported as
+      observed, not as a verdict.
+- [ ] **Network** — sockets and connections, live and residual.
+- [ ] **Registry in memory** — mapped hives, which can differ from disk.
+- [ ] **Keys and secrets** — BitLocker FVEK and LUKS master keys, under the
+      same rule as today: session-lifetime only, never written to the case.
+- [ ] **Files cached in memory**, and the page file examined together with the
+      image it came from.
+- [ ] **Presentation** — processes as roots, modules, handles and regions
+      beneath; the hex view and core sample over physical offsets.
+
+**Before any of it ships:** a memory image from a machine whose state is known
+independently, so a process list is checked against what was actually running.
+Agreeing with another tool is agreement, not verification.
+
+---
+
+## Analysis
+
+- [ ] Image similarity (perceptual hashing) -- needs pixel-level image
+      decoding this codebase does not otherwise have a reason to carry, so
+      it is scoped separately from fuzzy hashing (done).
+- [ ] Carving across fragments beyond the first slice: a gap that is not a
+      currently-allocated extent (both fragments sit in unallocated space,
+      with unrelated deleted data between them), sizer-only (no-footer)
+      signatures, and three or more fragments. The first slice --
+      footer-terminated types split around exactly one allocated gap -- is
+      done.
+- [ ] A map view for GPS coordinates.
+
+---
+
+## Interface
+
+- [x] Configurable columns in the folder view (saved with the case), and the
+      filter controls search already has, completed with name, created and
+      accessed ranges and hide-deleted. The filters are checked once, in
+      `filesearch.clean_filters`, for search, indexing and hashing alike. The
+      folder listing's own filter box is still a plain name filter.
+- [x] Read-only mode that refuses export and report writing.
+- [x] Template editor, so an examiner can define a structure without Python:
+      create, edit, delete, and preview against a chosen offset. Templates are
+      kept in the case. Integers are little-endian only, and a template is a
+      flat list of fields: no repeats, no fields whose offset or size comes
+      from another field, and they are not yet offered in the hex view.
+- [x] Diff two images, or two snapshots of one volume.
+- [ ] Scripting or plugin API for custom parsers.
+- [x] Multi-examiner case notes with attribution — each version names its
+      writer and time; edits add a version and withdrawals are flagged, so
+      nothing is changed in place. In the Notes module and the report.
+- [~] Localisation — the interface and engine messages already load from
+      `web/strings/`; only English (en-GB) exists.
+
+---
+
+## Performance and debt
+
+- [x] Tagged items are keyed on the filesystem handle (MFT record / inode),
+      which is stable only within an image; tags now follow the same volume
+      re-acquired into another image, matched on the filesystem's own
+      identifier.
+
+---
+
+## Open questions
+
+- **Independent validation.** `tests/crosscheck.py` now compares containers,
+  GPT and four filesystems against established readers on the synthetic
+  corpus (see `docs/CROSSCHECK.md`). Still open: running it over real images,
+  and references for encryption, artefacts, APFS and exFAT.
+- **Fuzz corpus growth.** The saved corpus is small; a standing fuzz job with
+  coverage feedback would find the next #15 before a user does.
+

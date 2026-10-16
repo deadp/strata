@@ -73,7 +73,8 @@ def dos_datetime(v):
     if not (1 <= mo <= 12 and 1 <= d <= 31 and h < 24 and mi < 60 and s < 60):
         return None
     try:
-        return datetime.datetime(y, mo, d, h, mi, s).isoformat() + "Z"
+        # A DOS time carries no zone, so no "Z": nothing says it is UTC.
+        return datetime.datetime(y, mo, d, h, mi, s).isoformat()
     except ValueError:
         return None
 

@@ -1,18 +1,31 @@
+import contextlib
 import functools
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
+import zlib
+from urllib.request import pathname2url
 
+from . import casepref
+from . import fuzzyhash
 from . import version as version_mod
 from .text import t as _t
+from .nodes import node_of
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY, value TEXT);
 
+-- `parents` is the other disks an exhibit reads through (a differencing
+-- VHD's parents, nearest first, or a RAID set's members) as a JSON list of
+-- paths. What the exhibit shows is only meaningful with them, so the case
+-- records which files they were; NULL where there are none, or before this
+-- was recorded. `definition` is what a RAID set is made of (level, chunk,
+-- layout, members in slot order) as JSON; NULL for every other exhibit.
 CREATE TABLE IF NOT EXISTS evidence (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL,
@@ -25,7 +38,9 @@ CREATE TABLE IF NOT EXISTS evidence (
     verified_sha1 TEXT,
     verified_at TEXT,
     kind TEXT,
-    added_at TEXT NOT NULL);
+    added_at TEXT NOT NULL,
+    parents TEXT,
+    definition TEXT);
 
 CREATE TABLE IF NOT EXISTS bookmarks (
     id INTEGER PRIMARY KEY,
@@ -66,7 +81,9 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 -- from a bookmark. It is identified by the filesystem's own handle (MFT
 -- record, inode, object id, start cluster) so it survives reopening the case,
 -- and it carries a copy of the metadata so a report can be written without
--- re-reading the evidence.
+-- re-reading the evidence. `contiguous` is exFAT-specific: a NoFatChain
+-- stream is read by extent rather than by walking the FAT, and getting that
+-- wrong on a deleted item silently returns the wrong content (#94).
 CREATE TABLE IF NOT EXISTS tagged_items (
     id INTEGER PRIMARY KEY,
     evidence_id INTEGER NOT NULL,
@@ -84,7 +101,48 @@ CREATE TABLE IF NOT EXISTS tagged_items (
     modified TEXT,
     accessed TEXT,
     file_created TEXT,
+    contiguous INTEGER,
     UNIQUE (evidence_id, part, node, tag));
+
+-- Where a volume's tags came from. One row per detected filesystem per
+-- evidence item, so tags can follow a volume when it is re-acquired into
+-- another image (#82): the key is the filesystem's own identifier -- an NTFS
+-- or exFAT serial, an ext4 or APFS UUID, an AD1 source volume serial -- the
+-- same value the volume reports wherever it is re-imaged.
+CREATE TABLE IF NOT EXISTS volume_identity (
+    evidence_id INTEGER NOT NULL,
+    part INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    UNIQUE (evidence_id, part));
+
+-- Case notes: what an examiner wants on the record that is not a mark on
+-- bytes or a tag on a file. Each note names who wrote it and when. A note is
+-- never changed in place: an edit is a new row that `replaces` the old one,
+-- and withdrawing a note sets `retracted_*` on it, so what was written, by
+-- whom and when stays in the record alongside what it says now.
+CREATE TABLE IF NOT EXISTS case_notes (
+    id INTEGER PRIMARY KEY,
+    at TEXT NOT NULL,
+    examiner TEXT,
+    body TEXT NOT NULL,
+    replaces INTEGER,
+    retracted_at TEXT,
+    retracted_by TEXT);
+
+-- Structure templates an examiner defined (engine.structure): the template
+-- itself as validated JSON, who last wrote it, and a revision that counts
+-- its saves so two examiners editing one template cannot overwrite each
+-- other unseen. Names are unique without regard to case.
+CREATE TABLE IF NOT EXISTS structure_templates (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    examiner TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1);
+CREATE UNIQUE INDEX IF NOT EXISTS structure_templates_name
+    ON structure_templates (name COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +183,10 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     node TEXT, path TEXT, name TEXT, size INTEGER,
     deleted INTEGER DEFAULT 0,
     md5 TEXT, sha1 TEXT, sha256 TEXT,
+    -- ssdeep-style context-triggered piecewise hash (engine/fuzzyhash.py):
+    -- unlike the three above, a partial match here means the files are
+    -- alike, not identical.
+    fuzzy TEXT,
     -- How many bytes the digests were actually taken over. Equal to `size`
     -- for a file that read whole. Stored because a digest over a short read
     -- is not the file's digest, and sixty-four hex characters say nothing
@@ -233,6 +295,19 @@ CREATE TABLE IF NOT EXISTS type_mismatches (
     UNIQUE (evidence_id, part, node, name));
 
 CREATE INDEX IF NOT EXISTS idx_tm ON type_mismatches(evidence_id, part);
+
+-- The key a volume was unlocked with (BitLocker's FVEK, LUKS's master key),
+-- kept so reopening the case finds the volume as it was left. It is the
+-- decryption key itself, so the case file holds it: anyone who can read the
+-- case can read the volume. Dropped when the volume is locked on purpose or
+-- the evidence is removed.
+CREATE TABLE IF NOT EXISTS volume_keys (
+    evidence_id INTEGER NOT NULL,
+    part INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    key BLOB NOT NULL,
+    saved_at TEXT NOT NULL,
+    PRIMARY KEY (evidence_id, part));
 CREATE INDEX IF NOT EXISTS idx_bm_ev ON bookmarks(evidence_id, offset);
 CREATE INDEX IF NOT EXISTS idx_tag_ev ON tagged_items(evidence_id, tag);
 CREATE INDEX IF NOT EXISTS idx_hits ON search_hits(search_id);
@@ -246,6 +321,9 @@ INDEX_META_SCHEMA = """
 CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
+# The layout every index had before it was compressed: FTS5 keeping its own
+# copy of each document. Still read, so an index built that way stays
+# searchable until it is converted (Case.relocate_index).
 FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS content_index USING fts5(
     name, path, body,
@@ -255,12 +333,62 @@ CREATE VIRTUAL TABLE IF NOT EXISTS content_index USING fts5(
     tokenize = 'unicode61');
 """
 
+INDEX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS content_docs (
+    id INTEGER PRIMARY KEY,
+    name, path, body BLOB,
+    node, part, size, deleted, modified, abs_offset, kind, evidence);
+CREATE INDEX IF NOT EXISTS content_docs_scope
+    ON content_docs(part, evidence, kind);
+CREATE INDEX IF NOT EXISTS content_docs_evidence
+    ON content_docs(evidence, kind);
+CREATE VIEW IF NOT EXISTS content_text AS
+    SELECT id, name, path, inflate(body) AS body, node, part, size, deleted,
+           modified, abs_offset, kind, evidence
+    FROM content_docs;
+CREATE VIRTUAL TABLE IF NOT EXISTS content_index USING fts5(
+    name, path, body,
+    node UNINDEXED, part UNINDEXED, size UNINDEXED,
+    deleted UNINDEXED, modified UNINDEXED,
+    abs_offset UNINDEXED, kind UNINDEXED, evidence UNINDEXED,
+    content = 'content_text', content_rowid = 'id',
+    tokenize = 'unicode61');
+"""
+
 FTS_COLUMNS = {"name", "path", "body", "node", "part", "size", "deleted",
                "modified", "abs_offset", "kind", "evidence"}
 
+DOC_COLUMNS = ("name", "path", "body", "node", "part", "size", "deleted",
+               "modified", "abs_offset", "kind", "evidence")
+
+PLAIN, COMPRESSED = "plain", "compressed"
+
+def deflate_text(text):
+    return zlib.compress(text.encode("utf-8"), 6) if text else None
+
+def inflate_text(blob):
+    return zlib.decompress(blob).decode("utf-8") if blob else ""
+
+def add_index_functions(conn):
+    # content_text calls inflate(), so every connection that reads or writes
+    # a compressed index needs it -- FTS5 reads through that view for
+    # snippet(), 'delete' and 'rebuild'.
+    conn.create_function("inflate", 1, inflate_text, deterministic=True)
+    conn.create_function("deflate", 1, deflate_text, deterministic=True)
+
+def index_layout(conn, schema="main"):
+    names = {r[0] for r in conn.execute(
+        "SELECT name FROM %s.sqlite_master WHERE type IN ('table','view')"
+        % schema)}
+    if "content_docs" in names and "content_index" in names:
+        return COMPRESSED
+    if "content_index" in names:
+        return PLAIN
+    return None
+
 ARTEFACT_VERSION = {
-    "browser": 2, "recyclebin": 1, "lnk": 2, "appcompat": 1, "prefetch": 1,
-    "shellbags": 1, "mail": 1, "leveldb": 1, "vss": 1, "usn": 1,
+    "browser": 5, "recyclebin": 1, "lnk": 2, "appcompat": 1, "prefetch": 1,
+    "shellbags": 1, "mail": 2, "leveldb": 1, "vss": 1, "usn": 1,
     "carve": 1, "timeline": 1, "evtx": 1, "wallets": 1,
 }
 
@@ -305,7 +433,6 @@ def utcnow():
 DB_NAME = "case.sqlite"
 INDEX_NAME = "content-index.sqlite"
 CACHE_DIR = "cache"
-PENDING_SUFFIX = ".migrating"
 
 def infer_kind(path, fmt):
     if path and os.path.isdir(path):
@@ -315,12 +442,84 @@ def infer_kind(path, fmt):
              _t("logical.format_file"): "file"}
     return known.get(fmt, "image")
 
-def is_case(path):
-    if not path:
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_CASE_TABLES = ("meta", "evidence", "audit")
+
+class NotACase(ValueError):
+    pass
+
+def _looks_like_case_db(db_file):
+    # Decides from the header and a read-only open, so a file that is not a
+    # case is never written, locked for writing, or given -journal/-wal/-shm
+    # siblings: what gets pointed at here is often evidence.
+    try:
+        with open(db_file, "rb") as fh:
+            header = fh.read(100)
+    except OSError:
         return False
-    if os.path.isdir(path):
-        return os.path.isfile(os.path.join(path, DB_NAME))
-    return os.path.isfile(path)
+    if len(header) < 100 or not header.startswith(_SQLITE_MAGIC):
+        return False
+    if header[18] != 1 or header[19] != 1:
+        # WAL mode. Strata never puts a case in WAL, and reading one would
+        # need a -shm file beside it.
+        return False
+    uri = "file:%s?mode=ro" % pathname2url(os.path.abspath(db_file))
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if not all(t in tables for t in _CASE_TABLES):
+            return False
+        audit_cols = {r[1] for r in conn.execute("PRAGMA table_info(audit)")}
+        return {"prev_hash", "hash"} <= audit_cols
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+def is_case(path):
+    if not path or not os.path.isdir(path):
+        return False
+    return _looks_like_case_db(os.path.join(path, DB_NAME))
+
+def _refuse_if_not_case(path):
+    # A case is a folder. Nothing that already exists at the path is written
+    # to unless it is one — a new case may only go where nothing is, or into
+    # a folder that does not yet hold a case record.
+    if not os.path.exists(path):
+        return
+    if not os.path.isdir(path):
+        raise NotACase(_t("casedb.not_a_case") % path)
+    record = os.path.join(path, DB_NAME)
+    if os.path.lexists(record) and not _looks_like_case_db(record):
+        raise NotACase(_t("casedb.not_a_case") % path)
+
+SPACE_HEADROOM = 64 << 20
+
+def _file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+def _uri(path, ro=False):
+    return "file:%s%s" % (pathname2url(os.path.abspath(path)),
+                          "?mode=ro" if ro else "")
+
+def _free_space(path):
+    try:
+        return shutil.disk_usage(os.path.dirname(os.path.abspath(path))).free
+    except OSError:
+        return None
 
 def db_path(case_path):
     return os.path.join(case_path, DB_NAME)
@@ -331,54 +530,50 @@ def cache_dir(case_path, create=False):
         os.makedirs(d, exist_ok=True)
     return d
 
-class CaseInUse(Exception):
-    pass
-
-def _become_folder(path):
-    pending = path + PENDING_SUFFIX
-    if os.path.isfile(path):
-        if os.path.exists(pending):
-            raise OSError("%s already exists; refusing to overwrite an "
-                          "interrupted migration" % pending)
-        try:
-            os.rename(path, pending)
-        except OSError as exc:
-            raise CaseInUse(
-                _t("casedb.case_in_use") % os.path.basename(path)) from exc
-    if not os.path.isfile(pending):
-        return
-    os.makedirs(path, exist_ok=True)
-    target = os.path.join(path, DB_NAME)
-    if os.path.exists(target):
-        raise OSError("%s already holds a case" % path)
-    os.rename(pending, target)
-
 class Case:
-    def __init__(self, path, name=None, examiner=None, migrate=True):
-        legacy = os.path.isfile(path) or os.path.isfile(path + PENDING_SUFFIX)
-        migrated = False
-        if legacy and migrate:
-            _become_folder(path)
-            legacy, migrated = False, True
+    def __init__(self, path, name=None, examiner=None, read_only=False):
+        _refuse_if_not_case(path)
         self.path = path
-        self.db_path = path if legacy else db_path(path)
+        self.db_path = db_path(path)
+        self.examiner = examiner or os.environ.get("STRATA_EXAMINER",
+                                                   "unattributed")
+        if read_only:
+            # A preview must not write at all: no folder creation, no schema
+            # upgrade, no migrations, no cache/ index. Open the record
+            # through a mode=ro URI — same pattern _looks_like_case_db uses —
+            # so SQLite itself refuses every write and no -journal/-wal/-shm
+            # sibling can appear.
+            uri = "file:%s?mode=ro" % pathname2url(os.path.abspath(self.db_path))
+            self.db = sqlite3.connect(uri, uri=True, check_same_thread=False,
+                                      timeout=30.0)
+            self.db.row_factory = sqlite3.Row
+            add_index_functions(self.db)
+            self.index_reset = False
+            self.index_db = None
+            self.index_pending = 0
+            self.index = self.db
+            self.index_layout = index_layout(self.db)
+            self.fts = False
+            return
         fresh = not os.path.isfile(self.db_path)
-        if not legacy:
-            os.makedirs(path, exist_ok=True)
+        os.makedirs(path, exist_ok=True)
         self.db = sqlite3.connect(self.db_path, check_same_thread=False,
                                   timeout=30.0)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        self.examiner = examiner or os.environ.get("STRATA_EXAMINER",
-                                                   "unattributed")
         self._migrate_bookmarks()
         self._migrate_file_hashes()
+        self._migrate_fuzzy_hash()
         self._migrate_bookmark_frame()
         self._migrate_evidence_kind()
+        self._migrate_evidence_parents()
+        self._migrate_evidence_definition()
+        self._migrate_tagged_items()
         self.index_reset = False
         self.index_db = None
         self.index_pending = 0
         self.index = self.db
+        self.index_layout = None
         try:
             self._open_index()
             self.fts = True
@@ -391,11 +586,6 @@ class Case:
             self._set("created_by", self.examiner)
             self.log("case.create", {"name": self.get("name"),
                                      "tool": version_mod.label()})
-        elif migrated:
-            self.log("case.migrated", {
-                "from": "single file", "to": os.path.join(
-                    os.path.basename(path), DB_NAME),
-                "note": _t("casedb.migrated")})
         self.db.commit()
 
     def close(self):
@@ -410,8 +600,6 @@ class Case:
         self.index = None
 
     def cache_dir(self, create=False):
-        if self.db_path == self.path:
-            return None
         return cache_dir(self.path, create=create)
 
     def _migrate_evidence_kind(self):
@@ -425,6 +613,25 @@ class Case:
                             (infer_kind(row["path"], row["format"]),
                              row["id"]))
         self.db.commit()
+
+    def _migrate_evidence_definition(self):
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(evidence)")}
+        if "definition" not in cols:
+            self.db.execute("ALTER TABLE evidence ADD COLUMN definition TEXT")
+            self.db.commit()
+
+    def _migrate_evidence_parents(self):
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(evidence)")}
+        if "parents" not in cols:
+            self.db.execute("ALTER TABLE evidence ADD COLUMN parents TEXT")
+            self.db.commit()
+
+    def _migrate_tagged_items(self):
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(tagged_items)")}
+        if "contiguous" not in cols:
+            self.db.execute(
+                "ALTER TABLE tagged_items ADD COLUMN contiguous INTEGER")
+            self.db.commit()
 
     def _migrate_bookmarks(self):
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(bookmarks)")}
@@ -440,6 +647,12 @@ class Case:
         if "read_bytes" not in cols:
             self.db.execute("ALTER TABLE file_hashes ADD COLUMN "
                             "read_bytes INTEGER")
+        self.db.commit()
+
+    def _migrate_fuzzy_hash(self):
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(file_hashes)")}
+        if "fuzzy" not in cols:
+            self.db.execute("ALTER TABLE file_hashes ADD COLUMN fuzzy TEXT")
         self.db.commit()
 
     def _migrate_bookmark_frame(self):
@@ -472,92 +685,308 @@ class Case:
             except sqlite3.Error:
                 pass
 
+    def _index_path(self):
+        return os.path.join(self.cache_dir(create=True), INDEX_NAME)
+
+    def _connect_index(self):
+        conn = sqlite3.connect(self._index_path(), check_same_thread=False,
+                               timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        add_index_functions(conn)
+        return conn
+
     def _open_index(self):
+        add_index_functions(self.db)
         try:
             n = self.db.execute(
                 "SELECT COUNT(*) c FROM content_index").fetchone()["c"]
         except sqlite3.Error:
             n = 0
-        cache = self.cache_dir(create=True)
-        if not cache:
-            self.db.executescript(FTS_SCHEMA)
-            return
-        self.index_db = sqlite3.connect(os.path.join(cache, INDEX_NAME),
-                                        check_same_thread=False, timeout=30.0)
-        self.index_db.row_factory = sqlite3.Row
-        self.index_db.executescript(FTS_SCHEMA)
+        self.index_db = self._connect_index()
         self.index_db.executescript(INDEX_META_SCHEMA)
+        cached = index_layout(self.index_db)
+        cached_n = 0
+        if cached == PLAIN:
+            cached_n = self.index_db.execute(
+                "SELECT COUNT(*) c FROM content_index").fetchone()["c"]
+            if not cached_n:
+                # Nothing in it worth converting: start over in the new
+                # layout rather than carrying an empty old one forward.
+                self.index_db.execute("DROP TABLE content_index")
+                cached = None
+        if cached is None:
+            self.index_db.executescript(INDEX_SCHEMA)
+            cached = COMPRESSED
         self.index_db.commit()
+        self.index = self.index_db
+        self.index_layout = cached
+        if cached == PLAIN:
+            # Built before the text was compressed. It stays searchable as it
+            # is until relocate_index() converts it.
+            self.index_pending = cached_n
         if n:
             cols = {r[1] for r in self.db.execute(
                 "PRAGMA table_info(content_index)")}
             if FTS_COLUMNS <= cols:
                 self.index_pending = n
                 self.index = self.db
+                self.index_layout = PLAIN
             else:
                 self.db.execute("DROP TABLE IF EXISTS content_index")
                 self.db.execute(
                     "DELETE FROM meta WHERE key LIKE 'index_part_%'")
                 self.db.commit()
-                self.index = self.index_db
                 self.index_reset = True
                 self.log("index.reset", {
                     "documents": n,
                     "reason": _t("casedb.index_reset_reason")})
                 self.db.commit()
-        else:
-            self.index = self.index_db
 
     def relocate_index(self, progress=None):
+        # Two kinds of index are brought into the current layout here: one
+        # still inside the case record, from before the index lived in
+        # cache/, and one in cache/ built before its text was compressed.
+        # Either way a new index file is written beside the old one and only
+        # swapped in once it holds every document, so a failure part way
+        # leaves the old index exactly as it was, and still searchable.
         if not self.index_pending or self.index_db is None:
             return {"moved": 0}
         want = self.index_pending
-        cache_path = os.path.join(self.cache_dir(create=True), INDEX_NAME)
-        if progress:
-            progress(0.05)
-        self.db.execute("ATTACH DATABASE ? AS idx", (cache_path,))
-        try:
-            self.db.execute("DELETE FROM idx.content_index")
-            self.db.execute(
-                "INSERT INTO idx.content_index "
-                "(name,path,body,node,part,size,deleted,modified,abs_offset,"
-                " kind,evidence) "
-                "SELECT name,path,body,node,part,size,deleted,modified,"
-                "abs_offset,kind,evidence FROM main.content_index")
-            got = self.db.execute(
-                "SELECT COUNT(*) c FROM idx.content_index").fetchone()["c"]
-            for row in self.db.execute(
-                    "SELECT key, value FROM main.meta "
-                    "WHERE key LIKE 'index_part_%'"):
-                self.db.execute(
-                    "INSERT OR REPLACE INTO idx.index_meta VALUES (?,?)",
-                    (row["key"], row["value"]))
+        in_record = self.index is self.db
+        cache_path = self._index_path()
+        source = self.db_path if in_record else cache_path
+        # The new file is smaller than the index it is made from, so that
+        # index's size bounds the room it needs. Starting without the room
+        # ends in "disk full" halfway through a multi-gigabyte copy -- which,
+        # before this check, rolled back without a word and was retried on
+        # every open.
+        need = _file_size(source) + SPACE_HEADROOM
+        free = _free_space(cache_path)
+        if free is not None and free < need:
+            self.log("index.relocate.deferred", {
+                "documents": want, "need_bytes": need, "free_bytes": free,
+                "note": _t("casedb.index_relocate_deferred")})
             self.db.commit()
-        finally:
-            self.db.execute("DETACH DATABASE idx")
-        if progress:
-            progress(0.6)
+            return {"moved": 0, "deferred": True, "need": need, "free": free}
+        before = _file_size(source)
+        building = cache_path + ".part"
+        try:
+            got = self._build_index_file(source, in_record, building,
+                                         progress)
+        except (sqlite3.Error, OSError) as exc:
+            _remove_quietly(building)
+            self.log("index.relocate.failed", {
+                "expected": want, "error": str(exc),
+                "note": _t("casedb.index_relocate_failed")})
+            self.db.commit()
+            return {"moved": 0, "expected": want, "error": str(exc)}
         if got != want:
-            self.log("index.relocate.failed", {"expected": want, "copied": got})
+            _remove_quietly(building)
+            self.log("index.relocate.failed", {
+                "expected": want, "copied": got,
+                "note": _t("casedb.index_relocate_failed")})
             self.db.commit()
             return {"moved": 0, "expected": want, "copied": got}
 
-        self.db.execute("DROP TABLE IF EXISTS content_index")
-        self.db.execute("DELETE FROM meta WHERE key LIKE 'index_part_%'")
-        self.db.commit()
-        if progress:
-            progress(0.7)
-        self.db.execute("VACUUM")
-        self.db.commit()
-        self.index_pending = 0
-        self.index = self.index_db
-        self.log("index.relocated", {
-            "documents": got, "to": os.path.join(CACHE_DIR, INDEX_NAME),
-            "note": _t("casedb.index_relocated")})
+        with _case_lock(self.path):
+            self.index_db.close()
+            try:
+                os.replace(building, cache_path)
+            except OSError as exc:
+                # Windows will not replace a file another connection still
+                # has open -- a second session on this case, say. The old
+                # index is untouched, so reopen it and say why.
+                self.index_db = self._connect_index()
+                if not in_record:
+                    self.index = self.index_db
+                _remove_quietly(building)
+                self.log("index.relocate.failed", {
+                    "expected": want, "error": str(exc),
+                    "note": _t("casedb.index_relocate_failed")})
+                self.db.commit()
+                return {"moved": 0, "expected": want, "error": str(exc)}
+            self.index_db = self._connect_index()
+            self.index = self.index_db
+            self.index_layout = COMPRESSED
+            self.index_pending = 0
+        after = _file_size(cache_path)
+        if in_record:
+            self.db.execute("DROP TABLE IF EXISTS content_index")
+            self.db.execute("DELETE FROM meta WHERE key LIKE 'index_part_%'")
+            self.db.commit()
+            if progress:
+                progress(0.95)
+            self.db.execute("VACUUM")
+            self.db.commit()
+            self.log("index.relocated", {
+                "documents": got, "to": os.path.join(CACHE_DIR, INDEX_NAME),
+                "note": _t("casedb.index_relocated")})
+        else:
+            self.log("index.converted", {
+                "documents": got, "before_bytes": before,
+                "after_bytes": after,
+                "note": _t("casedb.index_converted")})
         self.db.commit()
         if progress:
             progress(1.0)
-        return {"moved": got}
+        return {"moved": got, "converted": not in_record,
+                "before": before, "after": after}
+
+    def _build_index_file(self, source, in_record, dest, progress=None):
+        _remove_quietly(dest)
+        conn = sqlite3.connect(_uri(dest), uri=True)
+        try:
+            add_index_functions(conn)
+            # A file nothing else can see yet: if this stops part way it is
+            # deleted, not recovered, so a journal would only cost time.
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.executescript(INDEX_SCHEMA + INDEX_META_SCHEMA)
+            conn.execute("ATTACH DATABASE ? AS src", (_uri(source, ro=True),))
+            if progress:
+                progress(0.05)
+            conn.execute(
+                "INSERT INTO content_docs (id, %s) "
+                "SELECT rowid, name, path, deflate(body), node, part, size, "
+                "deleted, modified, abs_offset, kind, evidence "
+                "FROM src.content_index" % ", ".join(DOC_COLUMNS))
+            if in_record:
+                conn.execute(
+                    "INSERT OR REPLACE INTO index_meta SELECT key, value "
+                    "FROM src.meta WHERE key LIKE 'index_part_%'")
+            else:
+                conn.execute("INSERT OR REPLACE INTO index_meta "
+                             "SELECT key, value FROM src.index_meta")
+            conn.commit()
+            conn.execute("DETACH DATABASE src")
+            if progress:
+                progress(0.5)
+            # Tokenised afresh from the compressed text rather than copied
+            # across, so the index is known to agree with what it indexes.
+            conn.execute("INSERT INTO content_index(content_index) "
+                         "VALUES('rebuild')")
+            conn.commit()
+            if progress:
+                progress(0.9)
+            return conn.execute(
+                "SELECT COUNT(*) FROM content_docs").fetchone()[0]
+        finally:
+            conn.close()
+
+    def index_add(self, rows):
+        # rows are (name, path, body, node, part, size, deleted, modified,
+        # abs_offset, kind, evidence), body as text.
+        if not rows:
+            return
+        with _case_lock(self.path):
+            if self.index_layout != COMPRESSED:
+                self.index.executemany(
+                    "INSERT INTO content_index (%s) VALUES (%s)"
+                    % (",".join(DOC_COLUMNS), ",".join("?" * 11)), rows)
+                self.index.commit()
+                return
+            start = self.index.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM content_docs").fetchone()[0]
+            ids = range(start + 1, start + 1 + len(rows))
+            self.index.executemany(
+                "INSERT INTO content_docs (id, %s) VALUES (%s)"
+                % (",".join(DOC_COLUMNS), ",".join("?" * 12)),
+                [(i, r[0], r[1], deflate_text(r[2])) + tuple(r[3:])
+                 for i, r in zip(ids, rows)])
+            self.index.executemany(
+                "INSERT INTO content_index (rowid, name, path, body) "
+                "VALUES (?,?,?,?)",
+                [(i, r[0], r[1], r[2]) for i, r in zip(ids, rows)])
+            self.index.commit()
+
+    def index_remove(self, where="", args=()):
+        # where is over the document columns, e.g. "part=? AND evidence=?".
+        clause = (" WHERE " + where) if where else ""
+        with _case_lock(self.path):
+            if self.index_layout != COMPRESSED:
+                self.index.execute("DELETE FROM content_index" + clause, args)
+                self.index.commit()
+                return
+            n = self.index.execute(
+                "SELECT COUNT(*) FROM content_docs" + clause,
+                args).fetchone()[0]
+            if not n:
+                return
+            total = self.index.execute(
+                "SELECT COUNT(*) FROM content_docs").fetchone()[0]
+            if n == total:
+                self.index.execute("INSERT INTO content_index(content_index) "
+                                   "VALUES('delete-all')")
+            else:
+                # FTS5 removes a document by being handed the words it
+                # indexed, so each one is read back once on the way out.
+                self.index.execute(
+                    "INSERT INTO content_index(content_index, rowid, name, "
+                    "path, body) SELECT 'delete', id, name, path, "
+                    "inflate(body) FROM content_docs" + clause, args)
+            self.index.execute("DELETE FROM content_docs" + clause, args)
+            self.index.commit()
+
+    def index_documents(self):
+        return "content_docs" if self.index_layout == COMPRESSED \
+            else "content_index"
+
+    def storage(self):
+        files = {DB_NAME: _file_size(self.db_path)}
+        cache = self.cache_dir()
+        try:
+            names = sorted(os.listdir(cache))
+        except OSError:
+            names = []
+        for name in names:
+            files[CACHE_DIR + "/" + name] = _file_size(os.path.join(cache,
+                                                                    name))
+        return {"files": files, "total": sum(files.values())}
+
+    def compact(self, progress=None):
+        # Everything here is lossless. Merging the index's segments and
+        # rewriting both databases changes how the pages are laid out, not a
+        # row of what they hold -- the audit entry records the sizes either
+        # side so the change in the record is accounted for.
+        if self.index_pending:
+            return {"compacted": False,
+                    "error": _t("casedb.compact_index_pending")}
+        before = self.storage()
+        # VACUUM writes a fresh copy of a database before replacing it, so
+        # the largest file bounds the room it needs.
+        need = max([_file_size(self.db_path)] +
+                   ([_file_size(os.path.join(self.cache_dir(), INDEX_NAME))]
+                    if self.index is not self.db else [])) + SPACE_HEADROOM
+        free = _free_space(self.db_path)
+        if free is not None and free < need:
+            return {"compacted": False, "need": need, "free": free,
+                    "error": _t("casedb.compact_no_room")}
+        with _case_lock(self.path):
+            if progress:
+                progress(0.05)
+            if self.fts:
+                self.index.execute(
+                    "INSERT INTO content_index(content_index) "
+                    "VALUES('optimize')")
+                self.index.commit()
+            if progress:
+                progress(0.5)
+            if self.index is not self.db:
+                self.index.execute("VACUUM")
+            if progress:
+                progress(0.75)
+            self.db.commit()
+            self.db.execute("VACUUM")
+            after = self.storage()
+            self.log("case.compact", {
+                "before_bytes": before["total"], "after_bytes": after["total"],
+                "record_before": before["files"][DB_NAME],
+                "record_after": after["files"][DB_NAME]})
+            self.db.commit()
+        if progress:
+            progress(1.0)
+        return {"compacted": True, "before": before["total"],
+                "after": after["total"]}
 
     def _migrate_fts(self):
         cols = {r[1] for r in self.index.execute(
@@ -570,7 +999,13 @@ class Case:
         except sqlite3.OperationalError:
             n = 0
         self.index.execute("DROP TABLE IF EXISTS content_index")
-        self.index.executescript(FTS_SCHEMA)
+        if self.index is self.db:
+            self.index.executescript(FTS_SCHEMA)
+        else:
+            self.index.execute("DROP TABLE IF EXISTS content_docs")
+            self.index.executescript(INDEX_SCHEMA)
+            self.index_layout = COMPRESSED
+            self.index_pending = 0
         self._forget_coverage()
         self.index.commit()
         if n:
@@ -588,6 +1023,25 @@ class Case:
         r = self.db.execute("SELECT value FROM meta WHERE key=?", (k,)).fetchone()
         return r["value"] if r else default
 
+    def folder_columns(self):
+        """The folder-listing columns this case shows, in order, or None for
+        the default set. A display preference shared by everyone who opens
+        the case; it changes nothing that was found, so it is not an entry
+        in the audit log."""
+        return casepref.load_folder_columns(
+            self.get(casepref.meta_key("folder_columns")))
+
+    @_writes
+    def set_folder_columns(self, columns):
+        columns = casepref.clean_folder_columns(columns)
+        key = casepref.meta_key("folder_columns")
+        if columns is None:
+            self.db.execute("DELETE FROM meta WHERE key=?", (key,))
+        else:
+            self._set(key, json.dumps(columns))
+        self.db.commit()
+        return columns
+
     def pulse(self):
         row = self.db.execute(
             "SELECT examiner FROM audit ORDER BY seq DESC LIMIT 1").fetchone()
@@ -596,6 +1050,15 @@ class Case:
                 "SELECT COUNT(*) c FROM bookmarks").fetchone()["c"],
             "tags": self.db.execute(
                 "SELECT COUNT(*) c FROM tagged_items").fetchone()["c"],
+            # New notes only: an edit is a new version, not a new item.
+            "notes": self.db.execute(
+                "SELECT COUNT(*) c FROM case_notes WHERE replaces IS NULL")
+                .fetchone()["c"],
+            # Changes with every add, edit and withdrawal, so another
+            # examiner's view refreshes for all three.
+            "notes_rev": "%d:%d:%d" % tuple(self.db.execute(
+                "SELECT COUNT(*), COUNT(retracted_at), COALESCE(MAX(id), 0) "
+                "FROM case_notes").fetchone()),
             "audit": self.db.execute(
                 "SELECT COUNT(*) c FROM audit").fetchone()["c"],
             "latest": row["examiner"] if row else None,
@@ -616,7 +1079,30 @@ class Case:
 
     EVIDENCE_TABLES = ("bookmarks", "tagged_items", "saved_searches",
                        "file_hashes", "artefacts", "attack_tags",
-                       "type_mismatches")
+                       "type_mismatches", "volume_keys")
+
+    @_writes
+    def save_volume_key(self, evidence_id, part, kind, key):
+        self.db.execute(
+            "INSERT OR REPLACE INTO volume_keys VALUES (?,?,?,?,?)",
+            (evidence_id, part, kind, bytes(key), utcnow()))
+        self.db.commit()
+
+    def volume_key(self, evidence_id, part):
+        try:
+            row = self.db.execute(
+                "SELECT kind, key FROM volume_keys "
+                "WHERE evidence_id=? AND part=?", (evidence_id, part)).fetchone()
+        except sqlite3.Error:
+            return None
+        return (row["kind"], bytes(row["key"])) if row else None
+
+    @_writes
+    def forget_volume_key(self, evidence_id, part):
+        self.db.execute(
+            "DELETE FROM volume_keys WHERE evidence_id=? AND part=?",
+            (evidence_id, part))
+        self.db.commit()
 
     def evidence_holdings(self, evidence_id):
         out = {}
@@ -631,8 +1117,8 @@ class Case:
                 out[table] = n
         try:
             n = self.index.execute(
-                "SELECT COUNT(*) c FROM content_index WHERE evidence=?",
-                (str(evidence_id),)).fetchone()["c"]
+                "SELECT COUNT(*) c FROM %s WHERE evidence=?"
+                % self.index_documents(), (str(evidence_id),)).fetchone()["c"]
             if n:
                 out["content_index"] = n
         except sqlite3.Error:
@@ -658,9 +1144,7 @@ class Case:
             except sqlite3.Error:
                 continue
         try:
-            self.index.execute("DELETE FROM content_index WHERE evidence=?",
-                               (str(evidence_id),))
-            self.index.commit()
+            self.index_remove("evidence=?", (str(evidence_id),))
         except sqlite3.Error:
             pass
         self.db.execute("DELETE FROM evidence WHERE id=?", (evidence_id,))
@@ -668,21 +1152,44 @@ class Case:
         return {"path": row["path"], "label": row["label"],
                 "removed": holdings}
 
+    # The chain's last entry, "<seq>:<hash>", kept in meta and written in
+    # the same transaction as the entry. Each new entry chains from it, not
+    # from whatever row happens to be last, so entries cut from the end of
+    # the log still show as a break once more are written after them.
+    AUDIT_HEAD = "audit_head"
+
     def log(self, action, detail=None):
         with _case_lock(self.path):
-            row = self.db.execute("SELECT hash FROM audit ORDER BY seq DESC "
-                                  "LIMIT 1").fetchone()
-            prev = row["hash"] if row else ""
-            at = utcnow()
-            payload = json.dumps(detail or {}, sort_keys=True, default=str)
-            h = hashlib.sha256(
-                ("%s|%s|%s|%s|%s" % (prev, at, self.examiner, action, payload))
-                .encode("utf-8")).hexdigest()
-            self.db.execute(
-                "INSERT INTO audit (at, examiner, action, detail, prev_hash, "
-                "hash) VALUES (?,?,?,?,?,?)",
-                (at, self.examiner, action, payload, prev, h))
-            self.db.commit()
+            # The in-process lock does not reach another Strata on the same
+            # case folder; SQLite's write lock does. Taking it before reading
+            # the head means two processes cannot both chain from one entry.
+            if self.db.in_transaction:
+                self.db.commit()
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                head = self.get(self.AUDIT_HEAD)
+                if head:
+                    prev = head.partition(":")[2]
+                else:
+                    row = self.db.execute("SELECT hash FROM audit ORDER BY "
+                                          "seq DESC LIMIT 1").fetchone()
+                    prev = row["hash"] if row else ""
+                at = utcnow()
+                payload = json.dumps(detail or {}, sort_keys=True, default=str)
+                h = hashlib.sha256(
+                    ("%s|%s|%s|%s|%s" % (prev, at, self.examiner, action,
+                                         payload)).encode("utf-8")).hexdigest()
+                cur = self.db.execute(
+                    "INSERT INTO audit (at, examiner, action, detail, "
+                    "prev_hash, hash) VALUES (?,?,?,?,?,?)",
+                    (at, self.examiner, action, payload, prev, h))
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                                (self.AUDIT_HEAD,
+                                 "%d:%s" % (cur.lastrowid, h)))
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
             return h
 
     def audit(self, limit=500):
@@ -690,7 +1197,13 @@ class Case:
             "SELECT * FROM audit ORDER BY seq DESC LIMIT ?", (limit,))]
 
     def verify_audit(self):
+        """Whether every entry hashes to what it records and chains from the
+        one before, and the log still ends at the entry the case last wrote.
+        The chain is not keyed: it shows alteration, deletion and truncation
+        by anyone who does not also recompute every later hash and the
+        recorded head; it cannot rule that out."""
         prev = ""
+        last = None
         for r in self.db.execute("SELECT * FROM audit ORDER BY seq"):
             h = hashlib.sha256(
                 ("%s|%s|%s|%s|%s" % (prev, r["at"], r["examiner"], r["action"],
@@ -698,25 +1211,97 @@ class Case:
             if h != r["hash"] or r["prev_hash"] != prev:
                 return {"intact": False, "broken_at": r["seq"]}
             prev = r["hash"]
+            last = r["seq"]
+        head = self.get(self.AUDIT_HEAD)
+        if head:
+            seq, _, want = head.partition(":")
+            try:
+                seq = int(seq)
+            except ValueError:
+                seq = None
+            if seq is None or last is None or last < seq or \
+                    (last == seq and want != prev):
+                return {"intact": False,
+                        "broken_at": (last or 0) + 1,
+                        "detail": ("The log ends at entry %s, but the last "
+                                   "entry the case recorded writing is %s: "
+                                   "entries have been removed from the end."
+                                   % (last if last is not None else "none",
+                                      seq))}
+            if last > seq:
+                return {"intact": False, "broken_at": seq + 1,
+                        "detail": ("Entries after %d were not written by "
+                                   "Strata: the case records %d as its last."
+                                   % (seq, seq))}
         return {"intact": True, "broken_at": None}
 
     @_writes
-    def add_evidence(self, path, info, label=None):
-        row = self.db.execute("SELECT id FROM evidence WHERE path=?",
+    def add_evidence(self, path, info, label=None, parents=None,
+                     definition=None):
+        parents = [str(p) for p in (parents or [])]
+        blob = json.dumps(parents) if parents else None
+        row = self.db.execute("SELECT id, parents FROM evidence WHERE path=?",
                               (path,)).fetchone()
         if row:
+            if blob and not row["parents"]:
+                # Added before the chain was recorded.
+                self.db.execute("UPDATE evidence SET parents=? WHERE id=?",
+                                (blob, row["id"]))
+                self.db.commit()
+                self.log("evidence.parents", {"evidence_id": row["id"],
+                                              "parents": parents})
             return row["id"]
         kind = (info.get("kind") or "file") if info.get("logical") else "image"
+        if definition is not None:
+            kind = "raid"
         cur = self.db.execute(
             "INSERT INTO evidence (path,label,format,size,stored_md5,stored_sha1,"
-            "kind,added_at) VALUES (?,?,?,?,?,?,?,?)",
+            "kind,added_at,parents,definition) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (path, label or os.path.basename(path), info.get("format"),
              info.get("size"), info.get("stored_md5"), info.get("stored_sha1"),
-             kind, utcnow()))
+             kind, utcnow(), blob,
+             json.dumps(definition, sort_keys=True)
+             if definition is not None else None))
         self.db.commit()
         self.log("evidence.add", {"path": path, "size": info.get("size"),
-                                  "stored_md5": info.get("stored_md5")})
+                                  "stored_md5": info.get("stored_md5"),
+                                  "parents": parents or None,
+                                  "raid": definition})
         return cur.lastrowid
+
+    @staticmethod
+    def _chain_of(path, parents_blob):
+        chain = {os.path.realpath(path)}
+        try:
+            chain.update(os.path.realpath(p)
+                         for p in json.loads(parents_blob or "[]"))
+        except (TypeError, ValueError):
+            pass
+        return chain
+
+    def related_evidence(self, path, parents=()):
+        """Ids of exhibits that share a disk with this one: its parents, its
+        children, and its siblings (other children of the same parent).
+        They are different states of one volume, not re-acquisitions of it."""
+        mine = self._chain_of(path, json.dumps(list(parents)))
+        related = set()
+        for row in self.db.execute("SELECT id, path, parents FROM evidence"):
+            if os.path.realpath(row["path"]) == os.path.realpath(path):
+                continue
+            if mine & self._chain_of(row["path"], row["parents"]):
+                related.add(row["id"])
+        return related
+
+    def evidence_definition(self, path):
+        """The RAID definition stored for an exhibit, or None."""
+        row = self.db.execute("SELECT definition FROM evidence WHERE path=?",
+                              (path,)).fetchone()
+        try:
+            got = json.loads(row["definition"]) if row and row["definition"] \
+                else None
+        except ValueError:
+            return None
+        return got if isinstance(got, dict) else None
 
     def evidence_kind(self, path):
         row = self.db.execute("SELECT * FROM evidence WHERE path=?",
@@ -781,6 +1366,195 @@ class Case:
                            utcnow(), evidence_id))
         self.db.commit()
         self.log("evidence.verify", {"evidence_id": evidence_id, **result})
+
+    NOTE_MAX = 20000
+
+    def _note_body(self, body):
+        body = (body or "").strip()
+        if not body:
+            raise ValueError(_t("casedb.note_empty"))
+        if len(body) > self.NOTE_MAX:
+            # Refused rather than cut: a note that silently lost its end
+            # would be on the record as something its writer never wrote.
+            raise ValueError(_t("casedb.note_too_long") % self.NOTE_MAX)
+        return body
+
+    @contextlib.contextmanager
+    def _write_lock(self):
+        """SQLite's write lock for a check-then-write: the in-process lock
+        does not reach another Strata on the same case folder."""
+        if self.db.in_transaction:
+            self.db.commit()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.db.rollback()
+            raise
+        self.db.commit()
+
+    # -- structure templates ------------------------------------------------
+
+    def _template_row(self, r):
+        out = {"id": r["id"], "name": r["name"], "examiner": r["examiner"],
+               "created_at": r["created_at"], "updated_at": r["updated_at"],
+               "revision": r["revision"]}
+        try:
+            from . import structure
+            body = structure.validate_template(json.loads(r["body"]))
+            out["description"] = body["description"]
+            out["fields"] = body["fields"]
+        except (ValueError, TypeError) as exc:
+            # Kept and listed so it can be seen and deleted, but never applied.
+            out.update(description="", fields=[], damaged=str(exc))
+        return out
+
+    def templates(self):
+        return [self._template_row(r) for r in self.db.execute(
+            "SELECT * FROM structure_templates ORDER BY name COLLATE NOCASE")]
+
+    def template(self, tid):
+        r = self.db.execute("SELECT * FROM structure_templates WHERE id=?",
+                            (tid,)).fetchone()
+        return self._template_row(r) if r else None
+
+    @_writes
+    def save_template(self, template, tid=None, revision=None):
+        """A new template (tid None) or a new save of an existing one.
+        Returns the stored template, or None if `tid` is gone or has been
+        saved by someone else since `revision` was read -- checked under the
+        database's write lock, so that holds across processes too. Raises
+        ValueError for a template that does not validate or a name already
+        in use."""
+        from . import structure
+        body = structure.validate_template(template)
+        blob = json.dumps(body, sort_keys=True)
+        now = utcnow()
+        try:
+            with self._write_lock():
+                if tid is None:
+                    cur = self.db.execute(
+                        "INSERT INTO structure_templates (name, body, "
+                        "examiner, created_at, updated_at) VALUES (?,?,?,?,?)",
+                        (body["name"], blob, self.examiner, now, now))
+                    tid, action = cur.lastrowid, "template.add"
+                else:
+                    cur = self.db.execute(
+                        "UPDATE structure_templates SET name=?, body=?, "
+                        "examiner=?, updated_at=?, revision=revision+1 "
+                        "WHERE id=? AND revision=?",
+                        (body["name"], blob, self.examiner, now, tid,
+                         revision))
+                    if cur.rowcount != 1:
+                        return None
+                    action = "template.edit"
+        except sqlite3.IntegrityError:
+            raise ValueError(_t("template.name_in_use") % body["name"])
+        saved = self.template(tid)
+        self.log(action, {"id": tid, "name": body["name"],
+                          "revision": saved["revision"], "template": body})
+        return saved
+
+    @_writes
+    def delete_template(self, tid, revision):
+        """Deletes a template if it is still at `revision`; False otherwise.
+        What was deleted is kept whole in the audit log."""
+        with self._write_lock():
+            row = self.db.execute(
+                "SELECT * FROM structure_templates WHERE id=? AND revision=?",
+                (tid, revision)).fetchone()
+            if row is None:
+                return False
+            self.db.execute("DELETE FROM structure_templates WHERE id=?",
+                            (tid,))
+        try:
+            kept = json.loads(row["body"])
+        except ValueError:
+            # A damaged row is still recorded whole, as the text it held.
+            kept = row["body"]
+        self.log("template.delete", {"id": tid, "name": row["name"],
+                                     "revision": row["revision"],
+                                     "template": kept})
+        return True
+
+    @_writes
+    def add_note(self, body):
+        body = self._note_body(body)
+        cur = self.db.execute(
+            "INSERT INTO case_notes (at, examiner, body) VALUES (?,?,?)",
+            (utcnow(), self.examiner, body))
+        self.db.commit()
+        self.log("note.add", {"id": cur.lastrowid, "body": body})
+        return cur.lastrowid
+
+    def _current_note(self, nid):
+        row = self.db.execute("SELECT * FROM case_notes WHERE id=?",
+                              (nid,)).fetchone()
+        if not row or row["retracted_at"]:
+            return None
+        newer = self.db.execute("SELECT 1 FROM case_notes WHERE replaces=?",
+                                (nid,)).fetchone()
+        return None if newer else row
+
+    @_writes
+    def edit_note(self, nid, body):
+        """A new version of a note, by whoever is editing it; the version it
+        replaces is kept. Only the current version of a live note can be
+        edited, so two examiners editing at once cannot both win -- checked
+        and written under the database's write lock, so that holds across
+        processes too."""
+        body = self._note_body(body)
+        with self._write_lock():
+            old = self._current_note(nid)
+            if old is None:
+                return None
+            if old["body"] == body:
+                return nid
+            cur = self.db.execute(
+                "INSERT INTO case_notes (at, examiner, body, replaces) "
+                "VALUES (?,?,?,?)", (utcnow(), self.examiner, body, nid))
+        self.log("note.edit", {"id": cur.lastrowid, "replaces": nid,
+                               "body": body})
+        return cur.lastrowid
+
+    @_writes
+    def retract_note(self, nid):
+        with self._write_lock():
+            if self._current_note(nid) is None:
+                return False
+            self.db.execute(
+                "UPDATE case_notes SET retracted_at=?, retracted_by=? "
+                "WHERE id=?", (utcnow(), self.examiner, nid))
+        self.log("note.retract", {"id": nid})
+        return True
+
+    def notes(self, include_retracted=False):
+        """Current notes, newest first, each with its earlier versions
+        (oldest first) under "history". The first version's writer is the
+        note's author; each version names who wrote it."""
+        rows = [dict(r) for r in self.db.execute(
+            "SELECT * FROM case_notes ORDER BY id")]
+        by_id = {r["id"]: r for r in rows}
+        replaced = {r["replaces"] for r in rows if r["replaces"]}
+        out = []
+        for r in rows:
+            if r["id"] in replaced:
+                continue
+            if r["retracted_at"] and not include_retracted:
+                continue
+            chain = []
+            prev = r["replaces"]
+            while prev and prev in by_id and len(chain) < 1000:
+                chain.append(by_id[prev])
+                prev = by_id[prev]["replaces"]
+            chain.reverse()
+            note = dict(r)
+            note["history"] = chain
+            note["author"] = (chain[0] if chain else r)["examiner"]
+            note["created_at"] = (chain[0] if chain else r)["at"]
+            out.append(note)
+        out.sort(key=lambda n: n["created_at"], reverse=True)
+        return out
 
     @_writes
     def add_bookmark(self, evidence_id, offset, length=1, label="", note="",
@@ -860,19 +1634,18 @@ class Case:
 
     @_writes
     def tag_item(self, evidence_id, item, tag, note="", part=0):
-        node = str(item.get("mft") if item.get("mft") is not None
-                   else item.get("inode") if item.get("inode") is not None
-                   else item.get("oid") if item.get("oid") is not None
-                   else item.get("start_cluster"))
+        node = str(node_of(item))
         cur = self.db.execute(
             "INSERT INTO tagged_items (evidence_id,part,node,path,name,size,"
             "is_dir,deleted,tag,note,created_at,examiner,modified,accessed,"
-            "file_created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "file_created,contiguous) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(evidence_id,part,node,tag) DO UPDATE SET note=excluded.note",
             (evidence_id, part, node, item.get("path"), item.get("name"),
              item.get("size"), int(bool(item.get("is_dir"))),
              int(bool(item.get("deleted"))), tag, note, utcnow(), self.examiner,
-             item.get("modified"), item.get("accessed"), item.get("created")))
+             item.get("modified"), item.get("accessed"), item.get("created"),
+             int(bool(item.get("contiguous")))
+             if item.get("contiguous") is not None else None))
         self.db.commit()
         self.log("item.tag", {"path": item.get("path"), "name": item.get("name"),
                               "tag": tag, "node": node})
@@ -908,6 +1681,93 @@ class Case:
             "SELECT tag, COUNT(*) n FROM tagged_items GROUP BY tag ORDER BY tag")}
 
     @_writes
+    def register_volumes(self, evidence_id, identities):
+        """Record the volume identities of one evidence item, replacing any
+        earlier record for it (an image may be re-opened after re-imaging)."""
+        self.db.execute("DELETE FROM volume_identity WHERE evidence_id=?",
+                        (evidence_id,))
+        for ident in identities:
+            self.db.execute(
+                "INSERT INTO volume_identity (evidence_id, part, key) "
+                "VALUES (?,?,?)",
+                (evidence_id, ident["part"], ident["key"]))
+        self.db.commit()
+
+    @_writes
+    def reassociate_tags(self, evidence_id, identities, skip=()):
+        """Move tags of previously seen volumes onto this acquisition.
+
+        For each identity key of the incoming evidence, if exactly one other
+        evidence item held that key, its tagged rows move here (same volume
+        means same filesystem layout, so node values travel as-is).  Zero or
+        several candidates is reported, never guessed.  Returns the counts
+        and logs audit action "tags.reassociated". Exhibits in `skip` (a
+        disk's parents and siblings) are never a source: they share the
+        volume because they are states of it, not earlier copies.
+        """
+        counts = {"remapped": 0, "duplicates_dropped": 0, "ambiguous": 0,
+                  "unchanged": 0}
+        ambiguous_details = []
+        for ident in identities:
+            part = ident["part"]
+            key = ident["key"]
+            moved_from = self.db.execute(
+                "SELECT DISTINCT evidence_id, part FROM volume_identity "
+                "WHERE key=? AND NOT (evidence_id=? AND part=?)",
+                (key, evidence_id, part)).fetchall()
+            moved_from = [r for r in moved_from if r[0] not in skip]
+            if len(moved_from) == 1:
+                src_ev, src_part = moved_from[0]
+                rows = self.db.execute(
+                    "SELECT id, node, tag FROM tagged_items "
+                    "WHERE evidence_id=? AND part=?",
+                    (src_ev, src_part)).fetchall()
+                if not rows:
+                    # The volume's tags were already moved or never existed;
+                    # fold the identity silently and count nothing.
+                    self.db.execute(
+                        "DELETE FROM volume_identity "
+                        "WHERE evidence_id=? AND part=?",
+                        (src_ev, src_part))
+                    continue
+                for row in rows:
+                    clash = self.db.execute(
+                        "SELECT id FROM tagged_items "
+                        "WHERE evidence_id=? AND part=? AND node=? AND tag=?",
+                        (evidence_id, part, row["node"],
+                         row["tag"])).fetchone()
+                    if clash:
+                        # Both copies were tagged before identity tracking
+                        # existed; the target's row is what the examiner
+                        # currently sees, so it stands.
+                        self.db.execute("DELETE FROM tagged_items WHERE id=?",
+                                        (row["id"],))
+                        counts["duplicates_dropped"] += 1
+                    else:
+                        self.db.execute(
+                            "UPDATE tagged_items SET evidence_id=?, part=? "
+                            "WHERE id=?",
+                            (evidence_id, part, row["id"]))
+                        counts["remapped"] += 1
+                # The source's identity has been subsumed; leaving it would
+                # make a later third acquisition ambiguous between the empty
+                # source and the real target.
+                self.db.execute(
+                    "DELETE FROM volume_identity "
+                    "WHERE evidence_id=? AND part=?", (src_ev, src_part))
+            elif not moved_from:
+                counts["unchanged"] += 1
+            else:
+                counts["ambiguous"] += 1
+                ambiguous_details.append(
+                    {"key": key, "candidates": [list(r) for r in moved_from]})
+        self.db.commit()
+        detail = dict(evidence_id=evidence_id, **counts)
+        detail["ambiguous_details"] = ambiguous_details or None
+        self.log("tags.reassociated", detail)
+        return dict(counts, ambiguous_details=ambiguous_details)
+
+    @_writes
     def save_search(self, evidence_id, name, query, hits, part=None):
         cur = self.db.execute(
             "INSERT INTO saved_searches (evidence_id,name,query,part,hit_count,"
@@ -920,10 +1780,7 @@ class Case:
             "deleted,where_found,term,context,file_offset,encoding,modified) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(sid, h.get("name"), h.get("path"),
-              str(h.get("mft") if h.get("mft") is not None
-                  else h.get("inode") if h.get("inode") is not None
-                  else h.get("oid") if h.get("oid") is not None
-                  else h.get("start_cluster")),
+              str(node_of(h)),
               h.get("size"), int(bool(h.get("is_dir"))),
               int(bool(h.get("deleted"))), h.get("where"), h.get("term"),
               h.get("context"), h.get("file_offset"), h.get("encoding"),
@@ -965,14 +1822,16 @@ class Case:
     def record_hashes(self, evidence_id, rows, part=0):
         self.db.executemany(
             "INSERT INTO file_hashes (evidence_id,part,node,path,name,size,"
-            "deleted,md5,sha1,sha256,read_bytes,computed_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+            "deleted,md5,sha1,sha256,fuzzy,read_bytes,computed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(evidence_id,part,node) DO UPDATE SET "
             "md5=excluded.md5, sha1=excluded.sha1, sha256=excluded.sha256, "
+            "fuzzy=excluded.fuzzy, "
             "read_bytes=excluded.read_bytes, computed_at=excluded.computed_at",
             [(evidence_id, part, r["node"], r.get("path"), r.get("name"),
               r.get("size"), int(bool(r.get("deleted"))), r.get("md5"),
-              r.get("sha1"), r.get("sha256"), r.get("read"), utcnow())
+              r.get("sha1"), r.get("sha256"), r.get("fuzzy"), r.get("read"),
+              utcnow())
              for r in rows])
         self.db.commit()
         return len(rows)
@@ -1121,9 +1980,9 @@ class Case:
 
     def hash_map(self, evidence_id, part):
         return {r["node"]: {"md5": r["md5"], "sha1": r["sha1"],
-                            "sha256": r["sha256"]}
+                            "sha256": r["sha256"], "fuzzy": r["fuzzy"]}
                 for r in self.db.execute(
-                    "SELECT node,md5,sha1,sha256 FROM file_hashes "
+                    "SELECT node,md5,sha1,sha256,fuzzy FROM file_hashes "
                     "WHERE evidence_id=? AND part=?", (evidence_id, part))
                 if r["node"] is not None}
 
@@ -1132,6 +1991,71 @@ class Case:
             "SELECT * FROM file_hashes WHERE evidence_id=? AND part=? AND node=?",
             (evidence_id, part, str(node))).fetchone()
         return dict(r) if r else None
+
+    def duplicate_files(self):
+        """Files whose SHA-256 was seen under more than one evidence item
+        -- only among files a hash run has actually covered, since a
+        digest is never computed implicitly here. Largest group first."""
+        rows = self.db.execute(
+            "SELECT h.* FROM file_hashes h JOIN ("
+            " SELECT sha256 FROM file_hashes"
+            " WHERE sha256 IS NOT NULL AND sha256 != ''"
+            " GROUP BY sha256 HAVING COUNT(DISTINCT evidence_id) > 1"
+            ") dup ON h.sha256 = dup.sha256 "
+            "ORDER BY h.sha256, h.evidence_id, h.part").fetchall()
+        groups = {}
+        for r in rows:
+            groups.setdefault(r["sha256"], []).append(dict(r))
+        out = [{"sha256": k, "items": v} for k, v in groups.items()]
+        out.sort(key=lambda g: len(g["items"]), reverse=True)
+        return out
+
+    def similar_files(self, threshold=60, limit=500):
+        """Pairs of files whose fuzzy hashes are alike (score >= threshold),
+        across all evidence -- like duplicate_files, this only compares what
+        a hash run has already fuzzy-hashed, never hashes anything itself.
+        Unlike an exact digest, ssdeep similarity isn't transitive, so
+        results are scored pairs rather than groups, and exact duplicates
+        (same SHA-256) are left to Find Duplicates rather than repeated here.
+
+        ssdeep hashes only ever score non-zero when their block sizes match
+        or one is double the other, so files are bucketed by block size
+        first -- comparing every fuzzy-hashed file against every other
+        would be needless work on a case of any size."""
+        rows = [dict(r) for r in self.db.execute(
+            "SELECT * FROM file_hashes WHERE fuzzy IS NOT NULL AND fuzzy != ''")]
+        buckets = {}
+        for r in rows:
+            try:
+                bs = int(r["fuzzy"].split(":", 1)[0])
+            except (ValueError, IndexError):
+                continue
+            buckets.setdefault(bs, []).append(r)
+
+        def consider(a, b, pairs, seen):
+            key = (a["id"], b["id"]) if a["id"] < b["id"] else (b["id"], a["id"])
+            if key in seen:
+                return
+            seen.add(key)
+            if a["sha256"] and b["sha256"] and a["sha256"] == b["sha256"]:
+                return
+            score = fuzzyhash.compare(a["fuzzy"], b["fuzzy"])
+            if score >= threshold:
+                pairs.append((score, a, b))
+
+        pairs, seen = [], set()
+        for bs, group in buckets.items():
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    consider(group[i], group[j], pairs, seen)
+            for other in buckets.get(bs * 2, []):
+                for a in group:
+                    for b in other:
+                        consider(a, b, pairs, seen)
+
+        pairs.sort(key=lambda p: -p[0])
+        return [{"score": score, "a": a, "b": b}
+                for score, a, b in pairs[:limit]]
 
     @_writes
     def add_hash_set(self, name, kind, source, digests):
@@ -1193,6 +2117,7 @@ class Case:
         s["bookmarks"] = self.bookmarks()
         s["tagged"] = self.tagged()
         s["tag_counts"] = self.tag_counts()
+        s["notes"] = self.notes(include_retracted=True)
         s["attack"] = self.attack_tags()
         s["attack_summary"] = self.attack_summary()
         cat = self.attack_catalogue()

@@ -1,0 +1,1331 @@
+# Changelog
+
+Notable changes to Strata. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/). While the version is 0.x, a minor
+release may change behaviour.
+
+Add a line under **Unreleased** in the same PR as the change. Examiners read
+this list, so write for them: what changed in what Strata reads, reports or
+records, not how the code changed.
+
+## [Unreleased]
+
+## [0.9.0] - 2026-10-02
+
+### Added
+
+- **EWF2 (Ex01) images, as written by EnCase 7 and later, can be opened.**
+  Previously detected and refused outright. Zlib-compressed, stored and
+  pattern-fill (sparse) chunks are read, along with device and case
+  metadata and MD5/SHA1 verification. This is not simply E01 with wider
+  fields: EWF2 sections are read back-to-front (each one's descriptor sits
+  at its own end and points to the previous section, not the next), and
+  metadata uses a different text format. An encrypted volume, or one with
+  bzip2-compressed chunks, is refused with the reason — EnCase 7 has never
+  offered bzip2 as an option, and Ex01 encryption is undisclosed by
+  Guidance Software. Tested on synthetic images, cross-checked against
+  pyewf (libewf's own reference Python bindings); a real Ex01 written by
+  EnCase itself has not been checked. EWF2 logical evidence (Lx01: files
+  and folders, not a disk image) is not read.
+- A repeatable comparison of Strata against independent readers
+  (`tests/crosscheck.py`; libewf, libvhdi, libqcow, libvmdk, libvsgpt,
+  libfsntfs, libfshfs, libfsext, libfsfat and qemu-img where installed). It
+  reads the same image both ways, layer by layer, and lists every difference;
+  the ones that are understood are recorded with their reasons and a new one
+  fails the run. It can also be pointed at real images, with file and folder
+  names withheld from its output. Synthetic images only so far; see
+  `docs/CROSSCHECK.md`.
+- **AFF4 disk images can be opened.** Both the single-stream and the more
+  common Map-over-ImageStream shape are read, with zlib/Deflate-compressed
+  or stored chunks; a gap in a Map (unallocated space) reads as zeros, a
+  custom symbolic fill stream, or whatever `aff4:mapGapDefaultStream`
+  names. A damaged chunk or bevy index reads as zeros and is reported,
+  rather than failing the whole image. A striped or segmented multi-volume
+  AFF4 set, and chunks compressed with anything other than Deflate, are
+  refused with the reason. None of the byte-level format is documented by
+  the published AFF4 Standard with full accuracy -- two details (the
+  ImageStream bevy index layout, and the Deflate compression method's own
+  URI) were corrected against bytes observed in real files written by
+  pyaff4, the reference implementation. Tested on synthetic images only;
+  images written by a real AFF4 imaging tool have not been checked.
+- **LZFSE-compressed files are read on HFS+ and APFS.** Files macOS
+  compresses with LZFSE (the method newer macOS versions prefer) were listed
+  with a note and a volume finding but their content was not shown. They are
+  now decompressed like zlib and LZVN ones. The decoder was checked against
+  streams written by Apple's own reference encoder; only files stored raw
+  (compression types 9 and 10) are still listed without content. A cached
+  HFS+ or APFS filesystem tree is rebuilt the next time it is opened, so
+  these files show their size. Tested on synthetic volumes only.
+- **Apple disk images (DMG) can be opened.** Images with raw, zero-fill,
+  zlib, bzip2, LZMA and LZFSE chunks are read like any other disk: the
+  partitions and filesystems inside are found, and a damaged chunk reads as
+  zeros and is reported. An encrypted or multi-file image, a sparse image,
+  or one that uses ADC chunks is refused with the reason and what to do about
+  it, rather than shown partly. Tested on synthetic images only; images
+  written by Apple's own tools have not been checked.
+
+### Fixed
+
+- **Opening a folder on an HFS+ volume showed the volume's top level again,
+  and search, hashing, indexing and tagging skipped HFS+ folders.** Each
+  reader names its entries by its own key (the MFT record for NTFS, the inode
+  for ext, the catalog node ID for HFS+), and most of the code looked for
+  every key but HFS+'s. Expanding a folder in the tree listed the volume root
+  instead of its contents (nested without end), a search, file-type check,
+  hash or index run never went below the top folder, and an HFS+ file had no
+  key to tag or hash it under. The key is now chosen in one place. A tagged
+  HFS+ file can also be exported, which it could not be before: it is looked
+  up again from its key. Checked in a browser on a synthetic HFS+ volume
+  built with nested folders; the volume itself is unchanged.
+- **A cut-off name in the evidence tree can be read in full.** The tree is
+  narrow, so a long line such as a partition's "volume label ..." detail was
+  shown with an ellipsis and the rest was unreachable. Hovering over a row now
+  shows its full text.
+
+- **A large HFS+ volume could list as empty.** The volume header holds only
+  the first eight pieces of the catalog (the file that lists every folder and
+  file) and of the attributes file; on a volume where either is in more
+  pieces, the rest are recorded in the extents overflow file, which was not
+  consulted. A folder whose entries lay in a later piece showed "Empty
+  directory", the volume name and extended attributes could be missing, and
+  nothing said so. Both files are now read in full. Checked against a
+  synthetic volume built to the published layout and read by an independent
+  reader (libfshfs); not yet against a large volume written by macOS.
+- **Pressing Enter in a dialog cancelled it instead of submitting it.** In
+  the BitLocker and LUKS unlock dialog, the examiner-name dialogs, New case,
+  Open case, tagging, and every other dialog with a Cancel button, Enter in a
+  text field pressed Cancel because Cancel comes first. Enter now confirms,
+  and clicking Cancel still cancels.
+- **An HFS+ volume's name was never shown.** The volume tree titled an HFS+
+  partition only "Partition N", where NTFS, exFAT, FAT and ext volumes show
+  their label. The name is now read from the catalog's root folder record
+  (cheaply, without reading the whole catalog) and shown like the others.
+- **A GPT partition was titled by its filesystem's label, not its own
+  name.** The volume tree showed “Partition 3” and the filesystem's label,
+  where Disk Management and FTK Imager show the name the partition table
+  gives the partition. The tree now titles the partition with that name and
+  shows the filesystem's label beside the size and type ("volume label …").
+  A partition with no name of its own, as on an MBR disk, is still titled
+  by its label.
+- **The GPT's own tables were reported as unpartitioned space.** The space
+  between the protective MBR and the first usable sector (the GPT header and
+  partition array) was part of the first "Unpartitioned space" entry, and the
+  backup header and array at the end of the disk made a trailing one even on
+  a disk with no spare room. Space outside the GPT's usable range is no longer
+  listed as unpartitioned; gaps between partitions and spare room inside the
+  usable range still are.
+
+## [0.8.0] - 2026-10-01
+
+Adds RAID 0, 1 and 5 assembly, QCOW2 and VirtualBox VDI disk images,
+BitLocker volumes with the Elephant diffuser, compressed files and hard links
+on HFS+ and APFS, a reader for the NTFS log (`$LogFile`), a template editor
+for on-disk structures, configurable folder columns, and a long list of fixes
+to differencing VHDs, event logs and case notes. Most of the new readers have
+been tested on synthetic images only; each entry says so. Upgrade from 0.7.0.
+A previously cached filesystem tree is rebuilt the next time it is opened
+(HFS+ and APFS listings now carry the size of compressed files and the
+contents of hard links); a case that predates RAID sets gains a column the
+first time it is opened. Nothing else in an existing case needs redoing.
+
+### Added
+
+- **RAID 0, 1 and 5 sets can be assembled from their member images.** Open
+  or Add evidence has an "Assemble RAID set…" button: choose the level, chunk
+  size and (for RAID 5) layout, then the members in the order they were in the
+  set, each with the offset where its data starts. **Check** assembles the set
+  and says what it found at the start of it, so a wrong chunk size, order or
+  layout shows up before anything is added. The set becomes one exhibit, and
+  the case stores its definition and the files it is made of, so the set is
+  put together again when the case is reopened (and a member that has moved is
+  named). A RAID 5 set missing one member is read by rebuilding the missing
+  chunks from the others, and the exhibit says so. **Verify** also compares
+  what the members hold: a mirror's members should be identical and a RAID 5
+  row should XOR to zero, and where they do not, the ranges are listed as what
+  was observed, without saying which member is right or that the set is wrong.
+  Tested on synthetic sets only; the members can be raw images or any other
+  image format Strata reads.
+
+- **OST files written by Outlook 2013 and later can be read.** These use a
+  64-bit "4k page" format with optionally-compressed data blocks that
+  Microsoft's own [MS-PST] specification doesn't document at all; support
+  is built against libyal/libpff's independently reverse-engineered format
+  documentation instead. Tested on synthetic files only; no real OST file
+  has been checked yet.
+- **BitLocker volumes encrypted with the Elephant diffuser.** Vista and
+  Windows 7 volumes using AES-CBC with the Elephant diffuser (encryption
+  methods 0x8000/0x8001) are now decrypted, not just identified. Previously
+  these volumes were refused outright.
+- **A template editor for on-disk structures.** A new Templates tab lets an
+  examiner define a structure without writing code: a name, and rows of
+  offset, size, name, kind (little-endian integers, hex, signature, ASCII,
+  UTF-16, GUID, raw bytes) and a note. Preview decodes the fields from the
+  evidence at any offset, counted from the image or from a partition, and
+  says which fields ran past the end of the evidence. Templates are kept in
+  the case, under the name of whoever last saved them, so everyone who opens
+  the case sees them. Saving checks every field, names are unique, and an edit
+  made from an out-of-date copy is refused rather than overwriting a
+  colleague's; every save and delete is in the audit log, and a deleted
+  template is kept whole there.
+
+- **The folder listing's columns can be chosen, and search has the rest of
+  its filters.** A Columns button on the folder listing shows or hides each
+  column (size, extension, signature, created, modified, accessed, MD5,
+  SHA-256, and path in a listing of everything below a folder) and moves
+  them earlier or later. The choice is saved with the case, so everyone who
+  opens the case sees the same columns; with no case open it lasts until the
+  page is reloaded. Search, indexing and hashing filters gain name, created
+  and accessed date ranges and "hide deleted" (which switches off "deleted
+  only", since both together could match nothing). A filter that is
+  misspelt or could not match anything is now refused with the reason,
+  instead of silently matching everything.
+- **QCOW2 and VirtualBox VDI disk images can be opened.** Both were refused
+  by name before. QCOW2 (versions 2 and 3, including compressed clusters) and
+  VDI (dynamic and fixed) are read like any other disk, with unwritten space
+  reading as zeros and anything odd in the file reported as a finding on the
+  image. A disk that holds only a change from another disk, a QCOW2 with a
+  backing file or a differencing or undo VDI, is refused with the reason
+  rather than shown as though it were whole; so are encrypted QCOW2 disks
+  and the QCOW2 variants Strata cannot read (external data file, subcluster
+  tables, zstd compression). Tested on synthetic images only; DMG and AFF4
+  are still refused.
+- **Compressed files on HFS+ and APFS volumes are read.** Files that macOS
+  compresses transparently (the `com.apple.decmpfs` attribute, with the data
+  in the attribute or in the resource fork) showed as empty. Those compressed
+  with zlib or LZVN now show their real size and content, so they can be
+  viewed, hashed and searched; a block that cannot be decompressed reads as
+  zeros and the file's details say so. Files compressed with LZFSE are listed
+  with a note and a volume finding, and their content is not shown. Tested on
+  synthetic volumes only.
+- **HFS+ hard links show the file they stand for.** A hard link showed as an
+  empty file. It now has the size, content, resource fork and attributes of
+  the shared file, keeps its own name and times of creation, and says how many
+  names share it. A link whose shared file is missing is reported as
+  such. Directory hard links (as Time Machine makes) are listed with the
+  folder they stand for, and are not opened as folders, so a link cannot make
+  the tree loop. Tested on synthetic volumes; the layout was checked against
+  an independent reader.
+- **The NTFS log (`$LogFile`) can be read.** A new artefact, "NTFS log",
+  shows the log's restart areas (whether the last shutdown was clean, log
+  version, size) and its log records: LSN, transaction, the redo and undo
+  operation (name and code), and the attribute they act on. Where a record
+  adds, deletes or updates a file name and its payload is a plain
+  `$FILE_NAME` that passes sanity checks, the name, the file it refers to and
+  its four timestamps are shown too. Everything is shown as recorded: the log
+  is a ring, so it is not a full history, and Strata does not infer a
+  sequence of events from it. Torn pages are skipped and counted. Built from
+  published third-party format descriptions and tested on synthetic logs
+  only; it has not been checked against a real `$LogFile`.
+
+### Fixed
+
+- **HFS+ extended attributes were read from the wrong place in the record,
+  so their sizes and values were wrong.** The value of an inline attribute
+  starts sixteen bytes into its record, not twelve; `com.apple.quarantine`
+  and similar attributes now show their real contents. Resource forks that
+  continue in the extents overflow tree are also read in full.
+- **Sweeping event logs across a volume could use large amounts of memory
+  and could not be cancelled promptly.** Every log was read whole and every
+  event kept before the newest were picked. Logs are now read a chunk at a
+  time, only the newest events are kept, cancelling takes effect within a
+  chunk, and a log that stops being readable partway keeps what was read and
+  says so.
+- **Events from deleted event logs were merged among the live ones with
+  nothing to tell them apart.** The volume-wide Events timeline also read
+  `.evtx` files that had been deleted, whose clusters may have been reused
+  since, so an event could come from data that is not what the log once
+  held. Those logs and each of their events are now marked "deleted", a note
+  says why they need care, the log filter labels them, and a checkbox hides
+  them. An unreadable deleted file says it is deleted, and a live log is
+  listed before a deleted one at the same path.
+- **A differencing VHD could show a stale file listing after its parent was
+  replaced.** The saved listing of an NTFS volume was checked against the
+  child disk's size and time only, but a differencing disk shows mostly what
+  its parent holds. Replacing the parent with another disk of the same
+  identifier left the old listing in place. Each parent's size and time are
+  now part of the check, so a changed or missing parent rebuilds the listing;
+  disks without a parent are checked exactly as before.
+- **After reloading the page, every date fell back to UTC.** The time zone
+  applied to a case was only loaded when a case or image was opened, not when
+  the page was refreshed with one already open, so dates showed UTC (and
+  notes disagreed with the report) until the zone was applied again. The
+  applied zone is now restored on reload.
+- **Case note times ignored the case's time zone and the time-display
+  setting.** Notes always showed UTC, while every other date in the interface
+  and the HTML report showed the applied zone, so one note could carry two
+  different times. Notes now use the same display as everything else, and
+  switch when the zone or the setting changes.
+- **Text from an image was shown unescaped in the exhibit details, so a
+  crafted name could run script in Strata.** The exhibit's name, format,
+  acquisition fields (case and evidence numbers, examiner, tool), stored
+  hashes and structural findings were written into the page as markup. A
+  file name such as `<img src=x onerror=...>.vhd`, reachable now that a
+  differencing disk's parent is opened by the name the disk records, executed
+  when the exhibit was selected. Every one of these values is now shown as
+  plain text.
+- **The exhibit details did not show a differencing VHD's parent.** They now
+  list the parent disk and how it was found.
+- **A differencing VHD could read its parent from any file on the machine.**
+  A disk records where its parent lives, and that path was followed. Only the
+  file name it records is used now, and only in the disk's own folder, so a
+  crafted disk cannot make Strata open other files. A symbolic link named
+  like the parent is not followed either, and the refusal says so.
+- **A differencing VHD's refusal did not say which file was at fault, and a
+  wrong file could hide the right one.** A damaged or wrong parent was
+  reported as if the child were damaged; and if one recorded name led to the
+  wrong disk, the correct parent recorded elsewhere in the same disk was never
+  tried. Every recorded name is now tried, and a refusal names each file it
+  rejected and why.
+- **A dynamic VHD read its own footer as disk data when a block ran into
+  it**, and said nothing if a block ended exactly at the file's end. Reads
+  now stop where the footer begins, and a block that would run past that
+  point is reported.
+- **A crafted VHD could use about eleven times its own size in memory just by
+  being opened.** The block table is now stored compactly and read only as far
+  as the disk's size needs.
+- **Adding a differencing VHD to a case that held its parent moved the
+  parent's tags onto the child.** The two show the same volume, but as
+  different states of it, and the parent is still an exhibit. Tags now stay
+  where they are between a disk, its parents and its other children; tags
+  still follow a volume that is re-acquired as an unrelated image.
+- **A case did not record which parent files a differencing VHD was read
+  through.** They are now stored with the exhibit and written to the audit
+  log when it is added and when it is opened.
+- **The refusal for a VHD whose end of file is missing gave outdated advice**
+  ("convert it"). It now says the file is probably truncated or damaged at
+  the end and asks for a complete copy.
+- **One odd event record could stop a whole volume's event logs being
+  merged.** A record whose time was stored as something other than a
+  timestamp made the merge fail for every log on the volume. Such a record
+  now takes the time its log wrote it, and the rest are unaffected.
+- **A single unusual event record made a whole log unreadable.** A provider
+  name stored as a list, or a level written as a character that only looks
+  like a digit, failed the entire log in both the log viewer and the volume
+  timeline, though logs with such records opened before this version. They
+  now read, with no description for an event whose provider is not a name.
+- **An event log larger than 256 MiB was read only in part, without saying
+  so.** Records past that point were missing from the volume timeline. The
+  log's summary now says how much was read and that later records are not
+  included.
+- **The Events tab said "oldest first" above a list that shows the newest
+  first.** The heading now says which.
+- **Opening another case could leave the Notes panel showing the previous
+  case's notes, and Withdraw or Edit then changed a different note in the new
+  case.** Notes are now reloaded whenever a case or image is opened, and every
+  change names the case the note was read from; a request from a page still
+  showing another case is refused and the notes on screen are reloaded.
+- **Notes could not be read or written in a case with no exhibit loaded**, so
+  a new case, or one opened without evidence, showed "No notes" even when it
+  held some. Notes belong to the case and now work there.
+- **Two Strata instances editing the same note at once could split it in
+  two, or lose a withdrawal.** The check and the write now happen under the
+  case database's write lock, so exactly one edit wins.
+- **Another examiner's withdrawal never appeared in your Notes panel until
+  you acted on the note and were refused.** Withdrawals now refresh the
+  panel, and an edit by someone else is no longer announced as "added 1
+  item".
+- **A refresh of the Notes panel discarded an edit in progress.** Your
+  unsaved text now stays where it is; if the note was withdrawn or replaced
+  meanwhile, the text is moved into the new-note box with a message.
+- **A note longer than 20,000 characters was silently cut.** It is now
+  refused, with a message, so a note never records less than its writer
+  wrote.
+- **The report showed an edited note under its creation time**, and lost the
+  line breaks in earlier versions. It now says who wrote the current version
+  and when, and keeps earlier versions' line breaks.
+
+## [0.7.0] - 2026-09-28
+
+Adds a cross-log event timeline with event ID descriptions, attributed case
+notes, and dynamic/differencing VHD support; fixes a real-world NTFS bug
+that could clutter the filesystem tree with tens of thousands of spurious
+entries, several other correctness fixes, and much faster registry and
+bulk-hashing work when the optional native module is installed. Upgrade
+from 0.6.1. A previously cached NTFS filesystem tree is rebuilt the next
+time it is opened; hashes of files with stale content past their valid
+data length change the next time they are hashed (see *Fixed* below);
+nothing else in an existing case needs redoing.
+
+### Added
+
+- **Event logs across a whole volume, on one timeline.** Triage has a new
+  Events tab: every `.evtx` file on the volume is decoded and its records
+  merged in time order, so a logon in Security sits beside the service it
+  installed in System. It can be filtered by event ID, provider, text or
+  log, and each log's record count, time span and any damage are shown. A
+  log that could not be read is listed with the reason, not skipped.
+- **Descriptions for well-known event IDs.** Records show a one-line
+  description (for example "A service was installed", or "An account logged
+  on (logon type 10: remote interactive (Remote Desktop))") from a table
+  bundled with Strata, matched by provider as well as ID. They are Strata's
+  own summaries, not the message text the source machine would show, and an
+  event not in the table is shown without one.
+- **Case notes, attributed to whoever writes them.** A new Notes module
+  keeps notes in the case: each shows who wrote it and when. Editing a note
+  keeps the earlier version, under its own writer's name, and withdrawing a
+  note keeps it on the record marked as withdrawn, so nothing anyone wrote
+  is lost or rewritten. Notes written by another examiner on the same case
+  appear within a few seconds. Adding, editing and withdrawing are recorded
+  in the audit log, and the HTML report has a Case notes section with every
+  version and withdrawal.
+- **Dynamic and differencing VHD disks are read.** Only fixed VHDs opened
+  before; dynamic and differencing ones were refused. A dynamic disk is read
+  through its block allocation table, with blocks never written reading as
+  zeros. A differencing disk reads each sector from itself or from its
+  parent, as the disk's own sector bitmaps say. The parent must be in the
+  same folder, under the file name the disk records; a path recorded in the
+  disk is never followed anywhere else, so a crafted disk cannot make
+  Strata open other files. The disk is refused if the parent is missing or
+  is not the exact disk it was made from. The exhibit's details name the parent and how it was found, and list
+  both files.
+
+### Changed
+
+- **Opening a dirty registry hive is much faster when the optional native
+  module is installed.** Validating a hive's transaction log before
+  replaying it uses Marvin32, Windows' own checksum for the format; done in
+  pure Python this could take the better part of a minute for a large,
+  heavily dirty hive (one with tens of megabytes of unflushed log). The
+  native sidecar from 0.5.1 now covers this too — measured over 500x faster
+  on synthetic data, with byte-identical results. No native module: no
+  change in behaviour, just the same pure-Python speed as before.
+- **Bulk hashing (verify acquisition hashes, or hashing a folder or a whole
+  volume) is much faster when the optional native module is installed.** The
+  fuzzy hash computed alongside MD5/SHA-1/SHA-256 for every file is a
+  per-byte pass that dominated the time on anything but small files — a
+  single 20 MB file could take over ten seconds. The native sidecar now
+  covers it too, measured over 50x faster end to end on synthetic data, with
+  byte-identical results. No native module: no change in behaviour, just
+  the same pure-Python speed as before.
+
+### Fixed
+
+- **Running "Windows event logs" from Run artefacts always failed.** The
+  artefact asked the server for a volume's event logs, but the server only
+  read one log at a time and refused the request. It now reads every event
+  log on the volume (see *Added*).
+- **Entries removed from the end of the audit log went unnoticed.** Deleting
+  the newest entries, or all of them, still verified as intact. The case now
+  records its last entry alongside the log, and each new entry chains from
+  that record, so entries cut from the end are reported as a break (with
+  what is missing) even after more entries have been written. Cases from
+  earlier versions start recording from their next entry.
+- **Two Strata instances on one case folder could break the audit chain.**
+  Both could chain a new entry from the same previous one, which then
+  verified as tampered although nothing had been altered. Writing an entry
+  now takes the case database's write lock first, so entries from any number
+  of instances form one chain.
+
+- **The core sample judged each band of the strip on its first 4 KB.** On
+  a large disk each band covers hundreds of megabytes, so a band that began
+  with zeros and held encrypted data further in was drawn as zeroed. Anything
+  up to 64 MB is now read and classified in full; above that, each band is
+  classified from sixteen reads spread evenly across it. How much was read
+  is shown beneath the strip ("all read", or a percentage, with the detail on
+  hover), and the README now describes what is actually done.
+
+- **Logical partitions on MBR disks were not listed.** Only the four primary
+  entries of an MBR were read, so the volumes in an extended partition (the
+  logical drives on many older Windows and Linux disks) never appeared; the
+  extended partition showed as one volume with no filesystem. The chain of
+  extended boot records is now followed and each logical partition is listed
+  as MBR 5, MBR 6 and so on, and can be opened like any other volume. The
+  extended partition is shown as their container, space inside it that no
+  logical partition uses is shown as unused, and a broken or looping chain is
+  reported as a finding.
+
+- **NTFS and exFAT files returned stale disk content past their valid data
+  length.** A file's valid data length marks where the data it actually
+  wrote ends; Windows reads everything after it as zeros. Strata returned
+  whatever the clusters held there, usually part of an earlier file, as this
+  file's content, so previews, searches, exports and hashes differed from
+  Windows and other tools. Those bytes now read as zeros. The file's details
+  give the valid data length, and the runs still lead to the stale bytes in
+  the hex view. **Hashes of such files change:** hashes stored in a case
+  before this version keep their old values until the files are hashed again.
+
+- **"Hash every file" left out files it could not read, and said nothing.**
+  A file whose content could not be read was dropped from the results, and
+  the count of hashed files gave no sign of it. Such files are now listed
+  under "not hashed" with the reason, counted in the summary, and recorded in
+  the audit log as `hash.failed`.
+- **Hashing a very large file could run out of memory.** Each file was read
+  whole before it was hashed. Files are now read and hashed 4 MB at a time,
+  so memory use no longer depends on file size. The digests, including the
+  fuzzy hash, are unchanged.
+
+- **Regular-expression searches never looked at UTF-16LE text.** With Regex
+  ticked, the encoding boxes were ignored and only single-byte text was
+  searched, in raw media and in file contents alike, while the empty-result
+  hint still suggested ticking UTF-16LE. A regex is now matched against
+  UTF-16LE text too (at either byte alignment) when that box is ticked, and
+  each hit says which encoding it was found in.
+- **A raw search that reached its 5,000-hit limit stopped without saying
+  so.** It now says the limit was reached and gives the offset up to which
+  the results are complete. Terms later in the list are no longer the ones
+  that lose out when the limit is reached.
+
+- **A FAT file could be listed under another file's long name.** Long-name
+  entries left behind by a deleted file were attached to whatever short entry
+  followed them, so a live `B.TXT` could appear as the deleted file's long
+  name. Long names are now attached only when their checksum matches the
+  short name they were written for; one that doesn't is not shown against
+  any file.
+
+- **A single raw file with a numeric extension was reported as an incomplete
+  split set.** Opening `capture.2024` on its own said piece `capture.0001` was
+  missing and that the image started partway through a disk. With no other
+  piece beside it, the finding now says only that the file is named like a
+  piece and is read as a single image.
+
+- **`--browser` opened the browser before the interface was listening**, so
+  a fast browser could show "connection refused". It now opens once the port
+  is accepting connections, and it also works with `--host 0.0.0.0` (it opens
+  the interface on loopback). `--help` now describes the program and no
+  longer lists Ex01, which is not read. `--read-only` is in the README.
+
+- **A search for several terms lost hits where two terms matched at the same
+  place.** Searching raw media for `pass` and `password` together reported
+  only the `pass` hit wherever `password` appeared, so the longer term's hits
+  were missing from the results and the saved search. Every term's hit is now
+  kept.
+- **Sparse NTFS files whose holes were larger than the volume read back
+  empty.** A hole in a sparse file takes no space on disk and can span more
+  clusters than the volume holds, but it was treated as a damaged run: the
+  file's content after it was dropped and a finding wrongly said the run list
+  was corrupt. Holes are now read as zeros whatever their length; a run that
+  occupies clusters is still checked against the volume.
+- **NTFS: a file whose attributes overflowed into another MFT record was
+  also listed as a bogus file of its own**, named `<record number>` since it
+  has no `$FILE_NAME`, cluttering the root of the filesystem tree. This
+  happens for any file with an `$ATTRIBUTE_LIST` — heavily fragmented files,
+  ones with many alternate data streams, or (what turned up the bug) a
+  volume with enough files that its own directories need one. Found on a
+  real multi-hundred-gigabyte NTFS volume, where it produced tens of
+  thousands of spurious entries. A previously cached filesystem tree is
+  rebuilt the next time it is opened.
+
+## [0.6.1] - 2026-09-28
+
+Adds reading of ANSI (32-bit) PST files and corrects how PST files that use
+the cyclic ("high") encoding are decoded, which was wrong for Unicode files
+as well. Upgrade from 0.6.0. A Mail result saved by 0.6.0 is discarded the
+next time the exhibit's saved results are loaded (recorded in the audit log
+as `artefact.reset`) and must be run again, since it listed such stores as
+unreadable or decoded them wrongly; nothing else in an existing case needs
+redoing.
+
+### Added
+
+- **ANSI (32-bit) PST files are read.** These are the files Outlook 97 to 2002
+  wrote; they were refused outright. Folders, messages, attachment names and
+  content now come out the same as for a Unicode PST. Text in an ANSI file is
+  stored in a code page, so it is decoded with the code page each message
+  declares, or Windows-1252 where none is given, and the file's finding says
+  so. Checked against the published layouts and synthetic files only: no real
+  ANSI file has been tried yet, so corroborate results with another tool.
+
+### Fixed
+
+- **PST files using cyclic encoding were read as garbage.** The "high
+  encryption" method used a different calculation from the published one, so
+  every block in such a file decoded wrongly. It now follows the published
+  algorithm.
+- **A damaged PST could crash the mail listing.** A folder name of the wrong
+  type, or a B-tree entry too short to hold its fields, raised an error
+  instead of being skipped. Found by fuzzing, which now covers PST files of
+  both formats.
+
+## [0.6.0] - 2026-09-26
+
+Adds the reader for the browser cache that Chrome and Edge on Windows
+actually write, so the Browser view now lists cached pages there. Upgrade
+from 0.5.1. A Browser result saved by 0.5.1 is discarded the next time the
+exhibit's saved results are loaded (recorded in the audit log as
+`artefact.reset`) and must be run again, since it reported those cache
+files as not parsed; nothing else in an existing case needs redoing.
+
+### Added
+
+- **Chromium blockfile cache.** The `data_0`–`data_3` and `f_XXXXXX` cache that
+  Chrome and Edge on Windows write for web content is now read: URL, status,
+  content type, body size, when it was fetched, created and last used, and how
+  often it was refetched. Entries are found by reading the cache files
+  themselves rather than the index, so ones the browser has already dropped
+  (doomed, evicted, or in freed blocks) are listed too and marked as such.
+  Only response headers and metadata are read, not cached bodies. Checked
+  against real Chrome and Edge caches of known content. A Browser result saved
+  by an earlier version is discarded and must be run again
+  (recorded in the audit log as `artefact.reset`).
+
+### Fixed
+
+- **Cache status codes.** A cached response whose headers contained the text
+  `HTTP/` (for example `Server: BaseHTTP/0.6`) showed no status. The status is
+  now always taken from the status line.
+
+## [0.5.1] - 2026-09-25
+
+A fix release for the legacy Office and browser-cache readers shipped in
+0.5.0, which were checked against real files for the first time and
+corrected, plus an optional native crypto module for much faster
+encrypted-volume work. Upgrade from 0.5.0. A Browser result saved by 0.5.0
+is discarded the next time the exhibit's saved results are loaded
+(recorded in the audit log as `artefact.reset`) and must be run again,
+since it listed script bytecode and unusable addresses as cached pages;
+nothing else in an existing case needs redoing.
+
+### Changed
+
+- **Encrypted-volume unlock and reading are much faster when the optional
+  native crypto module is installed.** Each release carries it as a
+  separate download, `strata-native-<version>.zip`; extract it into the
+  Strata folder and it is used automatically. Unlocking a LUKS2 volume
+  with heavy key-derivation settings drops from over a minute to a
+  fraction of a second, and decrypted reads from LUKS2 and BitLocker
+  images go from under 1 MB/s to tens of MB/s (measured on a 64 MiB
+  image). Results are byte-identical to the built-in implementation, which
+  is kept and used whenever the module is absent. The module checks
+  itself against published test vectors (Argon2id, AES-CBC and AES-XTS)
+  when it loads, and is not used if any of them fails.
+
+### Fixed
+
+- **Text from legacy Excel and PowerPoint files is now read correctly on
+  real-world files, not only simple ones.** The 0.5.0 readers were checked
+  against 244 files written by real Office and four faults were found and
+  fixed. An Excel workbook whose string table held any rich-text or
+  East Asian phonetic string came out as binary garbage from that string
+  onward; those strings are now skipped over correctly, and text missing
+  from the sample fell from 48% of cells to 12% (the rest is cell types not
+  read yet, chiefly formula results). Sheets now carry their real names
+  instead of "sheet 1", "sheet 2". A sheet record cut short no longer
+  discards the whole workbook's properties. In PowerPoint only the first
+  nested shape group on each slide was visited, so most decks yielded no
+  text; slides with text now yield it (60 of 106 decks, up from 10, the
+  rest having no slide text), and an unused slot in the file's index no
+  longer raises a spurious finding.
+- **Text from legacy Word files is cleaner and better attributed.** Checked
+  against 144 real Word files. A file that holds both a `0Table` and a
+  `1Table` stream now reads the one its header names, instead of whichever
+  came first (which gave no text at all for the files where it was the
+  stale one). Smart quotes, dashes and the ellipsis in 8-bit text now come
+  out as those characters instead of raw control codes. A field now shows
+  what Word displays, its result, and no longer prints its instruction
+  (`HYPERLINK "…"`, `PAGE`, `FORMTEXT`) in the middle of the sentence;
+  line breaks become line breaks and picture and footnote anchors are
+  dropped, so no control characters reach the text. Text that lives in
+  footnotes, headers and footers, comments, endnotes and text boxes is
+  now listed as its own part instead of run on after the body (38 of 113
+  files had such parts). Files whose words match an independent reader's
+  exactly went from 41 to 67 (of about 93 compared).
+- **Chromium cache listings no longer include script bytecode or show
+  meaningless URLs.** The browser's compiled-script cache (`Code Cache`)
+  uses the same file formats as its web cache and was being listed as
+  cached pages; it is now left out. A cached page's address is now read
+  from the entry's key the way Chromium reads it, so entries stored in a
+  partitioned cache show the page's own address, and an entry whose key is
+  not an address at all (the service worker script cache uses plain
+  numbers) is shown with no URL and a note instead of a number posing as
+  one. The raw key is kept alongside.
+
+## [0.5.0] - 2026-09-25
+
+A feature release: shadow copies and APFS snapshots can be opened and
+browsed, two volumes (or a volume and one of its snapshots) can be diffed
+per path, tags follow a volume re-acquired into another image, the body
+text of legacy Word, Excel and PowerPoint files is read, and browser disk
+caches are read alongside browser history. Upgrade from 0.4.0. A Browser
+result saved by an earlier version is marked stale until it is run again,
+since it has no cache entries; nothing else in an existing case needs
+redoing, and an earlier version can still open a case this one has used.
+
+### Added
+
+- **Volume Shadow Copies can now be opened, not just listed.** Where an
+  exhibit holds shadow copies, Strata shows each snapshot in the Shadow
+  Copies pane with an Open button; opening one browses that snapshot's
+  files and folders as a filesystem in its own right, reading through the
+  block-redirect overlay to the differential store where a changed block
+  was copied and falling through to the base volume where it was not.
+  Hex, preview, export and folder export all read snapshot content, and
+  the snapshot context is labelled throughout so results are never
+  confused with the live volume
+  ([#49](https://github.com/switch-nz/strata/issues/49)).
+- **APFS snapshots can be listed and opened read-only.** On an APFS volume
+  that has snapshots, a Snapshots list now shows each snapshot's name,
+  creation time and transaction identifier, and a snapshot can be opened as a
+  read-only view of the volume as it was at that point — files as they were,
+  including ones later deleted or overwritten. A snapshot whose file contents
+  were removed when the snapshot was made is reported as dataless and cannot
+  be opened
+  ([#51](https://github.com/switch-nz/strata/issues/51)).
+- **Two volumes can be diffed, per path.** A new Diff tab picks any two
+  loaded exhibits (or a volume and one of its own shadow-copy snapshots)
+  and lists what was added, removed and changed between them — compared
+  by path, with size and timestamps per side. Node numbers are ignored:
+  the same volume acquired twice does not report every file as changed
+  just because its MFT records moved. Snapshot reads come straight from
+  the shadow-copy store, layered over the live volume
+  ([#74](https://github.com/switch-nz/strata/issues/74)).
+- **Tags follow a volume when it is re-acquired into another image.** Tags
+  are keyed to the filesystem handle of the file they name, which is stable
+  only within one image, so the same volume imaged again arrived with its
+  tags left behind on the old exhibit. Each detected volume now records its
+  filesystem's own identifier — an NTFS or exFAT serial, an ext4 or APFS
+  UUID — and when a volume the case has seen before is acquired, its tags
+  move to the new exhibit. A volume whose identifier matches several the
+  case already holds is reported rather than guessed
+  ([#82](https://github.com/switch-nz/strata/issues/82)).
+- **Word documents in the legacy binary .doc format now yield their body
+  text instead of nothing.** A .doc is a compound file whose text lives
+  in the piece table named by the File Information Block, and until now
+  Strata offered no text from it rather than text that might be wrong.
+  The text is now decoded by following compressed (8-bit) and UTF-16
+  pieces in document order, with carriage returns, form feeds and
+  paragraph marks mapped to newlines. Whatever cannot be proven from the
+  file is reported as a finding with the reason, and only text the
+  format itself supports is offered
+  ([#62](https://github.com/switch-nz/strata/issues/62)).
+- **Excel workbooks in the legacy binary .xls format now yield their body
+  text instead of nothing.** An .xls is a compound file whose text lives
+  in the BIFF record stream, and until now Strata offered no text from
+  it rather than text that might be wrong. The text is now decoded from
+  the shared-string table and each sheet's cell records, laid out per
+  sheet as the application shows them. Whatever cannot be proven from
+  the file is reported as a finding with the reason, and only text the
+  format itself supports is offered
+  ([#62](https://github.com/switch-nz/strata/issues/62)).
+- **PowerPoint presentations in the legacy binary .ppt format now yield
+  their body text instead of nothing.** A .ppt is a compound file whose
+  text lives in the slide records, and until now Strata offered no text
+  from it rather than text that might be wrong. The text is now decoded
+  via the Current User stream's edit history and the persist directory
+  it points at, reading the newest edit of each slide so superseded text
+  is not presented alongside the final one. Whatever cannot be proven
+  from the file is reported as a finding with the reason, and only text
+  the format itself supports is offered
+  ([#62](https://github.com/switch-nz/strata/issues/62)).
+- **Browser disk caches are now read alongside browser history.** Running
+  the Browser artefact on a volume lists the cached pages, not just the
+  visited ones: each Chromium Simple Cache entry and Firefox cache2 entry
+  shows its URL, HTTP status, content type, last-modified and last-fetched
+  times and fetch count, under a Cache category for each browser profile.
+  The Chromium index and the older blockfile cache (`data_0`–`data_4`,
+  `f_XXXXXX`) are recognised and counted but not parsed, and an entry too
+  damaged to read is counted and reported rather than shown with guessed
+  values.
+
+## [0.4.0] - 2026-09-24
+
+A feature release: split raw sets from FTK Imager, Guymager and `split`
+open as one exhibit; BitLocker volumes with a clear-key or startup-key
+protector unlock; and case folders are much smaller and indexed search much
+faster, with a compressed content index, timelines that store each path
+once, and a text extractor that finds UTF-16 text in any script without
+indexing binary as text. Upgrade from 0.3.0. An existing content index is
+converted when its case is opened, after which earlier versions cannot use
+it; rebuild the index and timeline to get the new extractor and the smaller
+timeline.
+
+### Added
+
+- **Split raw sets written by FTK Imager, Guymager and `dd` with `split`
+  now open as one exhibit.** Only three-digit `.001`/`.002` naming was
+  joined before, so a set numbered any other way opened as its first piece
+  alone — a whole disk presented as a few gigabytes of it, with nothing on
+  screen to say so. Guymager's `.0000` numbering (which widens for a disk
+  needing more than 999 pieces), `split`'s default `.aa`/`.ab` suffixes and
+  its `-d` numeric ones are now recognised alongside FTK Imager's `.001`,
+  and a missing, wrongly sized or mixed-width piece raises a finding that
+  names the piece the way that set numbers it. An image summary or info
+  file sitting beside the pieces is not mistaken for one
+  ([#45](https://github.com/switch-nz/strata/issues/45)).
+- **A BitLocker volume with a clear-key or startup-key (.BEK) protector can
+  now be unlocked.** Both protector types were already recognised but
+  unusable: a clear-key protector — the volume left effectively
+  unprotected, usually mid-encryption or with protection suspended — could
+  never be tried because the unlock request always demanded a non-empty
+  secret first, and a startup key was matched against the wrong on-disk
+  protector-type value (`0x0002` instead of the real `0x0200`, confirmed
+  against the published BitLocker format specification and cross-checked
+  independently), so a real `.BEK`-protected volume never matched at all.
+  A clear-key volume now unlocks with one click and no secret; a
+  startup-key volume unlocks by pointing at its `.BEK` file
+  ([#53](https://github.com/switch-nz/strata/issues/53)).
+- **Compact** in the Cases view gives back disk space left by deleted and
+  replaced work: it merges the content index and rewrites the case databases.
+  Nothing recorded changes, and the audit log records the size before and
+  after. It refuses, and changes nothing, when the disk has no room for the
+  rewrite.
+
+### Changed
+
+- **The content index keeps its text compressed, and indexed search is much
+  faster.** Each document's text is now stored once, zlib-compressed, instead
+  of as a second uncompressed copy inside the search index, which typically
+  makes the index about a third smaller. Searches find exactly the same hits
+  in the same order. They are faster because a snippet is now cut from each
+  hit's text only as far as the first place a term occurs, where before the
+  whole of every matching document was re-read — a search whose hits include
+  large files goes from tens of seconds to a few — and because counting what
+  is indexed no longer reads every document (seconds, twice before every
+  search, now instant). A snippet shows the passage around the first
+  occurrence of a term; before, it could be a later passage FTS5 scored
+  higher. An existing
+  index is converted when its case is opened, and stays searchable until it
+  is. Once converted, an earlier version of Strata cannot use the index: it
+  reports that there is no index, and building one fails with "no such
+  function: inflate". Nothing is damaged by trying. To go back to an earlier
+  version, delete `cache/content-index.sqlite` in the case folder and build
+  the index again there — it is derived entirely from the evidence.
+- **Timelines take much less disk space.** A timeline stored every file's
+  full path and name again on each of its events, and once more in its sort
+  index; each is now stored once per file. The timeline shows the same
+  events in the same order, and pages and filters at least as quickly. A
+  timeline built by an earlier version is still read as it is, and takes
+  the smaller form when it is next rebuilt.
+- **Indexed text in scripts other than Latin is found more reliably, and
+  binary noise no longer fills the index.** Text stored as UTF-16 is now
+  found wherever it starts — before, a string beginning on an odd byte was
+  missed entirely — in any script, including Chinese, Japanese, Korean,
+  Cyrillic, Greek, Arabic, Hebrew, Devanagari and Thai. At the same time the
+  extractor no longer keeps the plausible-looking characters that binary
+  data, and text read one byte out of step, decode to: most of the non-Latin
+  text in an index built before this was of that kind. ASCII text is found
+  exactly as before. What is not caught is a random run of Chinese
+  characters or Hangul, which cannot be told from real text without knowing
+  which characters are common. Extracting text from a file takes a little
+  longer, since it is read at both byte alignments, but with far less text
+  to index, building an index is faster overall and the index is smaller.
+  An index built before this keeps its text until it is rebuilt.
+- **A full index keeps at most 8 MB of text from any one file.** Every byte is
+  still read, but program binaries, browser cache blocks and `$MFT` produced
+  tens of megabytes of text each, and the index over that text roughly
+  doubled its size again. Files that reach the limit are counted and named
+  as a finding, so what is not searchable is stated.
+
+### Fixed
+
+- **The content index now moves out of older case records.** Cases indexed
+  before the index lived in the cache folder were meant to move it there when
+  opened, but the request never reached the engine, so the whole index
+  stayed inside `case.sqlite` and every rebuild added to it, taking the case
+  record to many gigabytes. When the disk has no room for the move it is now
+  deferred and recorded in the audit log, and a move that fails part way is
+  recorded rather than dropped.
+- **Removing an exhibit no longer leaves its timeline behind.** On Windows a
+  timeline that was briefly open could not be deleted and was silently kept;
+  deletion now retries, and opening a case removes derived files (timelines,
+  directory caches) belonging to exhibits no longer in it, recorded in the
+  audit log as `cache.swept`.
+- Background tasks can be followed with a case open and no evidence loaded.
+
+## [0.3.0] - 2026-09-23
+
+A feature release: a read-only mode for exports and reports, fixed VHD
+image support, Apple extended-attribute decoding on APFS and HFS+, ATT&CK
+technique attribution for artefact rows, a confirmation before re-running
+an artefact collector, and fragmented-file carving across a single gap.
+Upgrade from 0.2.0.
+
+### Added
+
+- **A `--read-only` startup flag refuses export and report writing for the
+  whole session.** With it set, every export route (single file, a whole
+  folder, a raw byte range, the export manifest) and writing the HTML
+  examination report are refused server-side with a clear error, whether
+  the request comes from the interface or straight at the API — a denied
+  attempt is recorded in the case's audit log the same as any other
+  action. The matching interface controls (Export, Export and add,
+  Export bytes, the Report button, the tagged-items export button) are
+  hidden or disabled rather than left to fail silently. Nothing else
+  changes: opening evidence, examining it, and writing to the case
+  itself (tags, bookmarks, notes) are unaffected, and the flag defaults
+  off ([#70](https://github.com/switch-nz/strata/issues/70)).
+- **A fixed VHD (Virtual PC / Hyper-V, the Conectix footer format) now opens
+  directly.** Its 512-byte footer is read from the end of the file and
+  excluded from the exposed disk, so what is shown, hashed and carved is the
+  virtual disk only, not the footer appended after it. A dynamic or
+  differencing VHD is recognised from the same footer and refused by name,
+  as before; a footer that fails its own checksum, or names a disk type
+  this reader does not know, is refused rather than guessed at
+  ([#46](https://github.com/switch-nz/strata/issues/46), fixed VHD only —
+  dynamic and differencing VHD, and VHDX, remain out of scope here).
+- **Extended attributes on APFS and HFS+ files are now decoded, not just
+  listed.** APFS already walked a file's extended attributes but discarded
+  their value, and HFS+ located the Attributes fork without ever opening
+  it, so neither surfaced anything beyond an attribute's name and size.
+  Both now read the value when it's stored inline, and decode the two most
+  examination-relevant ones: `com.apple.quarantine` (Gatekeeper's download
+  flag — agent, timestamp, event id) and
+  `com.apple.metadata:kMDItemWhereFroms` (the URL a file was downloaded
+  from, and often the page that linked to it). The file inspector's
+  Extended Attributes section shows the decoded fields alongside the raw
+  value, and notes plainly when a large, fork-based attribute's content
+  wasn't captured.
+- **A ShimCache entry (or any artefact row) can now be attributed to an
+  ATT&CK technique, and that attribution shows in the report.** ATT&CK
+  attribution existed only for tagged files; an artefact row like a
+  ShimCache entry has no filesystem handle to tag, so there was no way
+  to attribute one at all, and the report's ATT&CK section stayed
+  empty for it. Right-clicking a ShimCache entry now offers "Attribute
+  ATT&CK technique…", using the same picker and suggested-techniques
+  catalogue tagging a file already has; the attribution appears in the
+  ATT&CK tab and the report exactly as a file's would
+  ([#63](https://github.com/switch-nz/strata/issues/63), the report
+  half — the on-screen "examined, not run" caveat shipped earlier).
+- **Re-running an artefact collector now asks first if it already has a
+  result for that evidence item.** `save_artefact` replaces the earlier
+  row silently, which is fine on a first pass and wrong once an examiner
+  has worked from the earlier output. Running one again from the Run
+  Artefacts picker now confirms first when a result already exists,
+  and does nothing if declined
+  ([#71](https://github.com/switch-nz/strata/issues/71)).
+- **Carving now recovers a fragmented file split by exactly one gap of
+  other data, for footer-terminated types.** A signature carver reads
+  forward in a straight line, so a deleted file whose two fragments were
+  separated by other data that later filled the space between them
+  either carved with that unrelated data spliced into the middle, or
+  missed the file entirely. When a header and its footer (PNG, JPEG,
+  GIF, PDF, ZIP) are separated by exactly one still-allocated extent,
+  the hit is now split into two fragments around it; exporting or
+  marking it reads and concatenates the real fragments, skipping the
+  gap, with a "fragmented" flag and a note on how many bytes were
+  excluded. Two or more gaps, or a gap too close to the header or
+  footer to leave room for it, are left as before, unsplit
+  ([#66](https://github.com/switch-nz/strata/issues/66), two-fragment
+  gap carving of footer-terminated types only).
+
+## [0.2.0] - 2026-09-19
+
+A feature and correctness release: fuzzy hashing and a Find Similar report,
+LUKS2 Argon2 unlock, split raw sets, and PST attachment content, alongside a
+large batch of parser correctness fixes across ext4, exFAT, FAT, EWF, AD1,
+VMDK and the registry that closes out #19 in full. Upgrade from 0.1.2.
+
+### Added
+
+- **A fuzzy hash is now computed alongside MD5, SHA-1 and SHA-256, and a
+  "Find similar" report groups files that are alike rather than
+  identical.** Only exact-digest matches could ever be found before, so an
+  edited or partially-overwritten copy of a file shared nothing with the
+  original. Every hash run now also produces a ssdeep-compatible
+  context-triggered piecewise hash; "Find similar" on the Hashes tab scores
+  every pair of already-hashed files across evidence items and reports
+  those above a similarity threshold, alongside the existing exact-digest
+  "Find duplicates" ([#65](https://github.com/switch-nz/strata/issues/65),
+  fuzzy hashing only; image similarity remains open — it needs pixel-level
+  image decoding this codebase does not otherwise have a reason to carry).
+- **Gallery thumbnails no longer load the full-size image for every
+  picture.** A photo's own embedded EXIF thumbnail — what most camera
+  and phone photos already carry, typically a few KB against a
+  multi-MB original — is used when present. An image with no embedded
+  thumbnail (a screenshot, a thumbnail-less JPEG) falls back to the
+  full-size read exactly as before; nothing is invented for it
+  ([#80](https://github.com/switch-nz/strata/issues/80)).
+- **The Run Artefacts picker now hints at what is actually there before
+  you run anything.** Recycle Bin, Prefetch and browser-profile presence
+  are checked with one or two directory reads each — no parsing, no
+  filesystem walk — and shown as "12 items found" / "3 .pf files found" /
+  "2 browser profiles found" next to the matching row, so a full scan is
+  a choice rather than a guess.
+- **ext4 extended attributes beyond the inline file-data one are now
+  read.** Only the in-inode `system.data` attribute (inline file content
+  kept in the same entry format) was read; every other attribute — other
+  in-inode entries, and anything in an external xattr block reached via
+  `i_file_acl` — was invisible. Every attribute is now listed with its
+  namespace prefix and value, size-capped, in the file inspector
+  ([#52](https://github.com/switch-nz/strata/issues/52)).
+- **A duplicate-files report finds a digest seen under more than one
+  evidence item.** Digests were cached per file but never compared across
+  evidence items, so a file appearing in two exhibits went unnoticed. "Find
+  duplicates" on the Hashes tab groups files by digest and shows every
+  exhibit and path that shares one — only among files a hash run has
+  already covered, since nothing here hashes a file just to compare it
+  ([#67](https://github.com/switch-nz/strata/issues/67)).
+
+- **A PST attachment's content can now be viewed, not only its name and
+  size.** The mail viewer listed every attachment's filename and size but
+  had no way to read what was inside one. Clicking an attachment now
+  fetches and decodes it on demand — shown inline for an image, as text
+  for anything readable, or noted as binary of a given size and type
+  otherwise — without decoding every attachment in every message up front
+  ([#61](https://github.com/switch-nz/strata/issues/61), attachment
+  content only; ANSI PST files and OST-specific structures remain open).
+- **Hash-set matches now show in the folder and search views, not only in
+  the hash run.** A file already hashed (in this or an earlier run) whose
+  digest is in an imported hash set is flagged directly where it is found —
+  the folder listing and a file-content or file-name search — instead of
+  only in the Hash tab's own results
+  ([#60](https://github.com/switch-nz/strata/issues/60)).
+- **A registry value over 2 KB can now be fetched in full.** It was shown
+  in the interface as its size only, with nothing behind it — the parser
+  reads the full value already, the interface just had no way to ask for
+  it. A "load" affordance on such a value now fetches and decodes it in
+  full ([#79](https://github.com/switch-nz/strata/issues/79)).
+- **Split raw sets** (`.001`, `.002`, …, or numbered from `.000`) are opened
+  as one disk. Previously opening the first piece read that piece alone, with
+  nothing to say the rest of the disk was missing. The set is joined whichever
+  piece is opened. A missing piece is reported, and only the pieces before
+  the gap are joined. A piece opened on its own because an earlier one is
+  missing is reported as starting partway through the disk. A piece whose
+  size differs from the others is reported, since data after it may be at the
+  wrong offset ([#19](https://github.com/switch-nz/strata/issues/19)).
+
+- **LUKS2 volumes with Argon2 keyslots unlock by password.** Argon2d,
+  Argon2i and Argon2id (RFC 9106) are implemented in Python from the RFC's
+  test vectors, so a LUKS2 volume whose keyslots use Argon2 now opens where
+  it was previously refused. The derived key is cached per slot for the
+  session, so reopening the volume does not pay the derivation cost again.
+  Note that Argon2 key derivation in Python is slow: deriving a key with
+  typical parameters (64 MiB, 3 passes) takes on the order of tens of
+  seconds per attempt, and a progress bar shows the work.
+
+### Changed
+
+- **Building the content index no longer walks the whole tree into memory
+  before indexing the first file.** Each file is now read and indexed as
+  the walk reaches it. On a large collection this was measured at
+  roughly 500 bytes and 8 µs per entry regardless of content size — about
+  2.5 GB and 40+ seconds of walking alone at the 5,000,000-entry ceiling,
+  before a single file was read ([#81](https://github.com/switch-nz/strata/issues/81)).
+- **Scrubbing a large video or image no longer re-reads the whole file
+  for every Range request.** `/api/file` read the file again, up to its
+  256 MB stream cap, on each request; it now seeks directly to the
+  requested bytes where the filesystem supports it, or reuses a small
+  file's already-read content for the rest of the session, the same way
+  the hex view already does
+  ([#78](https://github.com/switch-nz/strata/issues/78)).
+- **Times recorded with no time zone are no longer shown as UTC.** FAT
+  timestamps, the DOS times inside shellbags, and exFAT timestamps whose
+  entry records no valid UTC offset are local time on a clock whose zone the
+  media does not say. They were marked and displayed as UTC, and converted to
+  the chosen display zone as if they were. They are now shown exactly as
+  recorded, with no zone, no conversion and no label, in the interface and
+  the report. Deciding which zone they belong to is left to the examiner.
+  The timeline still has to place them somewhere to sort them, and orders
+  them as if they were UTC ([#19](https://github.com/switch-nz/strata/issues/19)).
+
+### Fixed
+- **A ShimCache entry proves a file was examined, not that it ran — but
+  nothing said so next to the results.** The distinction was stated only in
+  a help string shown before collection ran. It's now a standing note on
+  the results themselves whenever any ShimCache entries are found
+  ([#63](https://github.com/switch-nz/strata/issues/63)).
+- Opening a tagged, deleted, contiguous exFAT file from the Tags panel (not
+  exporting it — viewing it) could show the wrong content, for the same
+  reason #94 fixed for export: the entry built for the hex view carried
+  `deleted` but not `contiguous`. Both now travel with it.
+- **The mail viewer crashed on a PST message with a sender or recipient.**
+  PST gives a single formatted address string per field where mbox gives a
+  list, and the viewer assumed every message used mbox's shape, so any PST
+  message with a `From` or `To` failed to render at all. Both shapes are
+  now handled.
+- **A message's body was never shown.** mbox and PST both decode a
+  message's text server-side already, but the mail viewer only ever listed
+  headers — clicking a message did nothing. A message can now be opened to
+  read its plain-text body (or, for an HTML-only message, its visible text
+  with the markup stripped out — never rendered as HTML) and its attachment
+  names
+  ([#93](https://github.com/switch-nz/strata/issues/93)).
+- **A tagged, deleted, contiguous exFAT file could export the wrong content.**
+  exFAT reads a NoFatChain stream by its extent, not by walking the FAT —
+  the same fix #91 made for FAT and ext4's `deleted` flag, but keyed on a
+  different field this format never carried through a tag. Tagged items now
+  record whether an exFAT stream is contiguous, so re-exporting one by
+  handle alone reads it the way it needs to be read
+  ([#94](https://github.com/switch-nz/strata/issues/94)).
+- A damaged AD1's chunk size, if implausible, is no longer trusted for how
+  much to allocate when a chunk fails to decompress; a header cut short
+  before its own declared fields end is now refused instead of raising an
+  unhandled error. A rejected AD1 no longer leaves its files held open,
+  which on Windows kept them locked.
+- A contiguous exFAT stream no longer builds one list entry per cluster to
+  find its extent. A corrupted stream length on a large genuine volume could
+  ask for hundreds of millions of entries, which was slow enough to look like
+  a hang; the extent is now computed directly, regardless of its length
+  ([#43](https://github.com/switch-nz/strata/issues/43)).
+- **Exporting a tagged deleted file could silently export the wrong content.**
+  "Export tagged items" sends a filesystem handle rather than a full listing
+  entry, and the flag saying an item is deleted did not make the trip. A
+  deleted file was then read as if it were live: on FAT this returned only
+  its first cluster for anything spanning more than one, and on ext4 an
+  unlinked inode whose blocks were already cleared exported as empty instead
+  of recovering from the journal. Deleted status, and the modified/accessed/
+  created times already recorded for the tag, now travel with the export, so
+  the manifest is complete and the content is read the way a deleted entry
+  needs to be
+  ([#85](https://github.com/switch-nz/strata/issues/85)).
+- **Previewing a case no longer writes to it.** Opening a case to peek at
+  it — the case picker in the Open dialog — upgraded old schemas, created a
+  `cache/` folder with an empty content index in it, and could add audit
+  entries to the case record before anything was opened. On a read-only
+  archive folder this made preview fail outright with a permission error.
+  A preview is now read-only end to end: it changes nothing in the case
+  folder, and a case there that predates some tables or columns is served
+  as-is and left for the next full open to upgrade.
+
+- **Sparse ext4 files read back wrong.** Where a file had a hole — a range
+  never written, which reads as zeros — the data after the hole was shifted
+  back into it and the end of the file was missing, so both the content and
+  its hash were wrong. Holes now read as zeros in place, including a hole at
+  the end of a file
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- **A truncated compressed chunk in an E01 was returned short, silently.**
+  The part that did decompress was served as if it were the whole chunk, with
+  no finding, and a read running across that chunk stopped there, so the rest
+  of the image could not be read in that pass. Such a chunk is now reported,
+  what decompressed is kept, and the missing remainder reads as zeros so
+  everything after it stays at the right offset. A chunk whose compressed data
+  is complete but missing its checksum is reported as unverified
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- **Deleted FAT long filenames were assembled out of order.** A deleted file
+  whose long name spans more than one directory entry was shown with the
+  pieces in the wrong order — `Removed document.txt` appeared as
+  `ent.txtRemoved docum`. The pieces are now joined in the order they belong
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- **Slack for a deleted FAT file larger than one cluster was reported inside
+  the file.** Deletion frees the file's cluster chain, and slack was worked
+  out from that freed chain, so it pointed into the file's own content rather
+  than past its end; the file's runs likewise showed only its first cluster.
+  Both now follow the clusters the recovered content is read from. Where
+  those clusters run off the end of the volume, or a live file's chain is
+  broken short, no slack is reported, since where the file ends is unknown
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- **Files in an exFAT directory spanning several clusters could be missing.**
+  A directory whose clusters are stored contiguously, without a FAT chain,
+  was listed from its first cluster only, so anything recorded in its later
+  clusters was not shown, searched or put on the timeline. Such a directory
+  is now read in full
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- **ext4 inline files over 60 bytes, and inline directories, were misread.**
+  With inline data, a small file or directory is kept inside its inode: the
+  first 60 bytes in the block map and the rest in an extended attribute.
+  Content past 60 bytes was taken from the wrong part of the inode, so the
+  file read back wrong and hashed wrong, and an inline directory's entries
+  were not listed. Both are now read from where ext4 stores them
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- **A file beside an E01 could stop the image opening.** Any file with the
+  same name and a three-letter extension, such as `case.txt` next to
+  `case.E01`, was taken as one of the image's segments. A lettered name only
+  counts as a segment now once the set reaches `.E99`, the point where EWF
+  moves on to lettered names, and only if the file is an EWF segment
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- A damaged ext4 extent tree whose index points back at itself, or at one
+  node many times over, no longer hangs reading a file. Each node is read
+  once, and a node at the wrong depth is ignored
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- A registry hive cut short no longer raises an error. One ending inside its
+  base block opens with a finding that it holds no keys. Recovering deleted
+  keys and values from one cut short part-way through its data stops at the
+  end of what is there
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- **A truncated or damaged chunk in an AD1 file shifted every chunk after
+  it.** AD1 stores a file's content in fixed-size compressed chunks, and a
+  chunk that decompressed to less than its full size, or not at all, was
+  appended as-is or served as its own raw compressed bytes, so every later
+  chunk's data landed at the wrong offset, and hashing carried the same
+  fault. Each chunk now keeps its own place: a chunk that could not be fully
+  recovered is reported and the gap reads as zeros, without moving anything
+  after it
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- **A damaged or hostile VMDK could hang or exhaust memory opening it.** A
+  handful of header and grain-table fields — the descriptor's location, the
+  grain size, the number of entries per grain table, and a compressed
+  grain's declared size — were trusted outright. An implausible value in any
+  of them could seek or allocate by that value directly, which crashed the
+  open, exhausted memory, or in one case made every read across the disk
+  slow enough to stall an examination. Each is now checked against what the
+  file could plausibly hold; an extent whose layout is genuinely implausible
+  is refused, and a field that only overruns the file is clipped and
+  reported. A grain whose compressed data ends early is now also reported,
+  rather than silently read as if it were complete
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+
+### Known issues
+
+The known issues listed for 0.1.2 are resolved:
+[#19](https://github.com/switch-nz/strata/issues/19) is closed, including
+the two registry crashes on truncated hives it was tracking.
+
+## [0.1.2] - 2026-09-17
+
+A correctness release: exFAT timestamps, and damaged ext, NTFS and exFAT
+volumes that could stop an examination. Upgrade from 0.1.1.
+
+### Fixed
+
+- exFAT timestamps were shifted by the time zone of the device that wrote
+  them. An exFAT entry records local time together with that device's UTC
+  offset, and the offset was ignored, so local time was shown as UTC. Times
+  are now converted to UTC using the recorded offset. An entry that records
+  no valid offset is still shown unadjusted and labelled UTC: treat those
+  times as the device's local time
+  ([#19](https://github.com/switch-nz/strata/issues/19)).
+- An ext2, ext3 or ext4 volume whose journal is missing or damaged no longer
+  raises an error when a deleted file's details or content are read, or when a
+  file's journal history is asked for. It reports that no history was
+  recovered instead
+  ([#15](https://github.com/switch-nz/strata/issues/15)).
+- An NTFS volume whose `$MFT` cannot be read no longer claims millions of
+  records it does not have, which made listing it hang; the record count is
+  held to what the volume can contain, with a finding when it had to be cut.
+  A damaged MFT record is also no longer returned as a real one the second
+  time it is looked up, which could stop a file's details from showing
+  ([#15](https://github.com/switch-nz/strata/issues/15)).
+- An exFAT volume whose boot sector claims more clusters than the image
+  holds is read using what the image actually holds, with a finding, so a
+  damaged boot sector can no longer exhaust memory
+  ([#15](https://github.com/switch-nz/strata/issues/15)).
+
+### Known issues
+
+The known issues listed for 0.1.0 still apply, with two changes: exFAT
+timestamps are now converted wherever the entry records a valid offset, and
+the crashes and hangs tracked in
+[#15](https://github.com/switch-nz/strata/issues/15) are fixed. Two registry
+crashes on truncated hives remain
+([#19](https://github.com/switch-nz/strata/issues/19)).
+
+## [0.1.1] - 2026-09-17
+
+A security and evidence-integrity release. Upgrade from 0.1.0.
+
+### Security
+
+- **A flat VMDK could make Strata read a file that is not part of the
+  exhibit.** A flat VMDK is a descriptor plus a file holding the disk data,
+  and the descriptor names that file. The name was followed wherever it led:
+  to another file on the examiner's machine, which was then shown, hashed,
+  searched and reported as the disk, or to a network path, which on Windows
+  can send the examiner's credentials to that host. The data file is now read
+  only from beside the descriptor, and any other name is refused before
+  anything is touched
+  ([GHSA-5ww2-4xpg-4jpq](https://github.com/switch-nz/strata/security/advisories/GHSA-5ww2-4xpg-4jpq)).
+  If you opened flat VMDKs from an untrusted source with 0.1.0, check that
+  each one's data file sat beside its descriptor.
+
+### Fixed
+
+- **Previewing or opening a file that is not a case could change it.** An
+  empty file or any SQLite database — a browser history file, for example —
+  had case tables written into it on preview, and was turned into a folder on
+  opening. A case is now only a folder holding `case.sqlite`, recognised
+  without writing to anything, and anything else is refused and left untouched
+  ([#23](https://github.com/switch-nz/strata/issues/23)).
+
+### Known issues
+
+The known issues listed for 0.1.0 still apply.
+
+## [0.1.0] - 2026-09-17
+
+The first release. Everything is described in the [README](README.md). In
+brief:
+
+### Evidence
+
+- EWF (`.E01`, `.L01`) including split segment sets; single-file raw/dd;
+  VMDK (flat, sparse and stream-optimized); VHDX (fixed and dynamic);
+  AccessData AD1.
+- Size and offset fields in EWF segment files are bounded, so a damaged
+  image records a finding instead of exhausting memory
+  ([#14](https://github.com/switch-nz/strata/pull/14)).
+- Logical evidence: a folder, a zip or a single file opened as an exhibit.
+- MBR and GPT volume layout, including damaged tables and the gaps between
+  partitions.
+- Stored acquisition hashes recovered and re-verifiable; EWF chunk
+  checksums checked as data is read.
+- BitLocker and LUKS1 unlock by password or recovery key, held for the
+  session only.
+
+### Filesystems
+
+- NTFS, FAT12/16/32, exFAT, ext2/3/4 with jbd2 journal recovery, APFS and
+  HFS+/HFSX, parsed directly, with deleted entries, file slack and
+  unallocated space reachable throughout.
+- A contiguous exFAT run that claims more than the cluster heap holds is cut
+  off at its end, with a finding
+  ([#17](https://github.com/switch-nz/strata/pull/17)).
+
+### Analysis
+
+- Sixteen artefact parsers with a triage set, including `$UsnJrnl`,
+  prefetch, LNK and Jump Lists, Recycle Bin, registry keys, shellbags,
+  Amcache and ShimCache, browser history, event logs and a timeline.
+- Registry hives with transaction-log replay and deleted key recovery.
+- SQLite (with deleted record recovery), ESE, LevelDB, PST, mbox, Office
+  documents, PDF, EXIF and cryptocurrency wallet material.
+- Literal and regex search with stated coverage; signature carving (29
+  built-in signatures); MD5, SHA-1 and SHA-256 hashing with hash sets;
+  ATT&CK tagging.
+
+### Interface and cases
+
+- Hex view with the core sample, data interpreter and structure templates;
+  directory listing and gallery; a preview pane that never executes active
+  content.
+- Six themes, including midnight, sepia and two high-contrast themes, chosen
+  from a theme picker dialog
+  ([#1](https://github.com/switch-nz/strata/pull/1),
+  [#9](https://github.com/switch-nz/strata/pull/9)).
+- Cases as folders with several exhibits and examiners, file extraction
+  with a hashed manifest, a self-contained HTML report and a hash-chained,
+  append-only audit log.
+
+### Project
+
+- CI on Linux, Windows and macOS across Python 3.8 to 3.13, with unit tests
+  and a smoke test of the running app; `SECURITY.md`, `CONTRIBUTING.md` and
+  issue templates ([#12](https://github.com/switch-nz/strata/pull/12)).
+- Parser tests built from synthetic images, mutation fuzzing of the parsers,
+  tests of the request gate, and CodeQL
+  ([#13](https://github.com/switch-nz/strata/pull/13)).
+
+### Not implemented
+
+EWF v2 (Ex01), split raw sets, FileVault, BitLocker with the Elephant
+diffuser, LUKS2 with Argon2, ANSI PST, `$LogFile`, carving across fragments,
+and opening shadow copies (they are listed only).
+
+### Known issues
+
+Corroborate results in these areas with another tool before relying on them.
+
+- **Some parsers return wrong or missing results without a warning**
+  ([#19](https://github.com/switch-nz/strata/issues/19)):
+  - exFAT timestamps ignore the recorded UTC offset but are labelled UTC.
+  - Files in the later clusters of a contiguous exFAT directory are not
+    listed.
+  - Sparse ext4 files read back with their data at the wrong offsets; ext4
+    inline files over 60 bytes, and inline directories, are misread.
+  - Deleted FAT long filenames made of several parts are assembled out of
+    order, and slack for a deleted multi-cluster FAT file is reported in the
+    wrong place.
+  - A truncated compressed EWF chunk is returned short, without a finding.
+  - Opening the first segment of a split raw set reads that segment alone,
+    with nothing to say the rest of the disk is missing. Join the segments
+    first.
+- A file with a three-letter extension beside an EWF image, such as
+  `case.txt` next to `case.E01`, is taken as a segment and stops the image
+  opening ([#19](https://github.com/switch-nz/strata/issues/19)).
+- Some damaged images crash or hang a parser instead of recording a finding
+  ([#15](https://github.com/switch-nz/strata/issues/15),
+  [#19](https://github.com/switch-nz/strata/issues/19)).
+
+[Unreleased]: https://github.com/switch-nz/strata/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/switch-nz/strata/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/switch-nz/strata/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/switch-nz/strata/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/switch-nz/strata/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/switch-nz/strata/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/switch-nz/strata/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/switch-nz/strata/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/switch-nz/strata/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/switch-nz/strata/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/switch-nz/strata/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/switch-nz/strata/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/switch-nz/strata/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/switch-nz/strata/releases/tag/v0.1.0

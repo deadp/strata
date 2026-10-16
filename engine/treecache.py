@@ -2,7 +2,7 @@ import json
 import os
 import sqlite3
 
-VERSION = 1
+VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -30,17 +30,44 @@ _COLS = ("mft", "parent", "name", "is_dir", "deleted", "size", "created",
          "modified", "accessed", "mft_modified", "fn_created", "fn_modified",
          "resident", "fixup_ok", "streams")
 
-def stamp(image_path, offset):
+def stamp(image_path, offset, snap=None, parents=(), extra=""):
+    """What a cached tree was built from. A differencing disk shows mostly
+    what its parents hold, so each parent (nearest first) is part of the
+    stamp: replacing one, even keeping its identifier, discards the cache.
+    A disk with no parents stamps exactly as before. `extra` is anything else
+    the tree depends on, such as how a RAID set's members were put together."""
     try:
         st = os.stat(image_path)
     except OSError:
         return None
-    return "%d:%d:%d:%d" % (VERSION, offset, st.st_size, int(st.st_mtime))
+    out = "%d:%d:%s:%d:%d" % (VERSION, offset, snap, st.st_size,
+                              int(st.st_mtime))
+    for parent in parents or ():
+        try:
+            ps = os.stat(parent)
+            out += "|%d:%d" % (ps.st_size, int(ps.st_mtime))
+        except OSError:
+            out += "|missing"       # a parent that is gone is a change too
+    if extra:
+        out += "|" + extra
+    return out
 
-def path_for(cache_dir, image_path, offset):
-    base = os.path.basename(image_path) or "image"
+PREFIX = "mft-"
+
+def prefix_for(image_path):
+    base = os.path.basename(image_path or "") or "image"
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in base)[:60]
-    return os.path.join(cache_dir, "mft-%s-%d.sqlite" % (safe, offset))
+    return "%s%s-" % (PREFIX, safe)
+
+def path_for(cache_dir, image_path, offset, snap=None):
+    """The cache file for a live volume at `offset`, or for shadow-copy
+    `snap` of it. `snap` is its own filename component (not folded into
+    the offset arithmetically) so a snapshot's cache can never collide
+    with a real partition's, whatever offset either happens to land on."""
+    suffix = ("%d" % offset if snap is None
+             else "%d-snap%d" % (offset, snap))
+    return os.path.join(cache_dir,
+                        "%s%s.sqlite" % (prefix_for(image_path), suffix))
 
 def save(path, tree, built_from):
     if not built_from:

@@ -43,6 +43,9 @@
   <button class="tab" data-view="tags" role="tab" data-i18n="ui.marks.tagged"></button>
   <button class="tab" data-view="hash" role="tab" data-i18n="ui.tags.hashes"></button>
   <button class="tab" data-view="attack" data-no-viewer role="tab" data-i18n="ui.hash.attack"></button>
+  <button class="tab" data-view="diff" data-no-viewer role="tab" data-i18n="ui.app.diff"></button>
+  <button class="tab" data-view="notes" data-no-viewer role="tab" data-i18n="ui.app.notes"></button>
+  <button class="tab" data-view="templates" data-no-viewer role="tab" data-i18n="ui.app.templates"></button>
 </nav>
 
 <main class="workspace" id="workspace">
@@ -54,6 +57,7 @@
         <button class="solid" id="btn-new-case" data-i18n="ui.cases.new"></button>
         <button class="ghost" id="btn-open-case" data-i18n="ui.cases.open"></button>
         <button class="ghost" id="btn-case-add" data-i18n="ui.cases.add_evidence"></button>
+        <button class="ghost" id="btn-compact-case" data-i18n="ui.cases.compact"></button>
         <button class="ghost" id="btn-close-case" data-i18n="ui.cases.close"></button>
       </div>
       <div class="view-main">
@@ -84,11 +88,14 @@
           <button class="dv-mode" data-art="browser" data-i18n="ui.tree.browsing"></button>
           <button class="dv-mode" data-art="appcompat" data-i18n="ui.tree.programs"></button>
           <button class="dv-mode" data-art="prefetch" data-i18n="ui.tree.execution"></button>
+          <button class="dv-mode" data-art="evtx" data-i18n="ui.tree.events"></button>
           <button class="dv-mode" data-art="usn" data-i18n="ui.tree.journal"></button>
+          <button class="dv-mode" data-art="logfile" data-i18n="ui.tree.logfile"></button>
           <button class="dv-mode" data-art="shellbags" data-i18n="ui.tree.folders"></button>
           <button class="dv-mode" data-art="mail" data-i18n="ui.tree.mail"></button>
           <button class="dv-mode" data-art="leveldb" data-i18n="ui.tree.leveldb"></button>
           <button class="dv-mode" data-art="vss" data-i18n="ui.tree.shadow_copies"></button>
+          <button class="dv-mode" data-art="snapshots" data-i18n="ui.tree.apfs_snapshots"></button>
           <button class="dv-mode" data-art="wallets" data-i18n="ui.tree.crypto"></button>
         </div>
         <button class="solid" id="btn-artifacts" data-i18n="ui.tree.artifacts"></button>
@@ -169,6 +176,8 @@
         </div>
         <details class="filters" id="find-filters">
           <summary data-i18n="ui.tree.filters"></summary>
+          <label class="row"><span data-i18n="ui.tree.name_contains"></span>
+            <input type="text" id="f-name" maxlength="255"></label>
           <label class="row"><span data-i18n="ui.tree.ext"></span>
             <input type="text" id="f-ext" data-i18n-placeholder="tooltips.tree.pdf_docx_jpg"></label>
           <label class="row"><span data-i18n="ui.tree.size"></span>
@@ -181,8 +190,19 @@
               <input type="date" id="f-mod-after">
               <input type="date" id="f-mod-before">
             </span></label>
+          <label class="row"><span data-i18n="ui.tree.created"></span>
+            <span class="pair">
+              <input type="date" id="f-cr-after">
+              <input type="date" id="f-cr-before">
+            </span></label>
+          <label class="row"><span data-i18n="ui.tree.accessed"></span>
+            <span class="pair">
+              <input type="date" id="f-ac-after">
+              <input type="date" id="f-ac-before">
+            </span></label>
           <div class="encodings">
             <label class="check"><input type="checkbox" id="f-deleted"><span data-i18n="ui.tree.deleted_only"></span></label>
+            <label class="check"><input type="checkbox" id="f-hide-deleted"><span data-i18n="ui.tree.hide_deleted"></span></label>
             <label class="check"><input type="checkbox" id="f-files" checked><span data-i18n="ui.tree.files_only"></span></label>
           </div>
           <label class="row" data-i18n-title="tooltips.tree.how_much_each_file_content_search">
@@ -312,6 +332,57 @@
       </div>
     </div>
 
+    <div class="view" data-view="notes">
+      <div class="controls">
+        <p class="hint" data-i18n="help.notes.intro"></p>
+        <label class="field"><span data-i18n="ui.notes.new"></span>
+          <textarea id="note-body" rows="4"></textarea></label>
+        <div class="row">
+          <button class="solid" id="btn-note-add" data-i18n="ui.notes.add"></button>
+          <label class="row"><input type="checkbox" id="note-show-retracted">
+            <span data-i18n="ui.notes.show_withdrawn"></span></label>
+        </div>
+      </div>
+      <div class="view-main">
+        <div id="note-results" class="results"></div>
+      </div>
+    </div>
+
+    <div class="view" data-view="templates">
+      <div class="controls tpl-controls">
+        <p class="hint" data-i18n="help.templates.intro"></p>
+        <div id="tpl-list" class="tpl-list"></div>
+        <div class="row">
+          <button class="solid" id="btn-tpl-new" data-i18n="ui.templates.new"></button>
+        </div>
+      </div>
+      <div class="view-main">
+        <div id="tpl-editor" class="tpl-editor"></div>
+        <div id="tpl-results" class="results"></div>
+      </div>
+    </div>
+
+    <div class="view" data-view="diff">
+      <div class="controls">
+        <label class="row"><span data-i18n="ui.diff.side_a"></span>
+          <select id="diff-a"></select>
+          <span data-i18n="ui.diff.snapshot"></span>
+          <select id="diff-a-snap"></select>
+        </label>
+        <label class="row"><span data-i18n="ui.diff.side_b"></span>
+          <select id="diff-b"></select>
+          <span data-i18n="ui.diff.snapshot"></span>
+          <select id="diff-b-snap"></select>
+        </label>
+        <button class="solid" id="btn-diff" data-i18n="ui.diff.run"></button>
+        <p class="hint" data-i18n="help.diff.walks_both_trees"></p>
+      </div>
+      <div class="view-main">
+        <div id="diff-results" class="results"></div>
+      </div>
+    </div>
+
+
     <div class="view" data-view="hash">
       <div class="controls">
         <label class="row">
@@ -320,6 +391,10 @@
         </label>
         <button class="solid" id="btn-hash" data-i18n="ui.tree.hash"></button>
         <p class="hint" data-i18n="help.tree.every_file_chosen_volume_md5_sha"></p>
+        <button class="ghost" id="btn-duplicates" data-i18n="ui.tree.find_duplicates"></button>
+        <p class="hint" data-i18n="help.tree.duplicates_across_evidence_items"></p>
+        <button class="ghost" id="btn-similar" data-i18n="ui.tree.find_similar"></button>
+        <p class="hint" data-i18n="help.tree.similar_across_evidence_items"></p>
         <details class="filters" id="hashset-wrap">
           <summary>Hash sets <span id="hashset-count"></span></summary>
           <label class="field"><span data-i18n="ui.tree.list_file"></span>
@@ -467,8 +542,20 @@
     <div class="notice bad" id="remove-holdings"></div>
     <p class="hint" data-i18n="help.remove.cannot_undone_audit_log_keeps_record"></p>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.remove.cancel"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.remove.cancel"></button>
       <button value="ok" class="solid danger" data-i18n="ui.remove.remove"></button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="dlg-rerun-artefact">
+  <form method="dialog" class="dlg">
+    <h2 data-i18n="ui.rerun_artefact.title"></h2>
+    <p class="hint" id="rerun-artefact-text"></p>
+    <p class="hint" data-i18n="help.rerun_artefact.replaces_earlier_result"></p>
+    <menu>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.rerun_artefact.cancel"></button>
+      <button value="ok" class="solid" data-i18n="ui.rerun_artefact.replace"></button>
     </menu>
   </form>
 </dialog>
@@ -516,8 +603,58 @@
     </label>
     <div id="browser" class="browser"></div>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.open.cancel"></button>
+      <button type="button" class="ghost" id="open-raid" data-i18n="ui.raid.open_button"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.open.cancel"></button>
       <button value="ok" class="solid" id="open-confirm" data-i18n="ui.open.confirm"></button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="dlg-raid">
+  <form method="dialog" class="dlg dlg-raid" id="raid-form">
+    <h2 data-i18n="ui.raid.title"></h2>
+    <p class="hint" data-i18n="help.raid.intro"></p>
+    <label class="field">
+      <span data-i18n="ui.raid.name"></span>
+      <input type="text" id="raid-name" maxlength="80">
+    </label>
+    <div class="row raid-params">
+      <label class="row"><span data-i18n="ui.raid.level"></span>
+        <select id="raid-level">
+          <option value="0">RAID 0</option>
+          <option value="1">RAID 1</option>
+          <option value="5" selected>RAID 5</option>
+        </select></label>
+      <label class="row" id="raid-chunk-field"><span data-i18n="ui.raid.chunk"></span>
+        <select id="raid-chunk"></select>
+        <input type="text" id="raid-chunk-custom" hidden size="9"></label>
+      <label class="row" id="raid-layout-field"><span data-i18n="ui.raid.layout"></span>
+        <select id="raid-layout"></select></label>
+    </div>
+    <p class="hint" id="raid-layout-hint"></p>
+    <div id="raid-members" class="raid-members"></div>
+    <div class="row">
+      <button type="button" class="ghost" id="raid-add-member" data-i18n="ui.raid.add_member"></button>
+      <span class="hint" data-i18n="ui.raid.pick_hint"></span>
+    </div>
+    <div id="raid-case-fields">
+      <label class="field" id="raid-examiner-field">
+        <span data-i18n="ui.open.examiner"></span>
+        <input type="text" id="raid-examiner">
+      </label>
+      <label class="field" id="raid-case-field">
+        <span data-i18n="ui.open.case_file"></span>
+        <input type="text" id="raid-case">
+      </label>
+      <p class="hint" id="raid-add-note" hidden></p>
+    </div>
+    <input type="hidden" id="raid-pick">
+    <div id="raid-browser" class="browser"></div>
+    <div id="raid-check" class="raid-check" aria-live="polite"></div>
+    <menu>
+      <button type="button" class="ghost" id="raid-cancel" data-i18n="ui.open.cancel"></button>
+      <button type="button" class="ghost" id="raid-test" data-i18n="ui.raid.check"></button>
+      <button type="button" class="solid" id="raid-open" data-i18n="ui.raid.assemble"></button>
     </menu>
   </form>
 </dialog>
@@ -541,7 +678,7 @@
     <div id="newcase-browser" class="browser"></div>
     <div class="notice" id="newcase-where"></div>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.newcase.cancel"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.newcase.cancel"></button>
       <button value="ok" class="solid" data-i18n="ui.newcase.create"></button>
     </menu>
   </form>
@@ -558,7 +695,7 @@
     </div>
     <div class="notice" id="closecase-holds"></div>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.closecase.cancel"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.closecase.cancel"></button>
       <button value="ok" class="solid" data-i18n="ui.closecase.close"></button>
     </menu>
   </form>
@@ -579,7 +716,7 @@
     <div id="case-browser" class="browser"></div>
     <div id="case-peek" class="case-peek"></div>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.case.cancel"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.case.cancel"></button>
       <button value="ok" class="solid" data-i18n="ui.case.open_case"></button>
     </menu>
   </form>
@@ -599,8 +736,24 @@
     <label class="field"><span data-i18n="ui.tag.note"></span>
       <textarea id="tag-note" rows="3"></textarea></label>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.tag.cancel"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.tag.cancel"></button>
       <button value="ok" class="solid" data-i18n="ui.tag.apply_tag"></button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="dlg-attack-artefact">
+  <form method="dialog" class="dlg">
+    <h2 data-i18n="ui.attack_artefact.title"></h2>
+    <p class="hint" id="attack-artefact-item"></p>
+    <label class="field"><span data-i18n="ui.tag.technique"></span>
+      <select id="attack-artefact-technique"><option value="" data-i18n="ui.tag.none"></option></select></label>
+    <p class="hint" id="attack-artefact-note" hidden></p>
+    <label class="field"><span data-i18n="ui.tag.note"></span>
+      <textarea id="attack-artefact-text" rows="3"></textarea></label>
+    <menu>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.tag.cancel"></button>
+      <button value="ok" class="solid" data-i18n="ui.attack_artefact.attribute"></button>
     </menu>
   </form>
 </dialog>
@@ -627,7 +780,7 @@
     </label>
     <p class="hint" id="tz-note"></p>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.tz.keep_utc_only"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.tz.keep_utc_only"></button>
       <button value="ok" id="tz-go" data-i18n="ui.tz.tz_go"></button>
     </menu>
   </form>
@@ -645,10 +798,15 @@
     </label>
     <label class="check"><input type="checkbox" id="unlock-show">
       <span data-i18n="ui.unlock.show_what_i_typed"></span></label>
+    <label class="field" id="unlock-keyfile-field">
+      <span data-i18n="ui.unlock.startup_key_path"></span>
+      <input type="text" id="unlock-keyfile" autocomplete="off" spellcheck="false"
+             data-i18n-placeholder="tooltips.unlock.bek_path">
+    </label>
     <p class="hint" id="unlock-note"></p>
     <p class="hint err" id="unlock-error" hidden></p>
     <menu>
-      <button value="cancel" class="ghost" id="unlock-cancel" data-i18n="ui.unlock.unlock_cancel"></button>
+      <button type="button" value="cancel" class="ghost" id="unlock-cancel" data-i18n="ui.unlock.unlock_cancel"></button>
       <button value="ok" id="unlock-go" data-i18n="ui.unlock.unlock_go"></button>
     </menu>
   </form>
@@ -708,7 +866,7 @@
     <p class="hint err" id="sig-error" hidden></p>
     <menu class="save-first">
       <button value="ok" class="solid" data-i18n="ui.carve.sig.save"></button>
-      <button value="cancel" class="ghost" data-i18n="ui.carve.sig.cancel"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.carve.sig.cancel"></button>
     </menu>
   </form>
 </dialog>
@@ -738,7 +896,7 @@
     <p class="hint" data-i18n="help.mark.working_marks_used_navigate_do_not"></p>
     <p class="hint" id="mark-range"></p>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.mark.cancel"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.mark.cancel"></button>
       <button value="ok" class="solid" data-i18n="ui.mark.save_mark"></button>
     </menu>
   </form>
@@ -753,7 +911,7 @@
     <p class="hint" data-i18n-html="help.who.attribution"></p>
     <div id="who-others"></div>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.who.cancel"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.who.cancel"></button>
       <button value="ok" class="solid" data-i18n="ui.who.use_name"></button>
     </menu>
   </form>
@@ -798,7 +956,7 @@
 
     <p class="hint" data-i18n="help.settings.where_kept"></p>
     <menu>
-      <button value="cancel" class="ghost" data-i18n="ui.settings.close"></button>
+      <button type="button" value="cancel" class="ghost" data-i18n="ui.settings.close"></button>
     </menu>
   </form>
 </dialog>
@@ -821,7 +979,7 @@
     </div>
     <div id="picker-list" class="picker"></div>
     <menu>
-      <button value="cancel" class="ghost" id="pick-cancel" data-i18n="ui.picker.pick_cancel"></button>
+      <button type="button" value="cancel" class="ghost" id="pick-cancel" data-i18n="ui.picker.pick_cancel"></button>
       <button value="ok" class="solid" id="pick-run" data-i18n="ui.picker.pick_run"></button>
     </menu>
   </form>

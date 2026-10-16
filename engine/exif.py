@@ -64,6 +64,9 @@ GPS_IFD = {
 
 TAG_EXIF_IFD = 0x8769
 TAG_GPS_IFD = 0x8825
+TAG_THUMB_OFFSET = 0x0201
+TAG_THUMB_LENGTH = 0x0202
+MAX_THUMB_BYTES = 1 << 20
 
 def _clean(s):
     s = s.split("\x00", 1)[0].strip()
@@ -136,7 +139,7 @@ def _read_ifd(buf, base, at, endian, names, seen):
         raw4 = buf[o + 8:o + 12]
         if count > (1 << 20):
             continue
-        if tag in (TAG_EXIF_IFD, TAG_GPS_IFD):
+        if tag in (TAG_EXIF_IFD, TAG_GPS_IFD, TAG_THUMB_OFFSET, TAG_THUMB_LENGTH):
             v = _entry_value(buf, base, endian, typ, count, raw4)
             if isinstance(v, int):
                 ptrs[tag] = v
@@ -175,7 +178,7 @@ def _dms(v, ref):
     return deg, ("No hemisphere reference recorded, so the sign is unknown. "
                  "The magnitude is as stored.")
 
-def _tiff(buf, base=0):
+def _tiff(buf, base=0, want_thumb=False):
     if base + 8 > len(buf):
         return None
     endian = buf[base:base + 2].decode("latin-1", "replace")
@@ -203,12 +206,19 @@ def _tiff(buf, base=0):
     hops = 0
     while nxt and hops < MAX_IFDS:
         hops += 1
-        thumb, nxt, _p = _read_ifd(buf, base, base + nxt, endian, IFD0, seen)
+        thumb, nxt, tptrs = _read_ifd(buf, base, base + nxt, endian, IFD0, seen)
         if thumb and not out["thumbnail"]:
             out["thumbnail"] = thumb
+        if (want_thumb and "thumbnail_jpeg" not in out
+                and TAG_THUMB_OFFSET in tptrs and TAG_THUMB_LENGTH in tptrs):
+            t_off = base + tptrs[TAG_THUMB_OFFSET]
+            t_len = tptrs[TAG_THUMB_LENGTH]
+            if (0 <= t_off and 0 < t_len <= MAX_THUMB_BYTES
+                    and t_off + t_len <= len(buf)):
+                out["thumbnail_jpeg"] = bytes(buf[t_off:t_off + t_len])
     return out
 
-def _from_jpeg(data):
+def _from_jpeg(data, want_thumb=False):
     if data[:2] != b"\xff\xd8":
         return None
     i = 2
@@ -227,11 +237,11 @@ def _from_jpeg(data):
         if seg_len < 2 or i + 2 + seg_len > n:
             break
         if marker == 0xE1 and data[i + 4:i + 10] == b"Exif\x00\x00":
-            return _tiff(data, i + 10)
+            return _tiff(data, i + 10, want_thumb)
         i += 2 + seg_len
     return None
 
-def _from_png(data):
+def _from_png(data, want_thumb=False):
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         return None
     i = 8
@@ -242,7 +252,7 @@ def _from_png(data):
         if length > n:
             break
         if kind == b"eXIf":
-            return _tiff(data, i + 8)
+            return _tiff(data, i + 8, want_thumb)
         if kind == b"IDAT":
             break
         i += 12 + length
@@ -263,6 +273,25 @@ def parse(data):
     got["coordinates"] = coordinates(got.get("gps") or {})
     got["summary"] = summarise(got)
     return got
+
+def thumbnail(data):
+    """The embedded thumbnail JPEG's raw bytes (JPEGInterchangeFormat /
+    JPEGInterchangeFormatLength on the IFD1 thumbnail entry), or None
+    when there isn't one. A narrower read than parse(): a caller that
+    wants to serve or preview the thumbnail image doesn't need the whole
+    metadata tree, and parse() itself never carries these bytes -- only
+    asking for them here decodes them, so every existing parse() caller
+    is unaffected."""
+    if not data or len(data) < 16:
+        return None
+    got = None
+    if data[:2] == b"\xff\xd8":
+        got = _from_jpeg(data, want_thumb=True)
+    elif data[:8] == b"\x89PNG\r\n\x1a\n":
+        got = _from_png(data, want_thumb=True)
+    elif data[:2] in (b"II", b"MM"):
+        got = _tiff(data, 0, want_thumb=True)
+    return (got or {}).get("thumbnail_jpeg")
 
 def coordinates(gps):
     if not gps:

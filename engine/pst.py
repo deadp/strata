@@ -1,11 +1,22 @@
 import datetime
 import struct
+import zlib
 
 MAGIC = b"!BDN"
 MAGIC_CLIENT = b"SM"
 
 VER_ANSI = (14, 15)
 VER_UNICODE = 23
+# The 64-bit Unicode format with 4k (4096-byte) pages that Outlook 2013+
+# writes for OST files (36), including files also marked as protected by
+# Windows Information Protection (37). [MS-PST] does not document this
+# variant at all (it only covers .pst); the page/block layout and block
+# compression below follow libyal/libpff's reverse-engineered "Personal
+# Folder File (PFF) format" documentation and libpff_data_block.c,
+# cross-checked against each other, not a Microsoft source. Only these two
+# observed values are accepted -- not "36 or higher" -- so a genuinely
+# unknown/future version is still reported rather than guessed at.
+VER_UNICODE_4K = (36, 37)
 
 CRYPT_NONE, CRYPT_PERMUTE, CRYPT_CYCLIC = 0, 1, 2
 
@@ -41,6 +52,28 @@ _MPBB_R = bytes((
     61,
 ))
 
+# [MS-PST] 5.1: mpbbS, the middle table of the cyclic cipher.
+_MPBB_S = bytes((
+     20,  83,  15,  86, 179, 200, 122, 156, 235, 101,  72,  23,  22,  21, 159,
+      2, 204,  84, 124, 131,   0,  13,  12,  11, 162,  98, 168, 118, 219, 217,
+    237, 199, 197, 164, 220, 172, 133, 116, 214, 208, 167, 155, 174, 154, 150,
+    113, 102, 195,  99, 153, 184, 221, 115, 146, 142, 132, 125, 165,  94, 209,
+     93, 147, 177,  87,  81,  80, 128, 137,  82, 148,  79,  78,  10, 107, 188,
+    141, 127, 110,  71,  70,  65,  64,  68,   1,  17, 203,   3,  63, 247, 244,
+    225, 169, 143,  60,  58, 249, 251, 240,  25,  48, 130,   9,  46, 201, 157,
+    160, 134,  73, 238, 111,  77, 109, 196,  45, 129,  52,  37, 135,  27, 136,
+    170, 252,   6, 161,  18,  56, 253,  76,  66, 114, 100,  19,  55,  36, 106,
+    117, 119,  67, 255, 230, 180,  75,  54,  92, 228, 216,  53,  61,  69, 185,
+     44, 236, 183,  49,  43,  41,   7, 104, 163,  14, 105, 123,  24, 158,  33,
+     57, 190,  40,  26,  91, 120, 245,  35, 202,  42, 176, 175,  62, 254,   4,
+    140, 231, 229, 152,  50, 149, 211, 246,  74, 232, 166, 234, 233, 243, 213,
+     47, 112,  32, 242,  31,   5, 103, 173,  85,  16, 206, 205, 227,  39,  59,
+    218, 186, 215, 194,  38, 212, 145,  29, 210,  28,  34,  51, 248, 250, 241,
+     90, 239, 207, 144, 182, 139, 181, 189, 192, 191,   8, 151,  30, 108, 226,
+     97, 224, 198, 193,  89, 171, 187,  88, 222,  95, 223,  96, 121, 126, 178,
+    138,
+))
+
 _MPBB = None
 _MPBB_INV = None
 
@@ -71,15 +104,21 @@ def _permute(data, encode=False):
     return bytes(table[b] for b in data)
 
 def _cyclic(data, key):
+    """[MS-PST] 5.2 CryptCyclic. A symmetric cipher; the key is the low
+    DWORD of the block's BID."""
+    if _MPBB is None:
+        raise PermuteTableUnavailable(
+            "PST permute table not installed; block contents cannot be decoded")
     out = bytearray(data)
-    w = key & 0xFFFF
-    x = ((key >> 16) & 0xFFFF) ^ w
+    w = (key ^ (key >> 16)) & 0xFFFF
     for i in range(len(out)):
-        b = out[i]
-        b = (b + (w & 0xFF)) & 0xFF
-        b ^= (x & 0xFF)
-        b = (b - (w & 0xFF)) & 0xFF
-        out[i] = b
+        b = (out[i] + (w & 0xFF)) & 0xFF
+        b = _MPBB[b]
+        b = (b + (w >> 8)) & 0xFF
+        b = _MPBB_S[b]
+        b = (b - (w >> 8)) & 0xFF
+        b = _MPBB_INV[b]
+        out[i] = (b - (w & 0xFF)) & 0xFF
         w = (w + 1) & 0xFFFF
     return bytes(out)
 
@@ -89,7 +128,7 @@ def decode_block(data, crypt, bid):
     if crypt == CRYPT_PERMUTE:
         return _permute(data)
     if crypt == CRYPT_CYCLIC:
-        return _cyclic(data, bid)
+        return _cyclic(data, bid & 0xFFFFFFFF)
     return data
 
 def filetime(v):
@@ -126,12 +165,39 @@ PID_BODY = 0x1000
 PID_DISPLAY_NAME = 0x3001
 PID_CREATION_TIME = 0x3007
 PID_LAST_MODIFICATION_TIME = 0x3008
+PID_ATTACH_DATA_BIN = 0x3701
 PID_ATTACH_LONG_FILENAME = 0x3707
+PID_ATTACH_MIME_TAG = 0x370E
 PID_ATTACH_SIZE = 0x0E20
 PID_LTP_ROW_ID = 0x67F2
+PID_INTERNET_CODEPAGE = 0x3FDE
+PID_MESSAGE_CODEPAGE = 0x3FFD
 
 MSG_FLAG_READ = 0x01
 MSG_FLAG_HAS_ATTACH = 0x10
+
+def _decode_string8(raw, codepage=None):
+    """PtypString8 bytes as text: the declared Windows code page when Python
+    knows it, else Windows-1252."""
+    if codepage == 65001:
+        codec = "utf-8"
+    elif isinstance(codepage, int) and codepage > 0:
+        codec = "cp%d" % codepage
+    else:
+        codec = "cp1252"
+    try:
+        text = raw.decode(codec, "replace")
+    except LookupError:
+        text = raw.decode("cp1252", "replace")
+    return text.rstrip(chr(0))
+
+def _text(v):
+    """A property value as text, or None when it is not a string (a
+    damaged or unexpected property type)."""
+    return v if isinstance(v, str) else None
+
+def _num(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
 
 def hnid_is_hid(hnid):
     return (hnid & 0x1F) == 0
@@ -219,31 +285,55 @@ class Pst:
         self.valid = False
         self.findings = []
         self.ansi = False
-        if len(data) < 600 or data[:4] != MAGIC:
+        self.page_size = 512
+        if len(data) < 14 or data[:4] != MAGIC:
             return
         if data[8:10] != MAGIC_CLIENT:
             self.findings.append("Header magic client is not 'SM'.")
         self.ver = struct.unpack_from("<H", data, 10)[0]
         self.client_ver = struct.unpack_from("<H", data, 12)[0]
         if self.ver in VER_ANSI:
+            # [MS-PST] 2.2.2.6: the same structures with 32-bit BIDs and IBs,
+            # 512-byte pages with 12-byte trailers, and a header whose ROOT
+            # starts at 164 instead of 180.
+            if len(data) < 512:
+                return
             self.ansi = True
+            root, self.sentinel_at, self.crypt_at = 164, 460, 461
+            self.file_eof = struct.unpack_from("<I", data, root + 4)[0]
+            self.nbt_bid, self.nbt_ib, self.bbt_bid, self.bbt_ib = (
+                struct.unpack_from("<4I", data, root + 20))
             self.findings.append(
-                "This is an ANSI (32-bit) PST. Its structures are the same "
-                "shape at narrower widths; this parser reads the Unicode "
-                "format only and will not guess at them.")
-            return
-        if self.ver != VER_UNICODE:
+                "This is an ANSI (32-bit) PST, the format Outlook 97 to 2002 "
+                "wrote. Text in it is stored in a code page rather than "
+                "Unicode; it is decoded with the code page each message "
+                "declares, or Windows-1252 where none is given.")
+        elif self.ver == VER_UNICODE or self.ver in VER_UNICODE_4K:
+            # The header layout (this "root") is identical for both page
+            # sizes -- only the NDB pages and blocks that root points to
+            # differ. libpff decides 4k-vs-512 the same way: wVer >= 0x24.
+            if len(data) < 600:
+                return
+            if self.ver in VER_UNICODE_4K:
+                self.page_size = 4096
+                self.findings.append(
+                    "This is the 64-bit Unicode format with 4k (4096-byte) "
+                    "pages that Outlook 2013 and later write for OST files. "
+                    "It is not documented by Microsoft's own [MS-PST] "
+                    "specification; block and page layout here follow "
+                    "libyal/libpff's reverse-engineered format documentation.")
+            root, self.sentinel_at, self.crypt_at = 180, 512, 513
+            self.file_eof = struct.unpack_from("<Q", data, root + 4)[0]
+            self.nbt_bid = struct.unpack_from("<Q", data, root + 36)[0]
+            self.nbt_ib = struct.unpack_from("<Q", data, root + 44)[0]
+            self.bbt_bid = struct.unpack_from("<Q", data, root + 52)[0]
+            self.bbt_ib = struct.unpack_from("<Q", data, root + 60)[0]
+        else:
             self.findings.append("Unknown PST version %d." % self.ver)
             return
 
-        self.crypt = data[513]
-        self.sentinel = data[512]
-        r = 180
-        self.file_eof = struct.unpack_from("<Q", data, r + 4)[0]
-        self.nbt_bid = struct.unpack_from("<Q", data, r + 36)[0]
-        self.nbt_ib = struct.unpack_from("<Q", data, r + 44)[0]
-        self.bbt_bid = struct.unpack_from("<Q", data, r + 52)[0]
-        self.bbt_ib = struct.unpack_from("<Q", data, r + 60)[0]
+        self.crypt = data[self.crypt_at]
+        self.sentinel = data[self.sentinel_at]
         if self.file_eof != len(data):
             self.findings.append(
                 "Header says the file ends at %d but it is %d bytes — it is "
@@ -254,7 +344,7 @@ class Pst:
         self._nbt = None
 
     def _page(self, ib):
-        return self.data[ib:ib + 512]
+        return self.data[ib:ib + self.page_size]
 
     def _walk_bt(self, ib, want_leaf, out, depth=0, seen=None):
         if seen is None:
@@ -263,21 +353,40 @@ class Pst:
             return out
         seen.add(ib)
         page = self._page(ib)
-        if len(page) < 512:
+        if len(page) < self.page_size:
             return out
-        cEnt = page[488]
-        cbEnt = page[490]
-        cLevel = page[491]
-        ptype = page[496]
+        if self.page_size == 4096:
+            # The 64-bit 4k page index B-tree node: same BTENTRY/BBTENTRY/
+            # NBTENTRY layout as the regular 64-bit page below, just a
+            # taller footer at the 4096-aligned end (counts are 2 bytes
+            # here, not 1). Undocumented by [MS-PST]; see libyal/libpff.
+            body = 4056
+            cEnt = struct.unpack_from("<H", page, body)[0]
+            cbEnt = page[body + 4]
+            cLevel = page[body + 5]
+            ptype = page[4072]
+        else:
+            # BTPAGE ([MS-PST] 2.2.2.7.7.1): the counts sit after the
+            # entries and the page trailer at the end; both move up 8 and
+            # 4 bytes in ANSI.
+            body = 496 if self.ansi else 488
+            cEnt = page[body]
+            cbEnt = page[body + 2]
+            cLevel = page[body + 3]
+            ptype = page[body + (4 if self.ansi else 8)]     # PAGETRAILER.ptype
         if ptype not in (PTYPE_BBT, PTYPE_NBT):
             return out
         for i in range(cEnt):
             off = i * cbEnt
-            if off + cbEnt > 488:
+            if off + cbEnt > body or cbEnt <= 0:
                 break
             e = page[off:off + cbEnt]
             if cLevel > 0:
-                child_ib = struct.unpack_from("<Q", e, 16)[0]
+                # BTENTRY: btkey, then the BREF whose ib is the child page
+                if self.ansi:
+                    child_ib = struct.unpack_from("<I", e, 8)[0]
+                else:
+                    child_ib = struct.unpack_from("<Q", e, 16)[0]
                 self._walk_bt(child_ib, want_leaf, out, depth + 1, seen)
             else:
                 out.append(e)
@@ -287,7 +396,10 @@ class Pst:
         if self._bbt is None:
             self._bbt = {}
             for e in self._walk_bt(self.bbt_ib, True, []):
-                bid, ib, cb = struct.unpack_from("<QQH", e, 0)
+                if len(e) < (10 if self.ansi else 18):
+                    continue                    # cbEnt too small for a BBTENTRY
+                bid, ib, cb = struct.unpack_from(
+                    "<IIH" if self.ansi else "<QQH", e, 0)
                 self._bbt[bid & ~1] = (ib, cb)
         return self._bbt
 
@@ -295,7 +407,10 @@ class Pst:
         if self._nbt is None:
             self._nbt = {}
             for e in self._walk_bt(self.nbt_ib, True, []):
-                nid, bid_data, bid_sub, parent = struct.unpack_from("<QQQI", e, 0)
+                if len(e) < (16 if self.ansi else 28):
+                    continue                    # cbEnt too small for an NBTENTRY
+                nid, bid_data, bid_sub, parent = struct.unpack_from(
+                    "<IIII" if self.ansi else "<QQQI", e, 0)
                 self._nbt[nid & 0xFFFFFFFF] = {
                     "nid": nid & 0xFFFFFFFF,
                     "type": nid & 0x1F,
@@ -304,6 +419,34 @@ class Pst:
                     "parent": parent,
                 }
         return self._nbt
+
+    def _decompress_block(self, raw, ib, cb):
+        """A 4k-page block's stored bytes, decompressed if its trailing
+        footer says the real content is longer than what's stored. Only
+        the 64-bit-4k-page (OST) format ever compresses blocks; [MS-PST]
+        doesn't document this at all, so the footer layout and the "is it
+        compressed" test below follow libyal/libpff's
+        libpff_data_block_read_footer_data()/libpff_data_block.c, not a
+        Microsoft source."""
+        if self.page_size != 4096 or not cb:
+            return raw
+        total = -(-cb // 512) * 512          # round up to the next 512
+        if total - cb < 24:                  # must leave room for the footer
+            total += 512
+        footer = self.data[ib + total - 24:ib + total]
+        if len(footer) < 24:
+            return raw
+        usize = struct.unpack_from("<H", footer, 18)[0]
+        if not usize or usize == cb:
+            return raw
+        try:
+            return zlib.decompress(raw)
+        except zlib.error:
+            self.findings.append(
+                "A compressed block at file offset %d claims to expand to "
+                "%d bytes but does not; using its stored bytes undecoded."
+                % (ib, usize))
+            return raw
 
     def blocks_of(self, bid, _depth=0, _out=None):
         out = [] if _out is None else _out
@@ -316,15 +459,18 @@ class Pst:
         raw = self.data[ib:ib + cb]
         if len(raw) < cb:
             return out
+        raw = self._decompress_block(raw, ib, cb)
         if bid & 0x02:
             if len(raw) >= 8 and raw[0] == 0x01:
                 count = struct.unpack_from("<H", raw, 2)[0]
+                width = 4 if self.ansi else 8
                 for i in range(count):
-                    off = 8 + i * 8
-                    if off + 8 > len(raw):
+                    off = 8 + i * width
+                    if off + width > len(raw):
                         break
-                    self.blocks_of(struct.unpack_from("<Q", raw, off)[0],
-                                   _depth + 1, out)
+                    self.blocks_of(struct.unpack_from(
+                        "<I" if self.ansi else "<Q", raw, off)[0],
+                        _depth + 1, out)
             return out
         out.append(decode_block(raw, self.crypt, bid))
         return out
@@ -341,22 +487,31 @@ class Pst:
             return out
         ib, cb = loc
         raw = self.data[ib:ib + cb]
+        if len(raw) < cb:
+            return out
+        raw = self._decompress_block(raw, ib, cb)
         if len(raw) < 8 or raw[0] != 0x02:
             return out
         level, count = raw[1], struct.unpack_from("<H", raw, 2)[0]
+        # SLBLOCK / SIBLOCK: an 8-byte header with padding in Unicode, 4
+        # bytes in ANSI; SLENTRY is 3 BIDs wide, SIENTRY 2.
+        head, w = (4, 4) if self.ansi else (8, 8)
+        fmt = "<I" if self.ansi else "<Q"
         if level == 0:
             for i in range(count):
-                off = 8 + i * 24
-                if off + 24 > len(raw):
+                off = head + i * 3 * w
+                if off + 3 * w > len(raw):
                     break
-                nid, bd, bs = struct.unpack_from("<QQQ", raw, off)
+                nid = struct.unpack_from(fmt, raw, off)[0]
+                bd = struct.unpack_from(fmt, raw, off + w)[0]
+                bs = struct.unpack_from(fmt, raw, off + 2 * w)[0]
                 out[nid & 0xFFFFFFFF] = (bd, bs)
         else:
             for i in range(count):
-                off = 8 + i * 16
-                if off + 16 > len(raw):
+                off = head + i * 2 * w
+                if off + 2 * w > len(raw):
                     break
-                child = struct.unpack_from("<Q", raw, off + 8)[0]
+                child = struct.unpack_from(fmt, raw, off + w)[0]
                 self.subnodes(child, _depth + 1, out)
         return out
 
@@ -377,7 +532,7 @@ class Pst:
             return b""
         return b"".join(self.blocks_of(ent[0]))
 
-    def _value(self, ptype, hnid, hn, subs):
+    def _value(self, ptype, hnid, hn, subs, codepage=None):
         fmt = _PT_INLINE.get(ptype)
         if fmt:
             return struct.unpack_from(fmt, struct.pack("<I", hnid & 0xFFFFFFFF),
@@ -390,7 +545,7 @@ class Pst:
         if ptype == 0x001F:
             return raw.decode("utf-16-le", "replace").rstrip("\x00")
         if ptype == 0x001E:
-            return raw.decode("cp1252", "replace").rstrip("\x00")
+            return _decode_string8(raw, codepage)
         if ptype == 0x0040:
             return filetime(struct.unpack_from("<Q", raw, 0)[0]
                             if len(raw) >= 8 else 0)
@@ -407,13 +562,26 @@ class Pst:
         subs = self.subnodes(node.get("sub") or 0)
         props = {}
         _, recs = bth_records(hn, hn.user_root)
+        later = []
         for key, ent in recs:
             if len(key) < 2 or len(ent) < 6:
                 continue
             pid = struct.unpack_from("<H", key, 0)[0]
             ptype, hnid = struct.unpack_from("<HI", ent, 0)
+            if ptype == 0x001E:
+                later.append((pid, ptype, hnid))     # needs the code page
+                continue
             try:
                 props[pid] = self._value(ptype, hnid, hn, subs)
+            except Exception:
+                props[pid] = None
+        # PtypString8 text (all of it in an ANSI PST) is in the object's own
+        # code page: PidTagMessageCodepage, else PidTagInternetCodepage.
+        codepage = props.get(PID_MESSAGE_CODEPAGE) or \
+            props.get(PID_INTERNET_CODEPAGE)
+        for pid, ptype, hnid in later:
+            try:
+                props[pid] = self._value(ptype, hnid, hn, subs, codepage)
             except Exception:
                 props[pid] = None
         return props
@@ -495,7 +663,7 @@ class Pst:
             if not node:
                 return
             props = self.pc(node)
-            name = props.get(PID_DISPLAY_NAME) or ""
+            name = _text(props.get(PID_DISPLAY_NAME)) or ""
             here = path if not name else (path.rstrip("/") + "/" + name)
             if not here:
                 here = "/"
@@ -528,10 +696,25 @@ class Pst:
             if not props:
                 continue
             out.append({
-                "name": props.get(PID_ATTACH_LONG_FILENAME) or None,
+                "nid": nid,
+                "name": _text(props.get(PID_ATTACH_LONG_FILENAME)) or None,
                 "size": props.get(PID_ATTACH_SIZE),
+                "content_type": _text(props.get(PID_ATTACH_MIME_TAG)) or None,
             })
         return out
+
+    def attachment_bytes(self, node, att_nid):
+        """The one attachment property mail() never reads: the content
+        itself. Kept out of attachments()/mail() because that runs over
+        every message in the store, and decoding every attachment's binary
+        content there would hash-run-eagerly what should be fetched only
+        when an examiner opens one."""
+        ent = self.subnodes(node.get("sub") or 0).get(int(att_nid) & 0xFFFFFFFF)
+        if not ent or (int(att_nid) & 0x1F) != NID_TYPE_ATTACHMENT:
+            return None
+        bd, bs = ent
+        props = self.pc({"data": bd, "sub": bs})
+        return props.get(PID_ATTACH_DATA_BIN)
 
     def message(self, nid, folder=None):
         node = self.nbt().get(nid)
@@ -540,34 +723,35 @@ class Pst:
         props = self.pc(node)
         if not props:
             return None
-        subject = _clean_subject(props.get(PID_SUBJECT) or "") or None
+        subject = _clean_subject(_text(props.get(PID_SUBJECT)) or "") or None
         if not subject:
-            subject = props.get(PID_NORMALIZED_SUBJECT) or None
-        sender = props.get(PID_SENDER_NAME) or \
-            props.get(PID_SENT_REPRESENTING_NAME)
-        email = props.get(PID_SENDER_EMAIL) or \
-            props.get(PID_SENT_REPRESENTING_EMAIL)
+            subject = _text(props.get(PID_NORMALIZED_SUBJECT)) or None
+        sender = _text(props.get(PID_SENDER_NAME)) or \
+            _text(props.get(PID_SENT_REPRESENTING_NAME))
+        email = _text(props.get(PID_SENDER_EMAIL)) or \
+            _text(props.get(PID_SENT_REPRESENTING_EMAIL))
         if sender and email and email != sender:
             frm = "%s <%s>" % (sender, email)
         else:
             frm = sender or email or None
-        flags = props.get(PID_MESSAGE_FLAGS) or 0
+        flags = _num(props.get(PID_MESSAGE_FLAGS))
         body = props.get(PID_BODY)
         if isinstance(body, bytes):
             body = body.decode("utf-8", "replace")
+        body = _text(body)
         atts = self.attachments(node) if flags & MSG_FLAG_HAS_ATTACH else []
         return {
             "nid": nid,
             "folder": folder,
             "subject": subject,
             "from": frm,
-            "to": props.get(PID_DISPLAY_TO) or None,
-            "cc": props.get(PID_DISPLAY_CC) or None,
+            "to": _text(props.get(PID_DISPLAY_TO)) or None,
+            "cc": _text(props.get(PID_DISPLAY_CC)) or None,
             "date": props.get(PID_MESSAGE_DELIVERY_TIME) or
             props.get(PID_CLIENT_SUBMIT_TIME),
             "submitted": props.get(PID_CLIENT_SUBMIT_TIME),
             "delivered": props.get(PID_MESSAGE_DELIVERY_TIME),
-            "message_class": props.get(PID_MESSAGE_CLASS),
+            "message_class": _text(props.get(PID_MESSAGE_CLASS)),
             "size": props.get(PID_MESSAGE_SIZE),
             "read": bool(flags & MSG_FLAG_READ),
             "body": body,
@@ -636,9 +820,11 @@ class Pst:
         }
 
     def info(self):
+        fmt = ("ANSI (32-bit)" if self.ansi
+               else "Unicode (64-bit, 4k pages)" if self.page_size == 4096
+               else "Unicode (64-bit)")
         return {
-            "type": "pst", "format": "Unicode (64-bit)" if not self.ansi
-            else "ANSI (32-bit)",
+            "type": "pst", "format": fmt,
             "version": getattr(self, "ver", None),
             "client_version": getattr(self, "client_ver", None),
             "encoding": {CRYPT_NONE: "none", CRYPT_PERMUTE: "permute",

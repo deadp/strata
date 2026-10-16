@@ -24,21 +24,23 @@ ENCRYPTION_METHODS = {
 }
 
 PROTECTOR_TYPES = {
+    # Numeric values verified against the libyal/libbde format specification
+    # and cross-checked against bitlocker2john.c -- both agree TPM and
+    # Startup key sit in the high byte (0x0100/0x0200), not 0x0001/0x0002 as
+    # this dict originally had it, which meant a real .BEK-protected volume
+    # never actually matched the "keyfile" entry below.
     0x0000: ("Clear key", "none",
              "The volume is not really protected — the key is stored beside "
              "it in the clear. This is what a volume looks like mid-encryption "
              "or with protection suspended."),
-    0x0001: ("TPM", "tpm",
+    0x0100: ("TPM", "tpm",
              "Sealed to the machine's TPM. It cannot be unlocked from an "
              "image; the chip is the secret and it did not come with the disk."),
-    0x0002: ("Startup key", "keyfile",
+    0x0200: ("Startup key", "keyfile",
              "Requires the .BEK startup key file, normally on a USB stick."),
-    0x0003: ("TPM and PIN", "tpm",
+    0x0500: ("TPM and PIN", "tpm",
              "Sealed to the TPM and additionally gated by a PIN. Not "
              "recoverable from an image alone."),
-    0x0004: ("TPM and startup key", "tpm", "Not recoverable from an image alone."),
-    0x0005: ("TPM, PIN and startup key", "tpm",
-             "Not recoverable from an image alone."),
     0x0800: ("Recovery password", "recovery",
              "The 48-digit recovery key, in eight groups of six."),
     0x1000: ("Auto-unlock", "keyfile",
@@ -51,10 +53,12 @@ ENTRY_VMK = 0x0002
 ENTRY_FVEK = 0x0003
 ENTRY_DESCRIPTION = 0x0007
 ENTRY_VOLUME_HEADER = 0x000F
+VALUE_KEY = 0x0001
 VALUE_UNICODE = 0x0002
 VALUE_STRETCH_KEY = 0x0003
 VALUE_AES_CCM = 0x0005
 VALUE_VMK = 0x0008
+VALUE_EXTERNAL_KEY = 0x0009
 VALUE_OFFSET_SIZE = 0x000F
 
 class Unsupported(Exception):
@@ -89,6 +93,12 @@ def _entries(data, pos, end, depth=0):
     return out
 
 def _stretch(initial, salt, progress=None):
+    # This is BitLocker's own documented key-stretching algorithm (FVE
+    # "chained hash"), not a scheme chosen here -- it must be reproduced
+    # exactly, SHA256 and all, to unwrap a real volume's VMK. A code
+    # scanner flagging bare SHA256 for password hashing doesn't apply: the
+    # 2**20 chained rounds below are the actual KDF, and there is no
+    # stronger substitute that would still open a real BitLocker volume.
     last = b"\x00" * 32
     step = STRETCH_ROUNDS // 100
     for i in range(STRETCH_ROUNDS):
@@ -109,6 +119,26 @@ def _ccm_open(key, blob):
         raise Unsupported(_t("bitlocker.unwrapped_key_entry_too"))
     size, etype, vtype, version = struct.unpack_from("<HHHH", plain, 0)
     return plain[12:size] if 12 < size <= len(plain) else plain[12:]
+
+def parse_bek_file(data):
+    """The raw 256-bit key out of a .BEK startup-key file: a 48-byte header
+    (the same shape as the volume's own FVE metadata header) followed by one
+    External Key (0x0009) entry -- a key identifier GUID, a last-modified
+    FILETIME, then properties holding an optional description and a Key
+    (0x0001) entry, which is a 4-byte encryption-method field followed by
+    the raw key bytes themselves. Returns None for anything that doesn't
+    match that shape, rather than guessing."""
+    if len(data) < 48:
+        return None
+    meta_size = struct.unpack_from("<I", data, 0)[0]
+    end = min(meta_size, len(data)) if meta_size >= 48 else len(data)
+    for e in _entries(data, 48, end):
+        if e["value_type"] != VALUE_EXTERNAL_KEY or len(e["data"]) < 24:
+            continue
+        for prop in _entries(e["data"], 24, len(e["data"])):
+            if prop["value_type"] == VALUE_KEY and len(prop["data"]) > 4:
+                return prop["data"][4:]
+    return None
 
 def _is_recovery_format(s):
     digits = "".join(c for c in s if c.isdigit())
@@ -131,12 +161,47 @@ def _recovery_digits(s):
         out += struct.pack("<H", q)
     return bytes(out)
 
+# Elephant diffuser (AES-CBC + diffuser, BitLocker Vista/Win7 methods
+# 0x8000/0x8001) -- constants and formulas verified against Niels Ferguson's
+# "AES-CBC + Elephant diffuser" whitepaper (Microsoft, 2006), section 4.
+# Encrypt pipeline: plaintext XOR sector-key -> A diffuser -> B diffuser ->
+# AES-CBC. Decrypt is the mirror: AES-CBC decrypt (done by the caller) ->
+# B diffuser -> A diffuser -> XOR sector-key.
+_DIFFUSER_A_ROT = (9, 0, 13, 0)
+_DIFFUSER_B_ROT = (0, 10, 0, 25)
+_DIFFUSER_A_CYCLES = 5
+_DIFFUSER_B_CYCLES = 3
+
+def _rotl32(x, n):
+    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF if n else x
+
+def _diffuser_pass(d, n, cycles, rot, near, far):
+    for _ in range(cycles):
+        for i in range(n):
+            d[i] = (d[i] + (d[(i + near) % n]
+                            ^ _rotl32(d[(i + far) % n], rot[i % 4]))) & 0xFFFFFFFF
+    return d
+
+def _sector_key(ksec, offset, sector_size):
+    """Ks := E(Ksec, e(s)) || E(Ksec, e'(s)), repeated to the sector size and
+    xorred into the plaintext. e(s) is the same 16-byte offset encoding used
+    for the AES-CBC IV; e'(s) is the same but with its last byte forced to
+    0x80 (whitepaper section 4.3)."""
+    e = struct.pack("<Q", offset) + b"\x00" * 8
+    e2 = e[:15] + b"\x80"
+    block = ksec.encrypt_block(e) + ksec.encrypt_block(e2)
+    return (block * (sector_size // len(block) + 1))[:sector_size]
+
 def diffuser_decrypt(data, tweak_key, offset, sector_size):
     if not tweak_key:
         raise Unsupported(
             _t("bitlocker.volume_uses_elephant_diffuser"))
-    raise Unsupported(
-        _t("bitlocker.elephant_diffuser_support_implemented"))
+    n = sector_size // 4
+    d = list(struct.unpack("<%dI" % n, data))
+    d = _diffuser_pass(d, n, _DIFFUSER_B_CYCLES, _DIFFUSER_B_ROT, 2, 5)
+    d = _diffuser_pass(d, n, _DIFFUSER_A_CYCLES, _DIFFUSER_A_ROT, -2, -5)
+    ks = struct.unpack("<%dI" % n, _sector_key(tweak_key, offset, sector_size))
+    return struct.pack("<%dI" % n, *(x ^ k for x, k in zip(d, ks)))
 
 class Protector:
 
@@ -294,30 +359,55 @@ class BitLocker:
     def unlocked(self):
         return self.fvek is not None
 
-    def unlock(self, secret, kind=None, progress=None):
+    def export_key(self):
+        return self.fvek
+
+    def restore_key(self, key):
+        """Unlock from a key kept by an earlier unlock. The decrypted header
+        must still show a filesystem, or the key is dropped again."""
+        if not self.valid or self.mode is None or not key:
+            return False
+        self.fvek = bytes(key)
+        self._kc = None
+        try:
+            ok = self.verify().get("ok", False)
+        except Exception:
+            ok = False
+        if not ok:
+            self.fvek = None
+            self._kc = None
+        return ok
+
+    def unlock(self, secret, kind=None, progress=None, bek_key=None):
         if not self.valid:
             return {"unlocked": False, "reason": _t("bitlocker.usable_bitlocker_metadata")}
         if self.mode is None:
             return {"unlocked": False,
                     "reason": _t("bitlocker.encryption_method_x_x") % self.method}
         secret = (secret or "").strip()
-        if not secret:
+        has_free = any(p.usable and p.kind == "none" for p in self.protectors)
+        if not secret and not bek_key and not has_free:
             return {"unlocked": False, "reason": _t("bitlocker.password_key_supplied")}
 
-        looks_recovery = _is_recovery_format(secret)
+        looks_recovery = _is_recovery_format(secret) if secret else False
         tried = []
         for p in self.protectors:
             if not p.usable or p.kind == "tpm":
                 continue
             if kind and p.kind != kind:
                 continue
-            if p.kind == "recovery" and not looks_recovery:
-                continue
-            if p.kind == "password" and looks_recovery:
-                continue
+            if p.kind == "recovery":
+                if not secret or not looks_recovery:
+                    continue
+            elif p.kind == "password":
+                if not secret or looks_recovery:
+                    continue
+            elif p.kind == "keyfile":
+                if not bek_key:
+                    continue
             tried.append(p.name)
             try:
-                vmk = self._unwrap_vmk(p, secret, progress)
+                vmk = self._unwrap_vmk(p, secret, progress, bek_key=bek_key)
             except ccm.MacMismatch:
                 continue
             except Exception as exc:
@@ -348,7 +438,10 @@ class BitLocker:
         return {"unlocked": False,
                 "reason": _t("bitlocker.incorrect") % (" or ".join(tried).lower())}
 
-    def _unwrap_vmk(self, protector, secret, progress=None):
+    def _unwrap_vmk(self, protector, secret, progress=None, bek_key=None):
+        if protector.kind == "none":
+            return self._unwrap_clear_vmk(protector)
+
         salt = None
         outer, nested = [], []
         for e in protector.entries:
@@ -368,7 +461,14 @@ class BitLocker:
             if digits is None:
                 return None
             initial = hashlib.sha256(digits).digest()
+        elif protector.kind == "keyfile":
+            if not bek_key:
+                return None
+            initial = bek_key
         else:
+            # The double-SHA256 digest BitLocker itself derives from a typed
+            # password, before _stretch() does the actual, expensive KDF
+            # work. Reproduced exactly for the same reason as _stretch().
             initial = hashlib.sha256(
                 hashlib.sha256(secret.encode("utf-16-le")).digest()).digest()
 
@@ -376,6 +476,30 @@ class BitLocker:
         for blob in candidates:
             try:
                 return _ccm_open(key, blob)
+            except ccm.MacMismatch:
+                continue
+            except Unsupported:
+                continue
+        return None
+
+    @staticmethod
+    def _unwrap_clear_vmk(protector):
+        """A clear-key protector's own entries hold the unwrapping key
+        directly (a Key (0x0001) entry -- a 4-byte encryption-method field
+        then the raw key) alongside the AES-CCM-wrapped VMK; unlike every
+        other protector kind, there's no stretch key or salt at all."""
+        raw_key = None
+        candidates = []
+        for e in protector.entries:
+            if e["value_type"] == VALUE_KEY and len(e["data"]) > 4:
+                raw_key = e["data"][4:]
+            elif e["value_type"] == VALUE_AES_CCM:
+                candidates.append(e["data"])
+        if raw_key is None or not candidates:
+            return None
+        for blob in candidates:
+            try:
+                return _ccm_open(raw_key, blob)
             except ccm.MacMismatch:
                 continue
             except Unsupported:
@@ -391,17 +515,28 @@ class BitLocker:
         n = self.key_bytes
         if self.mode == "xts":
             return aes.AES(self.fvek[:n]), aes.AES(self.fvek[n:n * 2])
+        if self.mode == "cbc-diffuser":
+            # Unlike XTS, the two components are NOT packed tightly: each
+            # sits in its own fixed 256-bit (32-byte) slot regardless of the
+            # actual AES key size, so AES-128-diffuser leaves 16 unused
+            # bytes at the end of each slot. Verified against dislocker's
+            # dis_crypt_set_fvekey() (src/encryption/encommon.c), which
+            # reads the tweak key from a hardcoded fvekey+0x20 for both
+            # AES-128-diffuser and AES-256-diffuser -- matching the
+            # whitepaper's "both components are provided with 256 bits of
+            # key material... some of the key bits may go unused" (4.1).
+            return aes.AES(self.fvek[:n]), aes.AES(self.fvek[0x20:0x20 + n])
         return aes.AES(self.fvek[:n]), None
 
     def decrypt_sector(self, offset, data):
         k1, k2 = self._cached_keys()
         if self.mode == "xts":
-            return aes.xts_decrypt(k1, k2, offset // self.sector_size, data)
+            return aes.xts_decrypt(k1, k2, offset // self.sector_size, data,
+                                   sector_size=self.sector_size)
         iv = k1.encrypt_block(struct.pack("<Q", offset) + b"\x00" * 8)
         plain = aes.cbc_decrypt(k1, iv, data)
         if self.mode == "cbc-diffuser":
-            plain = diffuser_decrypt(plain, self.tweak_key, offset,
-                                     self.sector_size)
+            plain = diffuser_decrypt(plain, k2, offset, self.sector_size)
         return plain
 
     def _cached_keys(self):

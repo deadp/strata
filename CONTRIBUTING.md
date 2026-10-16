@@ -20,6 +20,9 @@ python3 run.py          # then open http://127.0.0.1:8722
   frontend, runs the cross-platform smoke matrix (which launches the real
   server), and runs the unit tests.
 - Keep the diff focused: one behaviour per PR, no drive-by reformatting.
+- **Note user-visible changes** under *Unreleased* in
+  [`CHANGELOG.md`](CHANGELOG.md), written for an examiner rather than a
+  developer.
 
 ## The rules that make this codebase what it is
 

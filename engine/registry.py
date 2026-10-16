@@ -45,13 +45,18 @@ class Hive:
         self.findings = []
         if not self.valid:
             return
-        self.seq1 = _u32(data, 4)
-        self.seq2 = _u32(data, 8)
-        self.modified = filetime(_u64(data, 12))
-        self.major = _u32(data, 20)
-        self.minor = _u32(data, 24)
-        self.root_offset = _u32(data, 36)
-        self.hive_bins_size = _u32(data, 40)
+        if len(data) < BASE_BLOCK:
+            self.findings.append(
+                "Hive is cut short inside its base block (%d of %d bytes), "
+                "so it holds no keys to read." % (len(data), BASE_BLOCK))
+        head = data[:48].ljust(48, b"\x00")
+        self.seq1 = _u32(head, 4)
+        self.seq2 = _u32(head, 8)
+        self.modified = filetime(_u64(head, 12))
+        self.major = _u32(head, 20)
+        self.minor = _u32(head, 24)
+        self.root_offset = _u32(head, 36)
+        self.hive_bins_size = _u32(head, 40)
         self.dirty = self.seq1 != self.seq2
         if self.dirty:
             self.findings.append(
@@ -271,7 +276,7 @@ class Hive:
             if bin_size < 4096 or pos + bin_size > end:
                 bin_size = 4096
             cur = pos + 32
-            stop = pos + bin_size
+            stop = min(pos + bin_size, end)   # a hive cut short mid-bin
             while cur + 4 <= stop:
                 size = _i32(self.data, cur)
                 length = abs(size)

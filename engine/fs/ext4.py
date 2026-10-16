@@ -1,5 +1,6 @@
 from .streams import UnsupportedStream
 from .ranges import read_runs
+import base64
 import datetime
 import struct
 
@@ -10,6 +11,17 @@ INCOMPAT_INLINE_DATA = 0x8000
 
 FL_EXTENTS = 0x00080000
 FL_INLINE_DATA = 0x10000000
+XATTR_MAGIC = 0xEA020000
+XATTR_SYSTEM = 7
+
+# e_name_index -> the attribute's namespace prefix, per the ext4 kernel
+# source (fs/ext4/xattr.h). Anything not listed here (e.g. 2/3, the POSIX
+# ACL indices, whose complete name is a fixed string rather than
+# prefix+suffix) is shown as "index:name" instead of guessed at.
+XATTR_PREFIX = {0: "", 1: "user.", 4: "trusted.", 6: "security.",
+               XATTR_SYSTEM: "system."}
+
+XATTR_VALUE_CAP = 4096
 
 S_IFMT = 0xF000
 S_IFDIR = 0x4000
@@ -36,6 +48,31 @@ def _mode_string(mode):
         bits += ("r" if p & 4 else "-") + ("w" if p & 2 else "-") + \
                 ("x" if p & 1 else "-")
     return kind + bits
+
+def _xattr_entries(buf, entries_start, value_base, limit, max_value, out):
+    """Appends each ext4_xattr_entry found in buf[entries_start:limit] to
+    out, stopping at an all-zero header (the end of the list) or when a
+    header would run past limit. value_base is where e_value_offs counts
+    from: right after the in-inode magic for an in-inode list, or the
+    start of the block for an external xattr block."""
+    i = entries_start
+    while i + 16 <= limit:
+        name_len, index, value_offs, value_inum, value_size = \
+            struct.unpack("<BBHII", buf[i:i + 12])
+        if not name_len and not index and not value_offs:
+            break
+        name = buf[i + 16:i + 16 + name_len].decode("utf-8", "replace")
+        if not value_inum and not (index == XATTR_SYSTEM and name == "data"):
+            v = value_base + value_offs
+            cap = min(value_size, max_value)
+            value = bytes(buf[v:min(len(buf), v + cap)])
+            prefix = XATTR_PREFIX.get(index)
+            label = (prefix + name) if prefix is not None \
+                else "%d:%s" % (index, name)
+            out.append({"name": label, "size": value_size, "value": value,
+                        "truncated": value_size > max_value})
+        i += (16 + name_len + 3) & ~3
+    return out
 
 class Inode:
     def __init__(self, num, raw, fs):
@@ -77,6 +114,60 @@ class Inode:
     @property
     def inline(self):
         return bool(self.flags & FL_INLINE_DATA)
+
+    @property
+    def file_acl(self):
+        """The block holding this inode's external xattrs, or 0 when
+        every attribute (if any) fits in the inode itself."""
+        raw = self.raw
+        lo = struct.unpack("<I", raw[104:108])[0] if len(raw) >= 108 else 0
+        hi = struct.unpack("<H", raw[118:120])[0] if len(raw) >= 120 else 0
+        return lo | (hi << 32)
+
+    def xattrs(self, max_value=XATTR_VALUE_CAP):
+        """Every extended attribute on this file, in-inode and (via
+        file_acl) in its external xattr block, each value read up to
+        max_value bytes. system.data -- inline file data kept in this
+        same entry format, read whole by inline_xattr() for the file's
+        actual content -- is not an attribute an examiner is asking for
+        here, so it is left out."""
+        out = []
+        raw = self.raw
+        start = 128 + self.extra_isize
+        if len(raw) >= start + 4 and \
+                struct.unpack("<I", raw[start:start + 4])[0] == XATTR_MAGIC:
+            first = start + 4
+            _xattr_entries(raw, first, first, len(raw), max_value, out)
+        block = self.file_acl
+        if block:
+            blk = self.fs.source.read_at(block * self.fs.block_size,
+                                         self.fs.block_size)
+            if len(blk) >= 32 and \
+                    struct.unpack("<I", blk[0:4])[0] == XATTR_MAGIC:
+                _xattr_entries(blk, 32, 0, len(blk), max_value, out)
+        return out
+
+    def inline_xattr(self):
+        """The in-inode "system.data" extended attribute, where inline data
+        past the 60 bytes of i_block is kept; b"" when there is none."""
+        start = 128 + self.extra_isize
+        raw = self.raw
+        if len(raw) < start + 4 or \
+                struct.unpack("<I", raw[start:start + 4])[0] != XATTR_MAGIC:
+            return b""
+        first = start + 4
+        i = first
+        while i + 16 <= len(raw):
+            name_len, index, value_offs, value_inum, value_size = \
+                struct.unpack("<BBHII", raw[i:i + 12])
+            if not name_len and not index and not value_offs:
+                break
+            name = raw[i + 16:i + 16 + name_len]
+            if index == XATTR_SYSTEM and name == b"data" and not value_inum:
+                v = first + value_offs
+                return bytes(raw[v:min(len(raw), v + value_size)])
+            i += (16 + name_len + 3) & ~3
+        return b""
 
 class Ext4FS:
     name = "ext4"
@@ -147,6 +238,9 @@ class Ext4FS:
                     def recover(self, num):
                         return None
 
+                    def read_recovered(self, num, max_bytes=None):
+                        return b""
+
                     def inode_versions(self, num):
                         return []
                 self._journal = _Absent()
@@ -192,11 +286,19 @@ class Ext4FS:
         self._inode_cache[num] = ino
         return ino
 
-    def _extent_runs(self, block_area, depth_guard=0):
+    def _extent_runs(self, block_area, depth_guard=0, want_depth=None,
+                     seen=None):
         if len(block_area) < 12 or block_area[0:2] != b"\x0A\xF3":
             return []
         entries = struct.unpack("<H", block_area[2:4])[0]
         depth = struct.unpack("<H", block_area[6:8])[0]
+        # Each level down is exactly one shallower, and no index block is
+        # read twice: a damaged tree that points back at itself, or at one
+        # node many times, would otherwise cost fan-out ** depth reads.
+        if want_depth is not None and depth != want_depth:
+            return []
+        if seen is None:
+            seen = set()
         out = []
         if depth == 0:
             for i in range(entries):
@@ -218,8 +320,12 @@ class Ext4FS:
                     break
                 leaf = struct.unpack("<I", e[4:8])[0] | \
                     (struct.unpack("<H", e[8:10])[0] << 32)
+                if leaf in seen:
+                    continue
+                seen.add(leaf)
                 node = self.source.read_at(leaf * self.block_size, self.block_size)
-                out.extend(self._extent_runs(node, depth_guard + 1))
+                out.extend(self._extent_runs(node, depth_guard + 1,
+                                             depth - 1, seen))
         return out
 
     def _indirect_blocks(self, block_area, needed):
@@ -254,14 +360,30 @@ class Ext4FS:
                     blocks.append(b)
         return blocks
 
+    def _hole(self, logical, count):
+        return {"offset": 0, "length": count * self.block_size,
+                "block": 0, "blocks": count, "logical": logical,
+                "sparse": True, "initialised": True}
+
     def runs(self, ino):
         if ino.inline:
             return []
         out = []
         if ino.uses_extents:
+            if ino.block_area[0:2] != b"\x0A\xF3":
+                return []
             ext = self._extent_runs(ino.block_area)
             ext.sort()
+            # Extents only cover what was written, and every reader walks
+            # the runs end to end, so a gap in logical block numbers has to
+            # become an explicit hole or later data shifts down into it.
+            # Directories are never sparse in ext4, and listing reads them
+            # whole, so a hole there is corruption and is not filled.
+            holes = not ino.is_dir
+            expected = 0
             for logical, phys, count, initialised in ext:
+                if holes and logical > expected:
+                    out.append(self._hole(expected, logical - expected))
                 out.append({
                     "offset": phys * self.block_size,
                     "length": count * self.block_size,
@@ -269,6 +391,10 @@ class Ext4FS:
                     "logical": logical, "sparse": False,
                     "initialised": initialised,
                 })
+                expected = max(expected, logical + count)
+            size_blocks = (ino.size + self.block_size - 1) // self.block_size
+            if holes and size_blocks > expected:
+                out.append(self._hole(expected, size_blocks - expected))
         else:
             needed = (ino.size + self.block_size - 1) // self.block_size
             blocks = self._indirect_blocks(ino.block_area, needed)
@@ -293,7 +419,7 @@ class Ext4FS:
     def read_inode_data(self, ino, max_bytes=None):
         limit = ino.size if max_bytes is None else min(ino.size, max_bytes)
         if ino.inline:
-            body = ino.block_area + ino.raw[128:]
+            body = ino.block_area + ino.inline_xattr()
             return bytes(body[:limit])
         if ino.is_link and ino.size < 60:
             return bytes(ino.block_area[:ino.size])
@@ -309,7 +435,14 @@ class Ext4FS:
         return bytes(out[:limit])
 
     def _dir_entries(self, ino):
-        data = self.read_inode_data(ino)
+        if ino.inline:
+            # i_block opens with the parent's inode number (the ".." entry)
+            # and the xattr value continues the dirents on its own.
+            return (self._parse_dirents(ino.block_area[4:])
+                    + self._parse_dirents(ino.inline_xattr()))
+        return self._parse_dirents(self.read_inode_data(ino))
+
+    def _parse_dirents(self, data):
         out = []
         i = 0
         filetype = bool(self.feature_incompat & INCOMPAT_FILETYPE)
@@ -397,6 +530,13 @@ class Ext4FS:
                        else ("inline" if ino.inline else "indirect blocks"),
             "flags": "0x%08X" % ino.flags,
         }
+        xattrs = ino.xattrs()
+        if xattrs:
+            info["xattrs"] = [
+                {"name": a["name"], "size": a["size"],
+                 "truncated": a["truncated"],
+                 "value": base64.b64encode(a["value"]).decode("ascii")}
+                for a in xattrs]
         if ino.inline:
             info["note"] = ("Content is stored inside the inode itself. No "
                             "blocks are allocated, so there is nothing to "
@@ -406,8 +546,8 @@ class Ext4FS:
         if runs:
             info["runs"] = runs
             tail = ino.size % self.block_size
-            if tail:
-                last = runs[-1]
+            last = runs[-1]
+            if tail and not last["sparse"]:
                 info["slack"] = {
                     "offset": last["offset"] + last["length"]
                     - (self.block_size - tail),

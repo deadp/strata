@@ -1,0 +1,60 @@
+name: Fuzz
+
+# Mutation fuzzing of the evidence parsers (tests/fuzz.py).  Kept out of the
+# main CI workflow on purpose: it runs against a time budget rather than to
+# completion, and a finding is something to triage, not a reason to block an
+# unrelated PR.  Findings are uploaded as an artifact with their inputs, and
+# each can be replayed locally with `python3 tests/fuzz.py --replay <file>`.
+
+on:
+  pull_request:
+    paths:
+      - 'engine/**'
+      - 'tests/fuzz.py'
+      - 'tests/imagebuild_*.py'
+  schedule:
+    - cron: '41 4 * * 2'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Time budget in minutes'
+        default: '20'
+      target:
+        description: 'Target (all, fat16, ntfs, ext4, hive, ewf, ...)'
+        default: 'all'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz parsers
+    runs-on: ubuntu-latest
+    # A PR gets a short pass over whatever it touched; the weekly run and a
+    # manual dispatch get long enough to find the less shallow problems.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Run the fuzzer
+        env:
+          MINUTES: ${{ github.event_name == 'pull_request' && '3' || github.event.inputs.minutes || '45' }}
+          TARGET: ${{ github.event.inputs.target || 'all' }}
+        run: |
+          python tests/fuzz.py --minutes "$MINUTES" --target "$TARGET" \
+            --seed "${{ github.run_id }}" --out fuzz-findings
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-findings
+          path: fuzz-findings/
+          if-no-files-found: ignore
+          retention-days: 30

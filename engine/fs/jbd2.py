@@ -46,6 +46,11 @@ class Journal:
         return b""
 
     def _load(self):
+        # Set before any early return: recover() and inode_versions() stay
+        # reachable on an invalid journal (ext4.stat calls recover() for
+        # deleted inodes) and both read block_size.
+        self._runs = []
+        self.block_size = self.fs.block_size
         ino, runs = self._journal_runs()
         if not ino or not runs:
             self.findings.append("No journal inode, or it has no blocks. "
@@ -53,7 +58,6 @@ class Journal:
                                  "may be on an external device.")
             return
         self._runs = runs
-        self.block_size = self.fs.block_size
 
         sb = self._read_journal_block(0)
         if len(sb) < 68 or struct.unpack(">I", sb[0:4])[0] != JBD2_MAGIC:
@@ -177,6 +181,8 @@ class Journal:
         return block, byte % self.block_size
 
     def inode_versions(self, num):
+        if not self.valid:
+            return []
         from .ext4 import Inode
         block, offset = self._inode_location(num)
         if block is None:
@@ -214,6 +220,8 @@ class Journal:
         return out
 
     def recover(self, num):
+        if not self.valid:
+            return None
         versions = self.inode_versions(num)
         usable = [v for v in versions if v["runs"] and not v["deleted"]]
         if not usable:
@@ -234,6 +242,8 @@ class Journal:
         }
 
     def read_recovered(self, num, max_bytes=None):
+        if not self.valid:
+            return b""
         rec = self.recover(num)
         if not rec:
             return b""

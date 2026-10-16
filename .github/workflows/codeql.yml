@@ -1,0 +1,56 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly as well as on push: CodeQL's query packs are updated
+    # independently of this repo, so new checks reach unchanged code.
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # engine/ parses untrusted forensic input (images, filesystems,
+        # registry hives, archives, ...) byte by byte, and web/ is the
+        # local HTTP UI that talks to it -- both are exactly the kind of
+        # code CodeQL is worth running against. No compiled languages
+        # here, so build-mode is always "none".
+        include:
+          - { language: python, build-mode: none }
+          - { language: javascript-typescript, build-mode: none }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+          paths-ignore: |
+            docs/**
+            **/*.md
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: '/language:${{ matrix.language }}'

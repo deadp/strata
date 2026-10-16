@@ -5,41 +5,60 @@ import os
 import re
 
 from . import filesearch
+from . import fuzzyhash
 
 _HEX = re.compile(r"\b([0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\b")
 
 ALGO_BY_LEN = {32: "md5", 40: "sha1", 64: "sha256"}
 
-def node_of(entry):
-    for key in ("mft", "inode", "oid", "start_cluster"):
-        v = entry.get(key)
-        if v is not None:
-            return v
-    return None
+from .nodes import node_of, node_key  # noqa: F401  (re-exported)
 
-def node_key(entry):
-    v = node_of(entry)
-    return None if v is None else str(v)
+CHUNK = 4 << 20
+
+def _chunks(fs, entry, limit):
+    """The file's content, `limit` bytes at most, a piece at a time."""
+    ranged = getattr(fs, "read_range", None)
+    if ranged is None:
+        data = fs.read_file(entry, limit) or b""
+        if data:
+            yield data
+        return
+    off = 0
+    while limit is None or off < limit:
+        want = CHUNK if limit is None else min(CHUNK, limit - off)
+        got = ranged(entry, off, want)
+        if not got:
+            return
+        yield got
+        off += len(got)
 
 def hash_entry(fs, entry, max_bytes=None):
-    md5, sha1, sha256 = hashlib.md5(), hashlib.sha1(), hashlib.sha256()
     size = entry.get("size") or 0
-    data = fs.read_file(entry, max_bytes if max_bytes else size or None)
-    if data is None:
-        data = b""
-    md5.update(data)
-    sha1.update(data)
-    sha256.update(data)
+    limit = max_bytes if max_bytes else (size or None)
+    md5, sha1, sha256 = hashlib.md5(), hashlib.sha1(), hashlib.sha256()
+    fuzzy = fuzzyhash.Hasher(limit or 0)
+    read = 0
+    for chunk in _chunks(fs, entry, limit):
+        md5.update(chunk)
+        sha1.update(chunk)
+        sha256.update(chunk)
+        fuzzy.feed(chunk)
+        read += len(chunk)
     return {
         "node": node_key(entry), "name": entry.get("name"),
         "path": entry.get("path"),
-        "size": size, "read": len(data), "deleted": bool(entry.get("deleted")),
+        "size": size, "read": read, "deleted": bool(entry.get("deleted")),
         "md5": md5.hexdigest(), "sha1": sha1.hexdigest(),
         "sha256": sha256.hexdigest(),
-        "partial": bool(size and len(data) < size),
+        "fuzzy": (fuzzy.digest(lambda: _chunks(fs, entry, limit))
+                  if read else None),
+        "partial": bool(size and read < size),
     }
 
-def hash_many(fs, entries, progress=None, max_bytes=None):
+def hash_many(fs, entries, progress=None, max_bytes=None, failures=None):
+    """Hash every file in `entries`. A file that cannot be read is not
+    dropped silently: when `failures` is a list, it gets one row per such
+    file, naming it and saying why."""
     out = []
     total = max(1, len(entries))
     for i, e in enumerate(entries):
@@ -49,8 +68,12 @@ def hash_many(fs, entries, progress=None, max_bytes=None):
             continue
         try:
             out.append(hash_entry(fs, e, max_bytes))
-        except Exception:
-            continue
+        except Exception as exc:
+            if failures is not None:
+                failures.append({"node": node_key(e), "name": e.get("name"),
+                                 "path": e.get("path"),
+                                 "size": e.get("size") or 0,
+                                 "error": str(exc) or type(exc).__name__})
     if progress:
         progress(1.0)
     return out
@@ -145,6 +168,45 @@ def import_hash_set(case, path, name=None, kind="known_bad"):
     name = name or os.path.splitext(os.path.basename(path))[0]
     res = case.add_hash_set(name, kind, path, digests)
     return {"name": name, "kind": kind, **res}
+
+def matched_hash_map(case, evidence_id, part):
+    """Like case.hash_map, but each already-hashed node also carries
+    match_kind/matches when its digest is in an imported hash set —
+    the same lookup annotate_matches does for a hash run, applied to
+    whatever has been hashed already so folder and search views can
+    show it without hashing anything themselves."""
+    hashes = case.hash_map(evidence_id, part)
+    if not hashes:
+        return hashes
+    digests = []
+    for h in hashes.values():
+        digests += [h.get("md5"), h.get("sha1"), h.get("sha256")]
+    found = case.match_hashes([d for d in digests if d])
+    if not found:
+        return hashes
+    for h in hashes.values():
+        hits = []
+        for algo in ("md5", "sha1", "sha256"):
+            for m in found.get((h.get(algo) or "").lower(), []):
+                if m["algo"] == algo:
+                    hits.append(m)
+        if hits:
+            h["matches"] = hits
+            kinds = {m["kind"] for m in hits}
+            h["match_kind"] = ("known_bad" if "known_bad" in kinds
+                               else "notable" if "notable" in kinds
+                               else "known_good")
+    return hashes
+
+def annotate_hits(hits, matched_map):
+    """Marks each hit whose filesystem node is in matched_map (from
+    matched_hash_map) with its match_kind/matches, in place."""
+    for h in hits:
+        info = matched_map.get(node_key(h))
+        if info and info.get("match_kind"):
+            h["match_kind"] = info["match_kind"]
+            h["matches"] = info["matches"]
+    return hits
 
 def annotate_matches(case, rows):
     digests = []

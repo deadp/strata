@@ -1,7 +1,8 @@
 """Start the application and check that it actually serves.
 
 Exercises the running server rather than importing it: static assets, the
-version endpoint, path-traversal refusal, and the preferences whitelist.
+version endpoint, path-traversal refusal, the preferences whitelist, and that
+previewing or opening a file that is not a case leaves it untouched.
 
     python3 tests/smoke.py [-v]
 
@@ -9,16 +10,19 @@ Preferences are redirected to a temporary directory via STRATA_CONFIG_DIR, so
 running this never touches the preferences of whoever is logged in.
 """
 
+import hashlib
 import http.client
 import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,6 +84,21 @@ def post_json(opener, url, payload):
         if r.status != 200:
             raise AssertionError("POST %s returned %d" % (url, r.status))
         return json.loads(r.read().decode("utf-8"))
+
+
+def post_expect(opener, url, payload, want=200):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        r = opener.open(req, timeout=20)
+    except urllib.error.HTTPError as exc:
+        r = exc
+    body = r.read()
+    if r.status != want:
+        raise AssertionError("POST %s returned %d, expected %d"
+                             % (url, r.status, want))
+    return json.loads(body.decode("utf-8"))
 
 
 def raw_get(port, path):
@@ -245,6 +264,109 @@ def run(config_dir, log_path):
                 raise AssertionError("unknown key was stored")
             return "unknown key dropped"
 
+        def non_case_untouched():
+            folder = os.path.join(config_dir, "not-cases")
+            os.makedirs(folder, exist_ok=True)
+            empty = os.path.join(folder, "empty.bin")
+            open(empty, "wb").close()
+            history = os.path.join(folder, "History")
+            db = sqlite3.connect(history)
+            db.execute("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT)")
+            db.commit()
+            db.close()
+
+            def state():
+                out = {}
+                for name in sorted(os.listdir(folder)):
+                    p = os.path.join(folder, name)
+                    if os.path.isdir(p):
+                        out[name] = "<dir>"
+                    else:
+                        with open(p, "rb") as fh:
+                            out[name] = hashlib.sha256(fh.read()).hexdigest()
+                return out
+
+            before = state()
+            for target in (empty, history):
+                name = os.path.basename(target)
+                get(opener, base + "/api/case/peek?"
+                    + urllib.parse.urlencode({"path": target}), want=400)
+                req = urllib.request.Request(
+                    base + "/api/case/open",
+                    data=json.dumps({"path": target,
+                                     "examiner": EXAMINER}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                try:
+                    opener.open(req, timeout=20)
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 400:
+                        raise AssertionError(
+                            "opening %s returned %d, expected 400"
+                            % (name, exc.code))
+                else:
+                    raise AssertionError("opening %s as a case succeeded" % name)
+            after = state()
+            if after != before:
+                raise AssertionError("files changed: %r -> %r" % (before, after))
+            return "empty file and SQLite database refused, unchanged"
+
+        def wait_task(t):
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                got = get_json(opener, base + "/api/task?"
+                               + urllib.parse.urlencode({"id": t["id"]}))
+                if got.get("state") not in (None, "running"):
+                    return got
+                time.sleep(0.2)
+            raise AssertionError("task %s did not finish" % t.get("id"))
+
+        legacy = os.path.join(config_dir, "legacy.strata")
+
+        def legacy_index_moves():
+            # A case from before the index lived in cache/. The interface
+            # POSTs to /api/index/relocate on open; that route used to be
+            # GET-only, so the move never ran and the record kept the index.
+            post_json(opener, base + "/api/case/new",
+                      {"path": legacy, "name": "legacy",
+                       "examiner": EXAMINER})
+            post_json(opener, base + "/api/case/close", {})
+            db = sqlite3.connect(os.path.join(legacy, "case.sqlite"))
+            db.executescript("""
+                CREATE VIRTUAL TABLE content_index USING fts5(
+                    name, path, body, node UNINDEXED, part UNINDEXED,
+                    size UNINDEXED, deleted UNINDEXED, modified UNINDEXED,
+                    abs_offset UNINDEXED, kind UNINDEXED, evidence UNINDEXED,
+                    tokenize = 'unicode61');
+            """)
+            db.executemany(
+                "INSERT INTO content_index VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [("f%d" % i, "/f%d" % i, "needle %d" % i, str(i), 0, 1, 0,
+                  "", "", "file", "1") for i in range(5)])
+            db.commit()
+            db.close()
+            post_json(opener, base + "/api/case/open",
+                      {"path": legacy, "examiner": EXAMINER})
+            done = wait_task(post_json(opener, base + "/api/index/relocate",
+                                       {}))
+            if (done.get("result") or {}).get("moved") != 5:
+                raise AssertionError("relocation did not move the index: %r"
+                                     % done)
+            db = sqlite3.connect(os.path.join(legacy, "case.sqlite"))
+            left = db.execute("SELECT name FROM sqlite_master "
+                              "WHERE name='content_index'").fetchall()
+            db.close()
+            if left:
+                raise AssertionError("content_index is still in case.sqlite")
+            return "5 documents moved to cache/"
+
+        def compact_runs():
+            done = wait_task(post_json(opener, base + "/api/case/compact", {}))
+            got = done.get("result") or {}
+            if not got.get("compacted"):
+                raise AssertionError("compact did not run: %r" % done)
+            return "%d -> %d bytes" % (got["before"], got["after"])
+
         check("/api/version reports a version", version)
         check("/ serves the app shell", shell)
         check("/app.js is served", asset("/app.js", ("javascript", "ecmascript")))
@@ -258,6 +380,10 @@ def run(config_dir, log_path):
         check("prefs reject a bogus theme", prefs_rejects)
         check("prefs clamp an out-of-range width", prefs_clamps)
         check("prefs drop an unknown key", unknown_key)
+        check("a file that is not a case is left untouched", non_case_untouched)
+        check("a legacy case's index moves out of the record",
+              legacy_index_moves)
+        check("a case with no evidence open can be compacted", compact_runs)
 
     finally:
         code = stop(proc)
@@ -266,6 +392,72 @@ def run(config_dir, log_path):
     # what matters for CI is that the process goes away promptly when asked.
     check("server stops when signalled", lambda: "exit %s" % code)
     log(read_log(log_path))
+
+
+def run_readonly(config_dir, log_path):
+    """A second, short-lived server run with --read-only: export and report
+    writing must be refused straight at the API, not just hidden in the
+    interface (issue #70)."""
+    port = free_port()
+    base = "http://127.0.0.1:%d" % port
+
+    env = dict(os.environ)
+    env["STRATA_CONFIG_DIR"] = config_dir
+    env["PYTHONUNBUFFERED"] = "1"
+
+    print("starting %s run.py --read-only --port %d"
+          % (os.path.basename(sys.executable), port))
+    with open(log_path, "wb") as sink:
+        proc = subprocess.Popen(
+            [sys.executable, "run.py", "--read-only",
+             "--port", str(port), "--host", "127.0.0.1"],
+            cwd=ROOT, env=env, stdout=sink, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL)
+
+    try:
+        wait_for_server(proc, base, log_path)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor())
+
+        def state_reports_read_only():
+            d = get_json(opener, base + "/api/state")
+            if d.get("read_only") is not True:
+                raise AssertionError("/api/state did not report read_only: %r" % d)
+
+        def export_refused():
+            d = post_expect(opener, base + "/api/export", {}, want=403)
+            if "error" not in d:
+                raise AssertionError("export refusal carried no error: %r" % d)
+            return d["error"]
+
+        def export_file_refused():
+            post_expect(opener, base + "/api/export/file", {}, want=403)
+
+        def export_folder_refused():
+            post_expect(opener, base + "/api/export/folder", {}, want=403)
+
+        def export_manifest_refused():
+            post_expect(opener, base + "/api/export/manifest", {}, want=403)
+
+        def report_write_refused():
+            post_expect(opener, base + "/api/report/write", {}, want=403)
+
+        def reads_still_work():
+            # Examination itself must be unaffected by read-only mode.
+            d = get_json(opener, base + "/api/version")
+            if not d.get("version"):
+                raise AssertionError("version missing under --read-only: %r" % d)
+            return "version %s" % d["version"]
+
+        check("--read-only: /api/state reports read_only", state_reports_read_only)
+        check("--read-only: raw byte-range export refused", export_refused)
+        check("--read-only: file export refused", export_file_refused)
+        check("--read-only: folder export refused", export_folder_refused)
+        check("--read-only: export manifest refused", export_manifest_refused)
+        check("--read-only: report write refused", report_write_refused)
+        check("--read-only: examination reads still work", reads_still_work)
+    finally:
+        stop(proc)
 
 
 def stop(proc):
@@ -296,6 +488,17 @@ def main():
         print("     %s" % exc)
     finally:
         shutil.rmtree(config_dir, ignore_errors=True)
+
+    ro_config_dir = tempfile.mkdtemp(prefix="strata-ci-readonly-")
+    ro_log_path = os.path.join(ro_config_dir, "server.log")
+    try:
+        run_readonly(ro_config_dir, ro_log_path)
+    except AssertionError as exc:
+        failures.append("read-only server startup")
+        print("FAIL read-only server startup")
+        print("     %s" % exc)
+    finally:
+        shutil.rmtree(ro_config_dir, ignore_errors=True)
 
     print()
     if failures:

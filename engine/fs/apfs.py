@@ -1,5 +1,8 @@
 from .streams import UnsupportedStream
 from .ranges import read_runs
+from .. import decmpfs
+from .. import xattr as xattr_mod
+from ..text import t as _t
 import datetime
 import struct
 
@@ -17,8 +20,15 @@ TYPE_XATTR = 4
 TYPE_DSTREAM_ID = 6
 TYPE_FILE_EXTENT = 8
 TYPE_DIR_REC = 9
+TYPE_SNAP_METADATA = 0x0B
+TYPE_SNAP_NAME = 0x0C
+SNAP_META_DATALESS = 0x1
+SNAP_META_MERGE_IN_PROGRESS = 0x2
 
 ROOT_DIR_OID = 2
+UF_COMPRESSED = 0x20
+DECMPFS_XATTR = "com.apple.decmpfs"
+RESOURCE_FORK_XATTR = "com.apple.ResourceFork"
 
 def fletcher64(data):
     body = data[8:]
@@ -459,13 +469,30 @@ class ApfsVolume:
         return {"name": name, "file_id": file_id, "added": added,
                 "kind": flags & 0x0F}
 
+    # Extended-attribute value flags (j_xattr_val_t).
+    XATTR_DATA_STREAM = 0x0001
+    XATTR_DATA_EMBEDDED = 0x0002
+
     @staticmethod
     def _parse_xattr(key, val):
         name = ""
         if len(key) >= 10:
             nlen = struct.unpack("<H", key[8:10])[0]
             name = key[10:10 + nlen].split(b"\x00")[0].decode("utf-8", "replace")
-        return {"name": name, "size": len(val)}
+        out = {"name": name, "size": len(val)}
+        if len(val) >= 4:
+            flags, xdata_len = struct.unpack_from("<HH", val, 0)
+            if flags & ApfsVolume.XATTR_DATA_EMBEDDED:
+                data = val[4:4 + xdata_len]
+                if len(data) == xdata_len:
+                    out["size"] = xdata_len
+                    out["value"] = data
+            elif flags & ApfsVolume.XATTR_DATA_STREAM and len(val) >= 20:
+                # xattr_dstream: the object the value's extents are filed
+                # under, then that stream's size.
+                out["stream_id"], out["size"] = struct.unpack_from(
+                    "<QQ", val, 4)
+        return out
 
     def _size_of(self, oid, recs):
         ino = recs["inode"].get(oid)
@@ -474,9 +501,62 @@ class ApfsVolume:
         ext = recs["extent"].get(oid) or []
         return sum(e["length"] for e in ext)
 
+    def _compression(self, oid, ino, recs, entry):
+        """Note on `entry` that the file is transparently compressed
+        (UF_COMPRESSED and a com.apple.decmpfs attribute), and take its
+        size from the header when Strata can decompress it."""
+        header = None
+        for x in recs["xattr"].get(oid, ()):
+            if x["name"] == DECMPFS_XATTR:
+                header = decmpfs.parse_header(x.get("value"))
+        if header is None:
+            entry["compression_damaged"] = True
+            return
+        entry["compression"] = decmpfs.describe(header)
+        entry["uncompressed_size"] = header["size"]
+        if header["supported"]:
+            entry["_decmpfs"] = header
+            entry["size"] = header["size"]
+        else:
+            entry["compression_unsupported"] = True
+
+    def _resource_fork(self, oid, recs):
+        """(read(off, n), size) over the file's com.apple.ResourceFork
+        attribute, or (None, 0) when it has none."""
+        for x in recs["xattr"].get(oid, ()):
+            if x["name"] != RESOURCE_FORK_XATTR:
+                continue
+            if "value" in x:
+                data = x["value"]
+                return (lambda off, n: data[off:off + n]), len(data)
+            if "stream_id" in x:
+                stream, size = x["stream_id"], x["size"]
+                runs = self.runs(stream, size)
+                return (lambda off, n: read_runs(
+                    self.source, runs, off, min(n, max(0, size - off)))), size
+        return None, 0
+
+    def _decompressed(self, entry):
+        """The decmpfs reader for a compressed file (None for any other);
+        raises DecmpfsError if its compressed data cannot be laid out."""
+        header = entry.get("_decmpfs")
+        if header is None:
+            return None
+        key = entry.get("oid")
+        cache = self.__dict__.setdefault("_compressed", {})
+        got = cache.get(key)
+        if got is None:
+            reader, size = self._resource_fork(key, self._catalog())
+            got = decmpfs.Compressed(header, reader, size)
+            if len(cache) >= 8:
+                cache.clear()
+            cache[key] = got
+        return got
+
     def listdir(self, oid=ROOT_DIR_OID, path="/"):
         recs = self._catalog()
         out = []
+        lost = unsupported = 0
         for d in recs["drec"].get(oid or ROOT_DIR_OID, []):
             ino = recs["inode"].get(d["file_id"], {})
             is_dir = ino.get("is_dir", d["kind"] == 4)
@@ -494,13 +574,25 @@ class ApfsVolume:
                             for x in recs["xattr"].get(d["file_id"], [])],
                 "id": "apfs:%d" % d["file_id"],
             })
+        for e in out:
+            if not e["is_dir"] and not self.encrypted \
+                    and recs["inode"].get(e["oid"], {}).get("bsd_flags", 0) \
+                    & UF_COMPRESSED:
+                self._compression(e["oid"], recs["inode"][e["oid"]], recs, e)
+                lost += bool(e.get("compression_damaged"))
+                unsupported += bool(e.get("compression_unsupported"))
+        if unsupported and _t("apfs.compression_unsupported") not in self.findings:
+            self.findings.append(_t("apfs.compression_unsupported"))
+        if lost and _t("apfs.compression_damaged") not in self.findings:
+            self.findings.append(_t("apfs.compression_damaged"))
         out.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
         return out
 
-    def runs(self, oid):
+    def runs(self, oid, size=None):
         recs = self._catalog()
         ext = sorted(recs["extent"].get(oid, []), key=lambda e: e["logical"])
-        size = self._size_of(oid, recs)
+        if size is None:
+            size = self._size_of(oid, recs)
         out = []
         remaining = size
         for e in ext:
@@ -519,6 +611,10 @@ class ApfsVolume:
     def read_file(self, entry, max_bytes=None, stream=""):
         if stream:
             raise UnsupportedStream("APFS", stream)
+        if "_decmpfs" in entry:
+            comp = self._decompressed(entry)
+            return comp.read_at(0, comp.size if max_bytes is None
+                                else min(comp.size, max_bytes))
         oid = entry.get("oid")
         if oid is None:
             return b""
@@ -538,6 +634,8 @@ class ApfsVolume:
     def read_range(self, entry, off, length, stream=""):
         if stream:
             raise UnsupportedStream("APFS", stream)
+        if "_decmpfs" in entry:
+            return self._decompressed(entry).read_at(off, length)
         oid = entry.get("oid")
         if oid is None:
             return b""
@@ -578,12 +676,33 @@ class ApfsVolume:
             info["note"] = ("Volume is encrypted. Extents point at ciphertext; "
                             "this build does not decrypt.")
         if recs["xattr"].get(oid):
-            info["xattrs"] = recs["xattr"][oid]
+            info["xattrs"] = xattr_mod.for_client(recs["xattr"][oid])
         if ino and ino.get("size") is None and recs["extent"].get(oid):
             info["note"] = ("No data stream field on this inode, so the size "
                             "shown is the total of its extents and is rounded "
                             "up to the block size.")
+        if entry.get("compression"):
+            info["compression"] = {
+                "codec": entry["compression"],
+                "uncompressed_size": entry["uncompressed_size"]}
+            info["note"] = self._compression_note(entry, info)
+        elif entry.get("compression_damaged"):
+            info["note"] = _t("apfs.compressed_no_header")
         return info
+
+    def _compression_note(self, entry, info):
+        if entry.get("compression_unsupported"):
+            return _t("apfs.compressed_unread") % entry["compression"]
+        try:
+            comp = self._decompressed(entry)
+            comp.read_at(0, 1)
+        except decmpfs.DecmpfsError as exc:
+            return _t("apfs.compressed_failed") % (entry["compression"], exc)
+        text = _t("apfs.compressed") % entry["compression"]
+        if comp.findings:
+            info["compression"]["findings"] = list(comp.findings)
+            text += " " + " ".join(comp.findings)
+        return text
 
     def info(self):
         return {
@@ -609,3 +728,110 @@ class ApfsVolume:
                     out.append((e["phys"] * self.block_size,
                                 e["phys"] * self.block_size + e["length"]))
         return out
+
+    def snapshots(self):
+        if not self.snap_meta_oid:
+            return []
+        recs = []
+        names = {}
+        root = self.resolve(self.snap_meta_oid)
+        if root is None:
+            root = self.snap_meta_oid
+        buf = self.c.read_block(root, label="snapshot metadata tree")
+        if (len(buf) < 56
+                or ObjHeader(buf).kind != OBJ_BTREE_NODE):
+            self.findings.append("Snapshot metadata tree %d is not in the "
+                                 "volume object map." % self.snap_meta_oid)
+            return []
+        self._walk_snap_meta(root, recs, names, seen=set())
+        for r in recs:
+            if not r["name"] and r["xid"] in names:
+                r["name"] = names[r["xid"]]
+        recs = [r for r in recs if r["name"]]
+        recs.sort(key=lambda r: r["created_at"] or "", reverse=True)
+        return recs
+
+    def _walk_snap_meta(self, block, recs, names, depth=0, seen=None):
+        if seen is None:
+            seen = set()
+        if depth > 24 or block in seen:
+            return
+        seen.add(block)
+        buf = self.c.read_block(block, label="snapshot metadata node")
+        if len(buf) < 56:
+            return
+        node = BTreeNode(buf, self.block_size)
+        for key, val in node.items():
+            if len(key) < 8:
+                continue
+            packed = struct.unpack("<Q", key[0:8])[0]
+            oid = packed & 0x0FFFFFFFFFFFFFFF
+            rtype = (packed >> 60) & 0x0F
+            if not node.leaf:
+                if len(val) >= 8:
+                    child_oid = struct.unpack("<Q", val[0:8])[0]
+                    child = self.resolve(child_oid)
+                    if child is None:
+                        child = child_oid
+                    self._walk_snap_meta(child, recs, names, depth + 1, seen)
+                continue
+            if rtype == TYPE_SNAP_METADATA:
+                r = self._parse_snap_meta(oid, val)
+                if r:
+                    recs.append(r)
+            elif rtype == TYPE_SNAP_NAME:
+                name = self._snap_name_key(key)
+                if name and len(val) >= 8:
+                    names[name] = struct.unpack("<Q", val[0:8])[0]
+
+    @staticmethod
+    def _parse_snap_meta(xid, val):
+        if len(val) < 0x32:
+            return None
+        extentref, sblock = struct.unpack("<QQ", val[0x00:0x10])
+        create, change = struct.unpack("<QQ", val[0x10:0x20])
+        inum = struct.unpack("<Q", val[0x20:0x28])[0]
+        extentref_type, flags = struct.unpack("<II", val[0x28:0x30])
+        name_len = struct.unpack("<H", val[0x30:0x32])[0]
+        name = ""
+        if name_len:
+            raw = val[0x32:0x32 + name_len - 1]
+            name = raw.split(b"\x00")[0].decode("utf-8", "replace")
+        return {
+            "name": name, "xid": xid,
+            "created_at": apfs_time(create), "changed_at": apfs_time(change),
+            "inum": inum, "sblock_oid": sblock,
+            "extentref_tree_oid": extentref,
+            "extentref_tree_type": extentref_type, "flags": flags,
+            "dataless": bool(flags & SNAP_META_DATALESS),
+            "merge_in_progress":
+                bool(flags & SNAP_META_MERGE_IN_PROGRESS),
+        }
+
+    @staticmethod
+    def _snap_name_key(key):
+        if len(key) < 10:
+            return ""
+        nlen = struct.unpack("<H", key[8:10])[0]
+        return key[10:10 + nlen].split(b"\x00")[0].decode("utf-8", "replace")
+
+    def snapshot_volume(self, name):
+        for r in self.snapshots():
+            if r["name"] == name:
+                break
+        else:
+            raise ValueError("No snapshot named %r on this volume." % name)
+        if r["dataless"]:
+            raise ValueError("Snapshot %r is dataless: its file contents "
+                             "were removed, only metadata remains." % name)
+        blk = self.resolve(r["sblock_oid"])
+        if blk is None:
+            blk = r["sblock_oid"]
+        buf = self.c.read_block(blk, label="snapshot superblock")
+        if len(buf) < 36 or buf[32:36] != APFS_MAGIC:
+            raise ValueError("Snapshot %r: object %d is not a readable "
+                             "volume superblock." % (name, r["sblock_oid"]))
+        v = ApfsVolume(self.c, buf, blk, r["sblock_oid"])
+        v.snap_name = name
+        v.snapshot_xid = r["xid"]
+        return v

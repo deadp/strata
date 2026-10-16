@@ -1,0 +1,16 @@
+version: 2
+
+updates:
+  # No pip ecosystem entry by design: Strata is standard-library-only in
+  # the engine and in the tests (see CONTRIBUTING.md), so there is no
+  # requirements.txt / pyproject.toml to keep current. Only the CI
+  # tooling itself -- the GitHub Actions used in the workflows -- has
+  # versions worth Dependabot's attention.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
