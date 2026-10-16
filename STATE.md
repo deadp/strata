@@ -5,7 +5,8 @@ Strata is an offline, stdlib-only forensic image examiner that opens evidence re
 This fork (deadp/strata) is where Joshua's changes are written before they go to upstream switch-nz/strata as PRs.
 
 ## Now
-- Upstream main is at release 0.9.0 (03-10-2026). This fork's main is still at 16-09-2026, 179 commits behind upstream.
+- Fork synced with upstream on 17-10-2026 (Sync fork): main now has upstream's 0.9.0 release (03-10-2026) plus the fork's STATE.md commit. Ahead/behind counts were not checked because upstream could not be fetched from the runner.
+- Tests on synced main: `python -m unittest discover -s tests -p "test_*.py"` ran 1422 tests, OK (14 skipped); `python tests/smoke.py` passed all checks (25 ok lines).
 - Joshua has no open PRs on upstream. His 22 PRs there are all merged or closed (latest: browser disk caches, 23-09-2026).
 - Upstream CI is green: Fuzz 13-10-2026, CodeQL 12-10-2026. The fork's last CI run was 16-09-2026 and passed.
 - Upstream has 9 open issues, mostly feature requests (fuzz corpus, plugin API, localisation, GPS map, fragment carving, memory forensics, FileVault 2).
@@ -22,6 +23,6 @@ This fork (deadp/strata) is where Joshua's changes are written before they go to
 - 03-10-2026: Upstream cuts 0.9.0 with EWF2 (Ex01) and AFF4 read support.
 
 ## Next action
-`Sync this fork's main with upstream switch-nz/strata (fast-forward, no force push), run the tests, then pick one open roadmap item that needs real-evidence checking and open a PR on the fork first.`
+`Take the open roadmap item "LUKS2 with Argon2 against real cryptsetup images" (docs/ROADMAP.md): build a LUKS2 volume with real cryptsetup, check Strata unlocks it, and tick the item only if it does. Open the PR on the fork first.`
 
-Last updated: 14-10-2026
+Last updated: 17-10-2026
