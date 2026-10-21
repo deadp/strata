@@ -383,5 +383,18 @@ class Robustness(unittest.TestCase):
             h.carve_deleted()
 
 
+class OversizedLog(unittest.TestCase):
+
+    def test_hbins_size_far_beyond_hive_and_log_is_not_replayed(self):
+        stale, log, fresh_bins = build.build_dirty_pair()
+        evil = build.build_log(
+            [build.log_entry(10, 0x7FFFF000, [(0, fresh_bins)])], 10)
+        new, report = reglog.recover(stale, [evil])
+        self.assertIsNone(new)
+        self.assertFalse(report["recovered"])
+        self.assertTrue(any("out of proportion" in f
+                            for f in report["findings"]))
+
+
 if __name__ == "__main__":
     unittest.main()

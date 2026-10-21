@@ -32,26 +32,23 @@ NOTED_ONLY = {
 def looks_like_pdf(head):
     return head[:5] == MAGIC
 
-def _same_length_replacement(name):
-    body = name[1:]
-    return b"/X" + b"x" * (len(body) - 1)
+def _same_length_replacement(length):
+    return b"/X" + b"x" * (length - 2)
 
-_NAME_CHAR = re.compile(rb"[0-9A-Za-z\-_.#]")
+_NAME = re.compile(rb"/[0-9A-Za-z\-_.#]*")
+_HEX_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
+
+def _decoded(name):
+    return _HEX_ESCAPE.sub(lambda m: bytes([int(m.group(1), 16)]), name)
+
+def _name_spans(buf, key):
+    """(start, end) of every name in buf equal to key once #HH escapes are
+    decoded, so /Java#53cript is found as /JavaScript."""
+    return [m.span() for m in _NAME.finditer(buf)
+            if _decoded(m.group()) == key]
 
 def _name_positions(buf, key):
-    out = []
-    start = 0
-    n = len(key)
-    while True:
-        i = buf.find(key, start)
-        if i < 0:
-            return out
-        nxt = buf[i + n:i + n + 1]
-        if nxt and _NAME_CHAR.match(nxt):
-            start = i + 1
-            continue
-        out.append(i)
-        start = i + n
+    return [i for i, _ in _name_spans(buf, key)]
 
 def _streams(data):
     out = []
@@ -160,10 +157,8 @@ class Pdf:
         if self._clean is None:
             out = bytearray(self.data)
             for key in DANGEROUS:
-                rep = _same_length_replacement(key)
-                assert len(rep) == len(key)
-                for i in _name_positions(bytes(out), key):
-                    out[i:i + len(key)] = rep
+                for i, j in _name_spans(bytes(out), key):
+                    out[i:j] = _same_length_replacement(j - i)
             self._clean = bytes(out)
             left = [k.decode() for k in DANGEROUS
                     if _name_positions(self._clean, k)]

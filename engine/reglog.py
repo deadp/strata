@@ -203,6 +203,15 @@ def recover(hive, logs):
     last_seq = None
     for entry, raw in ordered:
         need = HIVE_BASE_BLOCK + entry["hbins_size"]
+        # A hive cannot sensibly grow by more than the log that grew it.
+        limit = len(hive) + len(raw)
+        if need > limit or any(HIVE_BASE_BLOCK + off + length > limit
+                               for off, length, _ in entry["pages"]):
+            report["findings"].append(
+                "A log entry declares a hive size (%d bytes) out of "
+                "proportion to the hive and its log; the log was not "
+                "replayed." % need)
+            return None, report
         if need > len(out):
             out.extend(bytes(need - len(out)))
         for off, length, at in entry["pages"]:

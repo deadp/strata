@@ -11,6 +11,16 @@ records, not how the code changed.
 
 ## [Unreleased]
 
+### Security
+
+- **Crafted evidence can no longer make Strata exhaust memory**: an EWF2
+  image with an inflated chunk count, a registry transaction log claiming a
+  huge hive size, or an AFF4 member or chunk that inflates past its declared
+  size is now refused with a finding. A truncated AFF4 deflate stream is
+  reported instead of being read as short data.
+- **PDF active content written with `#HH` name escapes (for example
+  `/Java#53cript`) is now recognised and stripped** like the plain spelling.
+
 ## [0.9.0] - 2026-10-02
 
 ### Added

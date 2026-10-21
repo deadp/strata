@@ -324,5 +324,29 @@ class Resilience(TempDir):
         img.close()
 
 
+class ChunkIndexBound(TempDir):
+
+    def test_chunk_index_past_declared_size_is_ignored(self):
+        data = b"A" * 2048
+        seg = build.SegmentBuilder()
+        seg.add_object_section(build.SECTION_DEVICE, {"bp": 512, "ts": 4})
+        seg.add_object_section(build.SECTION_CASE, {"sb": 4, "tb": 1})
+        seg.add_section(build.SECTION_SECTORS, data)
+        base = seg.length - len(data) - build.SECTION_DESC_SIZE
+        for first in (0, 1 << 40):
+            header = struct.pack("<QII", first, 1, 0)
+            header += struct.pack("<I", zlib.adler32(header) & 0xFFFFFFFF)
+            header += bytes(12)
+            body = struct.pack("<QII", base, len(data), 0)
+            footer = struct.pack("<I", zlib.adler32(body) & 0xFFFFFFFF)
+            footer += bytes(12)
+            seg.add_section(build.SECTION_TABLE, header + body + footer)
+        img = ewf2.Ewf2Image(self.write("a.Ex01", seg.finish()))
+        self.assertEqual(len(img.chunks), 1)
+        self.assertEqual(img.read_at(0, img.size), data)
+        self.assertTrue(any("past" in f for f in img.findings))
+        img.close()
+
+
 if __name__ == "__main__":
     unittest.main()

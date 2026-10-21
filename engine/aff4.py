@@ -432,7 +432,13 @@ class _Zip:
             return raw
         if e.method == 8:
             try:
-                return zlib.decompress(raw, -15)
+                d = zlib.decompressobj(-15)
+                out = d.decompress(raw, e.size + 1)
+                if len(out) > e.size:
+                    raise zlib.error("member inflates past its declared size")
+                if not d.eof:
+                    raise zlib.error("member is truncated")
+                return out
             except zlib.error:
                 raise Aff4Error(_t("aff4.member_decompress_failed") % name)
         raise Aff4Error(_t("aff4.member_compression_unsupported") % e.method)
@@ -516,7 +522,13 @@ class _ImageStream:
         if length == self.chunk_size:
             return raw
         try:
-            return zlib.decompress(raw)
+            d = zlib.decompressobj()
+            out = d.decompress(raw, self.chunk_size + 1)
+            if len(out) > self.chunk_size:
+                raise zlib.error("chunk inflates past the chunk size")
+            if not d.eof:
+                raise zlib.error("chunk is truncated")
+            return out
         except zlib.error:
             self.findings.append(
                 _t("aff4.chunk_decompress_failed") % (chunk_id, self.urn))
