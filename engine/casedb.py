@@ -551,7 +551,15 @@ class Case:
         self.db.executescript(SCHEMA)
         # Older cases kept unlocked volume keys here. A key decrypts the
         # volume, so it is never stored in the case; drop what is left.
-        self.db.execute("DROP TABLE IF EXISTS volume_keys")
+        # secure_delete zeroes the freed pages and VACUUM rewrites the file,
+        # so the key bytes do not survive in free pages or the journal.
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                           " AND name='volume_keys'").fetchone():
+            self.db.execute("PRAGMA secure_delete=ON")
+            self.db.execute("DROP TABLE volume_keys")
+            self.db.commit()
+            self.db.execute("VACUUM")
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self._migrate_bookmarks()
         self._migrate_file_hashes()
         self._migrate_fuzzy_hash()

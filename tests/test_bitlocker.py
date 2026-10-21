@@ -259,7 +259,6 @@ class KeptKey(unittest.TestCase):
         tables = [r[0] for r in c.db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")]
         self.assertNotIn("volume_keys", tables)
-        c.db.execute("VACUUM")
         c.close()
         for name in os.listdir(path):
             if os.path.isfile(os.path.join(path, name)):
