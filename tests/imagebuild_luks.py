@@ -25,7 +25,7 @@ SLOT_AREA_OFFSET = 32 * 1024
 STRIPES = 16
 UUID = "5f3a3cb0-7b6e-4f2a-9e5c-1d2b3a4c5d6e"
 DIGEST_ITER = 1000
-AREA_KEY_BITS = 512          # 512-bit XTS area key (2 x AES-256)
+AREA_KEY_BYTES = 64          # 512-bit XTS area key (2 x AES-256); JSON key_size is bytes
 KEY_BYTES = 32               # master key (volume key) length
 
 
@@ -73,7 +73,8 @@ def _af_split(mk, stripes):
     return (zero * (stripes - 1)) + last
 
 
-def _metadata(kdf_fields, salt, mk_digest_b64, d_salt_b64, area_size):
+def _metadata(kdf_fields, salt, mk_digest_b64, d_salt_b64, area_size,
+              sector_size=SECTOR):
     slot_id = "0"
     return {
         "keyslots": {
@@ -85,7 +86,7 @@ def _metadata(kdf_fields, salt, mk_digest_b64, d_salt_b64, area_size):
                 "area": {"type": "raw", "offset": SLOT_AREA_OFFSET,
                          "size": area_size,
                          "encryption": "aes-xts-plain64",
-                         "key_size": AREA_KEY_BITS},
+                         "key_size": AREA_KEY_BYTES},
                 "kdf": dict(kdf_fields, salt=_b64(salt)),
             },
         },
@@ -106,14 +107,14 @@ def _metadata(kdf_fields, salt, mk_digest_b64, d_salt_b64, area_size):
                 "size": "dynamic",
                 "iv_tweak": "0",
                 "encryption": "aes-xts-plain64",
-                "sector_size": SECTOR,
+                "sector_size": sector_size,
             },
         },
     }
 
 
 def build_luks2(password, kdf="argon2id", t=1, m_kib=64, p=1,
-                payload_sectors=64, corrupt_primary_json=False,
+                payload_sectors=64, sector_size=SECTOR, corrupt_primary_json=False,
                 no_backup=False):
     """Return (image_bytes, master_key) for a LUKS2 volume with one
     active keyslot using `kdf`.  With `corrupt_primary_json` the primary
@@ -131,7 +132,7 @@ def build_luks2(password, kdf="argon2id", t=1, m_kib=64, p=1,
     salt = b"slot-salt-16b".ljust(16, b"0")
     area_size = (KEY_BYTES * STRIPES + SECTOR - 1) // SECTOR * SECTOR
 
-    key_len = AREA_KEY_BITS // 8
+    key_len = AREA_KEY_BYTES
     if kdf == "pbkdf2":
         slot_key = hashlib.pbkdf2_hmac("sha256", password, salt,
                                        1000, key_len)
@@ -142,22 +143,25 @@ def build_luks2(password, kdf="argon2id", t=1, m_kib=64, p=1,
     d_salt = b"digest-salt-16b".ljust(16, b"0")
     mk_digest = hashlib.pbkdf2_hmac("sha256", mk, d_salt, DIGEST_ITER, 32)
     meta = _metadata(kdf_fields, salt, _b64(mk_digest), _b64(d_salt),
-                     area_size)
+                     area_size, sector_size)
 
     material = _af_split(mk, STRIPES)
     material += bytes(area_size - len(material))
     enc_area = b"".join(
-        _xts_encrypt(slot_key, (SLOT_AREA_OFFSET + i) // SECTOR,
+        _xts_encrypt(slot_key, i // SECTOR,       # IV 0 at area start
                      material[i:i + SECTOR])
         for i in range(0, len(material), SECTOR))
 
     payload_offset = SLOT_AREA_OFFSET + area_size
-    payload_plain = (b"STRATA-LUKS2-PLAINTEXT-" * 64)[:payload_sectors
-                                                      * SECTOR]
+    payload_plain = (b"STRATA-LUKS2-PLAINTEXT-" * 1024)[:payload_sectors
+                                                       * SECTOR]
     xts_mk = mk  # segment key: 32-byte volume key -> 2 x AES-128
+    # dm-crypt IV counts 512-byte units from segment start, even with
+    # 4096-byte crypt sectors (no iv_large_sectors).
     payload = b"".join(
-        _xts_encrypt(xts_mk, i // SECTOR, payload_plain[i:i + SECTOR])
-        for i in range(0, len(payload_plain), SECTOR))
+        _xts_encrypt(xts_mk, i // SECTOR,
+                     payload_plain[i:i + sector_size])
+        for i in range(0, len(payload_plain), sector_size))
 
     good = json.dumps(meta, sort_keys=True).encode("utf-8")
     bin_hdr = bytearray(BINARY_HDR)

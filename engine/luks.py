@@ -44,7 +44,9 @@ def af_merge(data, blocksize, stripes, hashname):
     return bytes(x ^ y for x, y in zip(d, last))
 
 def _decrypt_region(cipher_name, mode, key, data, start_sector=0,
-                    sector_size=SECTOR):
+                    sector_size=SECTOR, iv_step=1):
+    # IV counter = start_sector + iv_step per crypt sector (dm-crypt counts
+    # 512-byte units unless iv_large_sectors, so a 4096 sector steps by 8).
     if cipher_name != "aes":
         raise Unsupported(_t("luks.cipher_r_supported_only")
                           % cipher_name)
@@ -53,7 +55,7 @@ def _decrypt_region(cipher_name, mode, key, data, start_sector=0,
         half = len(key) // 2
         k1, k2 = aes.AES(key[:half]), aes.AES(key[half:])
         for i in range(0, len(data), sector_size):
-            out += aes.xts_decrypt(k1, k2, start_sector + i // sector_size,
+            out += aes.xts_decrypt(k1, k2, start_sector + i // sector_size * iv_step,
                                    data[i:i + sector_size],
                                    sector_size=sector_size)
         return bytes(out)
@@ -61,7 +63,7 @@ def _decrypt_region(cipher_name, mode, key, data, start_sector=0,
         c = aes.AES(key)
         ivmode = mode.split("-", 1)[1]
         for i in range(0, len(data), sector_size):
-            sec = start_sector + i // sector_size
+            sec = start_sector + i // sector_size * iv_step
             if ivmode == "plain" or ivmode == "plain64":
                 iv = struct.pack("<Q", sec) + b"\x00" * 8 if ivmode == "plain64" \
                     else struct.pack("<I", sec & 0xFFFFFFFF) + b"\x00" * 12
@@ -360,9 +362,8 @@ class Luks:
         if cached is not None:
             return cached
         kdf = slot.kdf_params
-        area_bits = slot.area.get("key_size") or 0
-        # cryptsetup writes area key_size in bits (512 = 64-byte XTS key).
-        key_len = (area_bits // 8) or slot.key_bytes
+        # LUKS2 JSON key_size is in bytes (64 = 512-bit XTS key).
+        key_len = slot.area.get("key_size") or slot.key_bytes
         if slot.kdf_type == "pbkdf2":
             pk = hashlib.pbkdf2_hmac(kdf.get("hash") or "sha256",
                                      password.encode("utf-8"), slot.salt,
@@ -384,8 +385,7 @@ class Luks:
             cipher = self.cipher_name
         else:
             cipher, mode = mode.split("-", 1)
-        split = _decrypt_region(cipher, mode, pk, material,
-                                area["offset"] // 512, 512)
+        split = _decrypt_region(cipher, mode, pk, material, 0, 512)
         mk = af_merge(split, slot.key_bytes, slot.af["stripes"],
                       slot.af["hash"])
         dig = slot.digest
@@ -407,7 +407,8 @@ class Luks:
         n = ((offset + length) - start + ss - 1) // ss
         raw = self.source.read_at(self.payload_offset + start, n * ss)
         plain = _decrypt_region(self.cipher_name, self.cipher_mode,
-                                self.master_key, raw, start // ss)
+                                self.master_key, raw, start // ss * (ss // SECTOR),
+                                ss, ss // SECTOR)
         head = offset - start
         return plain[head:head + length]
 
