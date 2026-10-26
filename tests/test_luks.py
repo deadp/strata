@@ -4,6 +4,7 @@ refusals, and the LUKS1 regression path, fed images from
 imagebuild_luks.  Argon2 correctness itself is pinned by the RFC 9106
 section 5 test vectors."""
 
+import hashlib
 import os
 import sys
 import unittest
@@ -133,6 +134,57 @@ class Luks2Pbkdf2(unittest.TestCase):
         self.assertEqual(vol.read(0, 23), b"STRATA-LUKS2-PLAINTEXT-")
         res = vol.unlock(BAD_PW)
         self.assertFalse(res["unlocked"])
+
+
+class Luks2SpecFacts(unittest.TestCase):
+    """One test per reader bug fixed against the LUKS2 / dm-crypt spec."""
+
+    def test_keyslot_key_size_is_bytes(self):
+        import engine.luks as luks_mod
+        blob, _ = build.build_luks2(PW)
+        vol = Luks(MemSource(blob), len(blob))
+        self.assertEqual(vol.slots[0].area["key_size"], 64)
+        sizes = []
+        real = argon2.derive
+
+        def spy(password, salt, **kwargs):
+            sizes.append(kwargs["out_len"])
+            return real(password, salt, **kwargs)
+
+        try:
+            luks_mod.argon2.derive = spy
+            self.assertTrue(vol.unlock(PW)["unlocked"])
+        finally:
+            luks_mod.argon2.derive = real
+        self.assertEqual(sizes, [64])       # old code derived 8 bytes
+
+    def test_keyslot_area_iv_starts_at_zero(self):
+        blob, mk = build.build_luks2(PW, kdf="pbkdf2")
+        vol = Luks(MemSource(blob), len(blob))
+        area = vol.slots[0].area
+        self.assertNotEqual(area["offset"], 0)
+        # Independent check: first area sector decrypts with IV 0.
+        slot_key = hashlib.pbkdf2_hmac("sha256", PW.encode(),
+                                       vol.slots[0].salt, 1000, 64)
+        first = blob[area["offset"]:area["offset"] + 512]
+        plain = build._xts(slot_key, 0, first, decrypt=True)
+        self.assertEqual(plain[:32 * 15], bytes(32 * 15))
+        self.assertTrue(vol.unlock(PW)["unlocked"])
+        self.assertEqual(vol.master_key, mk)
+
+    def test_4096_sector_iv_counts_512_byte_units(self):
+        blob, mk = build.build_luks2(PW, kdf="pbkdf2", sector_size=4096,
+                                     payload_sectors=64)
+        vol = Luks(MemSource(blob), len(blob))
+        self.assertEqual(vol.sector_size, 4096)
+        self.assertTrue(vol.unlock(PW)["unlocked"])
+        plain = (b"STRATA-LUKS2-PLAINTEXT-" * 1024)[:64 * 512]
+        # Second 4096 block sits at IV 8, not 1.
+        raw = blob[vol.payload_offset + 4096:vol.payload_offset + 8192]
+        self.assertEqual(build._xts(mk, 8, raw, decrypt=True),
+                         plain[4096:8192])
+        self.assertEqual(vol.read(4096, 100), plain[4096:4196])
+        self.assertEqual(vol.read(4000, 300), plain[4000:4300])
 
 
 class Luks1Regression(unittest.TestCase):
