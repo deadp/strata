@@ -99,6 +99,7 @@
   "ewf2.chunk_inflates_past_chunk_size": "Chunk %d inflates past the %d-byte chunk size this image declares; it was cut off there.",
   "ewf2.chunk_incomplete": "Chunk %d is incomplete: its compressed data %s and gave %d of %d bytes; the rest reads as zeros.",
   "ewf2.chunk_table_found_evidence": "No chunk table found; evidence set may be incomplete.",
+  "ewf2.chunks_beyond_image_size": "The chunk table has entries past the %d chunks this image declares; they were ignored.",
   "ewf2.chunk_table_has_gaps": "The chunk table has %d gap(s); the missing chunks read as zeros.",
   "ewf2.compression_method_unknown": "This image's segment file header declares compression method %d, which Strata does not recognise.",
   "ewf2.encrypted_not_supported": "This EWF2 volume is encrypted. Ex01 encryption is not disclosed by Guidance Software and not documented by libewf either, so it cannot be decrypted here.",

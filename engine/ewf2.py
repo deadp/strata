@@ -57,6 +57,7 @@ SECTION_TYPES = {
 # damaged or hostile descriptor claims -- same discipline as engine/ewf.py.
 MAX_OBJECT_STRING = 4 << 20
 MAX_CHUNK_SIZE = 64 << 20
+MAX_UNSIZED_CHUNKS = 1 << 22
 MAX_TABLE_ENTRIES = 1 << 20
 SECTOR_SIZES = (512, 1024, 2048, 4096)
 
@@ -207,6 +208,18 @@ class Ewf2Image:
 
         if not chunk_by_index:
             raise Ewf2Error(_t("ewf2.chunk_table_found_evidence"))
+
+        if self.sector_count and self.bytes_per_sector and self.chunk_size:
+            total = -(-self.sector_count * self.bytes_per_sector
+                      // self.chunk_size)
+        else:
+            total = MAX_UNSIZED_CHUNKS
+        if max(chunk_by_index) >= total:
+            self.findings.append(_t("ewf2.chunks_beyond_image_size") % total)
+            chunk_by_index = {i: c for i, c in chunk_by_index.items()
+                              if i < total}
+            if not chunk_by_index:
+                raise Ewf2Error(_t("ewf2.chunk_table_found_evidence"))
 
         last = max(chunk_by_index)
         missing = 0

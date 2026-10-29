@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -314,6 +315,29 @@ class Resilience(unittest.TestCase):
         got = img.read_at(0, img.size)
         self.assertEqual(got, bytes(len(data)))
         self.assertTrue(any("index" in f for f in img.findings))
+        img.close()
+
+
+class InflateBounds(unittest.TestCase):
+
+    def test_chunk_inflating_past_chunk_size_reads_as_zeros(self):
+        volume_urn = "aff4://77777777-7777-7777-7777-777777777777"
+        stream_urn = "%s/image.dd" % volume_urn
+        bomb = zlib.compress(b"\x01" * (1 << 20))
+        turtle = build._turtle([(stream_urn, [
+            ("a", ["aff4:ImageStream"]),
+            ("aff4:chunkSize", ["512"]),
+            ("aff4:chunksInSegment", ["1"]),
+            ("aff4:size", ["512"]),
+        ])])
+        raw = build.build_zip64(
+            [("image.dd/00000000", bomb),
+             ("image.dd/00000000.index", struct.pack("<III", 0, 0, len(bomb))),
+             ("information.turtle", turtle)],
+            comment=volume_urn.encode("ascii"))
+        img = _open(raw, "bomb.aff4")
+        self.assertEqual(img.read_at(0, 512), bytes(512))
+        self.assertTrue(img.findings)
         img.close()
 
 
