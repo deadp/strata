@@ -11,6 +11,22 @@ records, not how the code changed.
 
 ## [Unreleased]
 
+### Security
+
+- **Unlocked BitLocker and LUKS volume keys are no longer saved in the case
+  file.** The README always said they never were, but each unlock stored the
+  volume key, so anyone holding a case could decrypt the volume. Keys now live
+  only in memory for the session; reopening a case means unlocking again.
+  Opening a case written by an earlier version removes any stored keys and
+  wipes them from the file.
+- **Crafted evidence can no longer make Strata exhaust memory**: an EWF2
+  image with an inflated chunk count, a registry transaction log claiming a
+  huge hive size, or an AFF4 member or chunk that inflates past its declared
+  size is now refused with a finding. A truncated AFF4 deflate stream is
+  reported instead of being read as short data.
+- **PDF active content written with `#HH` name escapes (for example
+  `/Java#53cript`) is now recognised and stripped** like the plain spelling.
+
 ## [0.9.0] - 2026-10-02
 
 ### Added
