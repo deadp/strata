@@ -50,3 +50,59 @@ Out of scope:
   Use it only on a trusted, isolated network.
 - Evidence is opened read-only, but the case folder is not — protect it like
   any case record.
+
+## Optional keyed audit log
+
+The audit chain is unkeyed by default: anyone who can write the case folder
+can rebuild a whole forged chain. An optional per-case key stops that.
+
+Set `STRATA_AUDIT_KEY_FILE` (path to a file holding the key; one trailing
+newline is dropped) or `STRATA_AUDIT_KEY` before opening the case. Each new
+entry then gets a tag, `HMAC-SHA256(key, previous tag | entry hash)`, kept in
+the `audit_mac` table. The key is never written to the case or the log.
+
+- Verify without a key behaves as before for unkeyed logs. A keyed log that
+  otherwise checks out reports "keyed, key needed", not intact.
+- Verify with the key names the first entry whose tag is wrong or missing.
+  Tags must run unbroken to the end of the log; entries from before the key
+  was turned on may be untagged.
+- Tags are compared in constant time; the key is not put in errors or logs.
+- Once a case is keyed, logging without the key is refused.
+
+Limits: this stops forging without the key. It does not stop someone who
+holds the key, deleting the whole log, or removing every tag and the keyed
+marker (the case then looks unkeyed). The recorded head is not keyed, so
+cutting entries from the end is caught as before, not by the key.
+
+### Assumptions
+
+1. Off by default; unkeyed cases and old logs behave as today.
+2. Key from a file path or environment variable only; no passphrase prompt
+   or UI.
+3. Unkeyed and keyed verify modes; first bad entry named; keyed without key
+   is "key needed".
+4. Constant-time comparison; key never logged.
+5. Tags live in a separate `audit_mac` table keyed by entry number, chained
+   through the previous tag; the existing hash columns are unchanged.
+6. A keyed case refuses new entries without the key (an untagged entry would
+   break the log for good).
+7. The web UI is unchanged; a key-needed result shows there as a broken
+   chain with no entry number.
+
+### Questions for maintainers
+
+- Key source: are a file and an environment variable enough, or do you want
+  a passphrase-derived key or a UI?
+- Tag format and place: separate `audit_mac` table, hex HMAC over previous
+  tag and entry hash. Prefer a column on `audit`, or a MAC over the raw
+  fields?
+- Should keyed ever become the default (e.g. a generated key stored beside,
+  not in, the case)?
+- Migration: existing logs stay unkeyed until the key is first set, with
+  older entries left untagged. Should there be a command to tag them, or to
+  refuse mixed logs?
+- Should the head record be keyed too, and a keyed marker kept outside the
+  case so stripping tags cannot downgrade it?
+- Should refusing to log without the key be an error, a warning, or a
+  read-only open?
+- UI and report wording for "keyed, key needed".

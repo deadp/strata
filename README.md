@@ -157,9 +157,10 @@ separate from the tool's suggestions, and never promotes one to the other.
   extracted file can be added back as its own exhibit
 - Self-contained HTML report
 - Append-only, hash-chained audit log that reports where it was altered,
-  including entries cut from the end. The chain is not keyed: it shows
-  tampering by anyone who does not also recompute every later hash, but
-  cannot rule that out
+  including entries cut from the end. By default the chain is not keyed: it
+  shows tampering by anyone who does not also recompute every later hash, but
+  cannot rule that out. An optional per-case key (HMAC) closes that; see
+  [SECURITY.md](SECURITY.md#optional-keyed-audit-log)
 
 ## Not implemented
 

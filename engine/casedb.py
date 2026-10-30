@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -152,6 +153,12 @@ CREATE TABLE IF NOT EXISTS audit (
     detail TEXT,
     prev_hash TEXT,
     hash TEXT NOT NULL);
+
+-- Optional keyed tags for the audit chain (see Case.log). Empty unless the
+-- case has an audit key.
+CREATE TABLE IF NOT EXISTS audit_mac (
+    seq INTEGER PRIMARY KEY,
+    tag TEXT NOT NULL);
 
 -- A saved search is the query *and* the hits it produced. Keeping the hits
 -- matters: re-running a search later can return something different once the
@@ -436,6 +443,36 @@ _CASE_TABLES = ("meta", "evidence", "audit")
 class NotACase(ValueError):
     pass
 
+class AuditKeyNeeded(RuntimeError):
+    pass
+
+AUDIT_KEY_ENV = "STRATA_AUDIT_KEY"
+AUDIT_KEY_FILE_ENV = "STRATA_AUDIT_KEY_FILE"
+
+def audit_key_from_env():
+    """The optional audit key as bytes, or None. A key file named by
+    STRATA_AUDIT_KEY_FILE wins over STRATA_AUDIT_KEY; one trailing newline is
+    dropped. The key is never stored in the case or written to the log."""
+    path = os.environ.get(AUDIT_KEY_FILE_ENV)
+    if path:
+        try:
+            with open(path, "rb") as fh:
+                key = fh.read()
+        except OSError as e:
+            raise AuditKeyNeeded("cannot read the audit key file: %s"
+                                 % e.strerror)
+        if key.endswith(b"\n"):
+            key = key[:-1]
+            if key.endswith(b"\r"):
+                key = key[:-1]
+    else:
+        key = os.environ.get(AUDIT_KEY_ENV, "").encode("utf-8")
+    return key or None
+
+def _audit_tag(key, prev_tag, entry_hash):
+    return hmac.new(key, ("%s|%s" % (prev_tag, entry_hash)).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
 def _looks_like_case_db(db_file):
     # Decides from the header and a read-only open, so a file that is not a
     # case is never written, locked for writing, or given -journal/-wal/-shm
@@ -519,8 +556,15 @@ def cache_dir(case_path, create=False):
     return d
 
 class Case:
-    def __init__(self, path, name=None, examiner=None, read_only=False):
+    def __init__(self, path, name=None, examiner=None, read_only=False,
+                 audit_key=None):
         _refuse_if_not_case(path)
+        # Optional HMAC key for the audit chain; None leaves the log unkeyed.
+        if audit_key is None:
+            audit_key = audit_key_from_env()
+        elif isinstance(audit_key, str):
+            audit_key = audit_key.encode("utf-8")
+        self._audit_key = audit_key or None
         self.path = path
         self.db_path = db_path(path)
         self.examiner = examiner or os.environ.get("STRATA_EXAMINER",
@@ -1133,6 +1177,25 @@ class Case:
     # from whatever row happens to be last, so entries cut from the end of
     # the log still show as a break once more are written after them.
     AUDIT_HEAD = "audit_head"
+    # Set (to "1") by the first keyed entry. Not secret, and not protected:
+    # a case also counts as keyed while any audit_mac row exists.
+    AUDIT_KEYED = "audit_keyed"
+
+    def _audit_tags(self):
+        try:
+            return {r[0]: r[1] for r in
+                    self.db.execute("SELECT seq, tag FROM audit_mac")}
+        except sqlite3.OperationalError:
+            return {}       # read-only open of a case that never had tags
+
+    def _audit_is_keyed(self):
+        if self.get(self.AUDIT_KEYED) == "1":
+            return True
+        try:
+            return self.db.execute(
+                "SELECT 1 FROM audit_mac LIMIT 1").fetchone() is not None
+        except sqlite3.OperationalError:
+            return False
 
     def log(self, action, detail=None):
         with _case_lock(self.path):
@@ -1143,6 +1206,12 @@ class Case:
                 self.db.commit()
             self.db.execute("BEGIN IMMEDIATE")
             try:
+                key = self._audit_key
+                if not key and self._audit_is_keyed():
+                    # An untagged entry would break a keyed log for good.
+                    raise AuditKeyNeeded(
+                        "this case has a keyed audit log: set %s or %s"
+                        % (AUDIT_KEY_FILE_ENV, AUDIT_KEY_ENV))
                 head = self.get(self.AUDIT_HEAD)
                 if head:
                     prev = head.partition(":")[2]
@@ -1162,6 +1231,17 @@ class Case:
                 self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
                                 (self.AUDIT_HEAD,
                                  "%d:%s" % (cur.lastrowid, h)))
+                if key:
+                    row = self.db.execute(
+                        "SELECT tag FROM audit_mac WHERE seq=?",
+                        (int(head.partition(":")[0]) if head else -1,)
+                    ).fetchone()
+                    self.db.execute(
+                        "INSERT INTO audit_mac VALUES (?,?)",
+                        (cur.lastrowid,
+                         _audit_tag(key, row[0] if row else "", h)))
+                    self.db.execute("INSERT OR REPLACE INTO meta VALUES "
+                                    "(?,?)", (self.AUDIT_KEYED, "1"))
                 self.db.commit()
             except BaseException:
                 self.db.rollback()
@@ -1173,6 +1253,53 @@ class Case:
             "SELECT * FROM audit ORDER BY seq DESC LIMIT ?", (limit,))]
 
     def verify_audit(self):
+        """The unkeyed check (_verify_chain), then, if the case has keyed
+        tags, the keyed one. Without the key a keyed log is not reported
+        intact: the result says the key is needed. With the key, each tagged
+        entry must carry HMAC(key, previous tag | entry hash), and tags must
+        run unbroken to the end of the log (entries from before the key was
+        turned on may be untagged). Limits: this stops forging without the
+        key, not by someone who holds it, and a log stripped of every tag and
+        of the keyed marker looks like an unkeyed one."""
+        got = self._verify_chain()
+        if not got["intact"]:
+            return got
+        if not self._audit_is_keyed():
+            return got
+        if not self._audit_key:
+            return {"intact": False, "broken_at": None, "keyed": True,
+                    "key_needed": True,
+                    "detail": "Keyed, key needed: set %s or %s to verify."
+                              % (AUDIT_KEY_FILE_ENV, AUDIT_KEY_ENV)}
+        tags = self._audit_tags()
+        prev_tag = ""
+        started = False
+        for r in self.db.execute("SELECT seq, hash FROM audit ORDER BY seq"):
+            tag = tags.get(r["seq"])
+            if tag is None:
+                if started:
+                    return self._keyed_break(r["seq"], "has no tag")
+                continue
+            want = _audit_tag(self._audit_key, prev_tag, r["hash"])
+            if not hmac.compare_digest(want.encode(), str(tag).encode()):
+                return self._keyed_break(
+                    r["seq"], "does not match its tag (altered, or the key "
+                              "is wrong)")
+            started = True
+            prev_tag = tag
+        if not started:
+            return {"intact": False, "broken_at": self.db.execute(
+                        "SELECT MIN(seq) FROM audit").fetchone()[0],
+                    "keyed": True, "detail": "The case is keyed but no entry "
+                                             "carries a tag."}
+        return {"intact": True, "broken_at": None, "keyed": True}
+
+    @staticmethod
+    def _keyed_break(seq, why):
+        return {"intact": False, "broken_at": seq, "keyed": True,
+                "detail": "Entry %d %s." % (seq, why)}
+
+    def _verify_chain(self):
         """Whether every entry hashes to what it records and chains from the
         one before, and the log still ends at the entry the case last wrote.
         The chain is not keyed: it shows alteration, deletion and truncation
