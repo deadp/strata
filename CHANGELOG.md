@@ -13,6 +13,11 @@ records, not how the code changed.
 
 ### Security
 
+- **Optional keyed audit log.** Set `STRATA_AUDIT_KEY_FILE` (or
+  `STRATA_AUDIT_KEY`) and each new audit entry also gets an HMAC-SHA256 tag,
+  so the log cannot be rebuilt without the key. Off by default; existing logs
+  verify as before. A keyed log checked without the key reports "keyed, key
+  needed" instead of intact.
 - **Unlocked BitLocker and LUKS volume keys are no longer saved in the case
   file.** The README always said they never were, but each unlock stored the
   volume key, so anyone holding a case could decrypt the volume. Keys now live
