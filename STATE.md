@@ -14,7 +14,7 @@ This fork (deadp/strata) is where Joshua's changes are written before they go to
 - LUKS2 is implemented but still unticked in docs/ROADMAP.md: it has only been checked against synthetic images. `tests/fixtures/luks/make_fixtures.sh` (#4) builds fixtures with real cryptsetup, but no real cryptsetup-written image has been checked yet and none is committed.
 - Tests on synced main (before #5-#7; not re-run since): `python -m unittest discover -s tests -p "test_*.py"` ran 1422 tests, OK (14 skipped); `python tests/smoke.py` passed all checks (25 ok lines).
 - Joshua has no open PRs on upstream that this repo shows. His 22 PRs there were all merged or closed as of the last check (latest then: browser disk caches, 23-09-2026); since then #187 (hostile-input bounds, PDF escapes; the upstream version of fork #6) landed upstream on 29-10-2026.
-- Open fork PR #11 (not merged; branch queue/q659, 30-10-2026): optional keyed HMAC-SHA256 audit log chain, opt-in per case via env var or key file, new `audit_mac` table, keyed and unkeyed verify modes, 14 new tests. It is written to be offered upstream; the design choices are listed as assumptions in the PR. Nothing from it is on main yet.
+- Fork PR #11 (branch queue/q659) merged on 30-10-2026 (af38e0f): optional keyed HMAC-SHA256 audit log chain, opt-in per case via env var or key file, new `audit_mac` table, keyed and unkeyed verify modes, 14 new tests. It is written to be offered upstream; the design choices are listed as assumptions in the PR. Not yet offered upstream.
 - Upstream CI is green: Fuzz 13-10-2026, CodeQL 12-10-2026. The fork's last CI run was 16-09-2026 and passed.
 - Upstream has 9 open issues, mostly feature requests (fuzz corpus, plugin API, localisation, GPS map, fragment carving, memory forensics, FileVault 2).
 - The fork has 11 old feature branches whose PRs are merged or closed upstream; they could be pruned.
@@ -35,4 +35,4 @@ This fork (deadp/strata) is where Joshua's changes are written before they go to
 ## Next action
 `Finish the open roadmap item "LUKS2 with Argon2 against real cryptsetup images" (docs/ROADMAP.md): the reader is built and fixed (#9), so run tests/fixtures/luks/make_fixtures.sh with real cryptsetup, check Strata unlocks the resulting images, and tick the item only if it does. Open the PR on the fork first.`
 
-Last updated: 31-10-2026
+Last updated: 04-11-2026
