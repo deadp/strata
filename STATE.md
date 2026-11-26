@@ -5,7 +5,7 @@ Strata is an offline, stdlib-only forensic image examiner that opens evidence re
 This fork (deadp/strata) is where Joshua's changes are written before they go to upstream switch-nz/strata as PRs.
 
 ## Now
-- Fork last synced with upstream on 30-10-2026 (merge of switch-nz:main into main); the earlier sync was 17-10-2026. Main has upstream's 0.9.0 release (03-10-2026) plus upstream's #185 (volume keys, 25-10-2026) and #187 (hostile-input bounds, 29-10-2026). Ahead/behind counts were not checked because upstream could not be fetched from the runner.
+- Fork last synced with upstream on 26-11-2026 (PR #15, merge of switch-nz:main into main, 0.9.1); the earlier sync was 30-10-2026. Main has upstream's 0.9.1 release (14-11-2026, #190), which includes #188 (evidence and case-file text escaped in the interface, served with a Content-Security-Policy) and #189 (CI Python 3.8/3.9 jobs on ubuntu-24.04), on top of 0.9.0 (03-10-2026), #185 (volume keys, 25-10-2026) and #187 (hostile-input bounds, 29-10-2026). The only merge conflict was CHANGELOG.md; the fork's keyed audit log entry (#11) stays under Unreleased. Ahead/behind counts were not checked because upstream could not be fetched from the runner.
 - 21-10-2026 security audit fixes landed on the fork (#5, #6, #7), each also intended as its own upstream PR:
   - #5: unlocked BitLocker/LUKS volume keys are no longer written to the case file. The `volume_keys` table and save/get/forget_volume_key are gone, unlocked state is session memory only, and opening a case drops any legacy `volume_keys` table.
   - #6: hostile-input allocations are bounded: EWF2 chunk indexes capped by image size, oversized registry log hive sizes/page offsets refused, AFF4 chunk and member inflation capped. PDF `#HH` name escapes are decoded before matching.
@@ -35,4 +35,4 @@ This fork (deadp/strata) is where Joshua's changes are written before they go to
 ## Next action
 `Finish the open roadmap item "LUKS2 with Argon2 against real cryptsetup images" (docs/ROADMAP.md): the reader is built and fixed (#9), so run tests/fixtures/luks/make_fixtures.sh with real cryptsetup, check Strata unlocks the resulting images, and tick the item only if it does. Open the PR on the fork first.`
 
-Last updated: 04-11-2026
+Last updated: 27-11-2026
